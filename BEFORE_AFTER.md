@@ -37,6 +37,13 @@ emulation and causal fp16 SDPA to Triton FA, with fallback:
 See [`INTEGRATION.md`](INTEGRATION.md) for conditions, accumulation policy and
 next steps.
 
+## Training stability (P0)
+
+| case | before | after | status |
+|---|---|---|---|
+| `FeatureSetRanker` fp16 training, `nn.MultiheadAttention` | cuDNN FMHA loop (110k FATAL), `cublasSetWorkspace` crash | eager full step 1.04–1.21 s, loss 0.00683, 0 FATAL | fixed via slow-path MHA (`run-zluda-train.cmd`) |
+| `torch.compile` for the same model | — | skipped: ~30 min even on T4 | not a P0 blocker |
+
 ## GEMV / skinny GEMM (N=K=4096, fp16, Triton `bench/gemv.py`)
 
 | M | Before: rocBLAS `F.linear` | After: Triton | Change | % of 448 GB/s |

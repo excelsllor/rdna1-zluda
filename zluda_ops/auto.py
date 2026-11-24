@@ -7,6 +7,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from . import bf16 as _bf16
 from . import gemv as _gemv
 from . import flash_attention as _fa
+from . import mha as _mha
 
 _orig_linear = None
 _orig_sdpa = None
@@ -90,8 +91,12 @@ def uninstall():
     F.scaled_dot_product_attention = _orig_sdpa
     _orig_linear = None
     _orig_sdpa = None
+    _mha.uninstall()
     return True
 
+
+if os.environ.get("ZLUDA_MHA_SLOW") == "1":
+    _mha.install()
 
 if os.environ.get("ZLUDA_OPS_DISABLE") != "1":
     _installed_now = install()
