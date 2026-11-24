@@ -8,12 +8,10 @@ Matrix units (tensor cores / MFMA): **none** on RDNA1.
 ## Software stacks
 
 - **ZLUDA**: upstream `v7-preview.21` (commit `eb89ae3`) + the patches in this tree.
-- **Runtime A (unified, recommended)**:
+- **Runtime (supported)**:
   ROCm 10.1 user space from TheRock gfx1010 packages (HIP 7.16, MIOpen, rocFFT,
   rocSPARSE) **plus** rocBLAS 7.1.1 with tuned gfx1010 Tensile libraries
   (likelovewant ROCmLibs) and its matching `rocblas.dll`, replacing stock rocBLAS.
-- **Runtime B**: HIP SDK 6.4 + tuned rocBLAS 6.4.2 (same external source). Kept as a
-  fallback; it has no MIOpen (no cuDNN).
 - **PyTorch**: `2.7.1+cu118` — the CUDA wheel branch that ships `compute_37` PTX,
   which ZLUDA consumes. `cu128` wheels are SASS-only and cannot be used.
 - **Triton**: `triton-windows 3.3.1`, with `TRITON_PTXAS_PATH` pointing at ZLUDA's
@@ -48,8 +46,7 @@ Triton; the default 8.5 does not exist), `TRITON_PTXAS_PATH`, isolated
 | path | fp32 | fp16 (fp32 accum) | bf16 |
 |---|---|---|---|
 | ROCm 10.1 stock rocBLAS (fallback Tensile) | 28.3 ms / 4.85 TF | 32.6 ms / 4.21 TF | 59.3 ms / 2.32 TF |
-| HIP 6.4 + tuned rocBLAS 6.4.2 | 18.3–18.7 ms / 7.36–7.50 TF | 21.6–21.9 ms / 6.28–6.37 TF | 39.3–39.8 ms / 3.46 TF |
-| **ROCm 10.1 + tuned rocBLAS 7.1.1 (unified)** | **16.8–16.9 ms / 8.13–8.18 TF** | **19.7–19.8 ms / 6.93–6.96 TF** | **31.1 ms / 4.42 TF** |
+| **ROCm 10.1 + tuned rocBLAS 7.1.1** | **16.8–16.9 ms / 8.13–8.18 TF** | **19.7–19.8 ms / 6.93–6.96 TF** | **31.1 ms / 4.42 TF** |
 | native ROCm 10.1 torch | 32.8 ms / 4.19 TF | 42.2 ms / 3.25 TF | 57.7 ms / 2.38 TF |
 
 - fp32 reaches **~84% of theoretical peak** — normal for a well-tuned GEMM.
@@ -110,10 +107,9 @@ Not available / failed:
 - **xformers**: no gfx1010 build (CUTLASS sm80 kernels; no RDNA1 support).
 - **SageAttention**: no gfx1010 wheel; CUDA kernels target sm80+, fp8 paths need
   sm89.
-- Stock rocBLAS: fallback Tensile kernels only (4.2–4.85 TF fp32). Tuned
-  libraries must be supplied externally; ROCm 10.1 rocBLAS rejects Tensile
-  libraries built for 6.4/7.1 unless the matching `rocblas.dll` from that
-  package is used too.
+- Stock rocBLAS: fallback Tensile kernels only (4.2-4.85 TF fp32). The tuned
+  libraries must be supplied externally and match the shipped `rocblas.dll`
+  from the same release; both are replaced together.
 
 ## ZLUDA — what works / what does not
 
@@ -131,8 +127,7 @@ torch 2.7/cu118; their CUDA kernels are sm80+ SASS/PTX); TF32 MMA in Triton
 
 ## Reproduce
 
-- `run-zluda.cmd <app>` — unified ROCm 10.1 + tuned rocBLAS (recommended).
-- `run-zluda-gemm.cmd <app>` — HIP 6.4 + tuned rocBLAS (no cuDNN).
+- `run-zluda.cmd <app>` - ROCm 10.1 + tuned rocBLAS 7.1.1.
 - venv: `G:\zluda\venv` (torch 2.7.1+cu118, triton-windows 3.3.1).
 - Scripts: `bench/matmul_bench.py`, `bench/fp16_acc.py`,
   `bench/triton_flash_canon.py`, `bench/math_attn_fb.py`, `smoke/*`.
