@@ -198,13 +198,38 @@ torch._C._set_cublas_allow_fp16_accumulation(True)  # selects packed HH kernels
 
 ### ComfyUI
 
-- Create the environment as in section 5, then install ComfyUI's requirements
-  into the same venv (do not break the existing native ROCm environment).
-- Launch with `--use-pytorch-cross-attention` (math SDPA) or the default
-  attention; do not expect PyTorch's flash SDPA or the `flash_attn` package to
-  work on gfx1010.
-- Keep `PYTORCH_HIP_ALLOC_CONF`/cache settings in mind for 8 GB VRAM (see
-  `ROADMAP.md`, Stage 6).
+Verified with ComfyUI 0.45.0 and a separate Python 3.12 venv
+(`venv-comfy`, `torch==2.7.1+cu118`, `torchvision==0.22.1+cu118`,
+`triton-windows==3.3.1.post21`); the native ROCm venv is left untouched.
+
+```bat
+rem base mode, no custom nodes (most reliable)
+start-comfy.cmd
+
+rem full mode with custom nodes (UTF-8 is required: some nodes raise
+rem ImportError messages containing emoji and crash a cp1251 console)
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+comfy-zluda-nodes.cmd
+```
+
+- Both launchers use `--use-pytorch-cross-attention` (math SDPA),
+  `--force-fp16`, `--disable-smart-memory`, `--gpu-only`,
+  `--disable-pinned-memory` (8 GB VRAM).
+- Do not expect PyTorch's flash SDPA or the `flash_attn` package to work on
+  gfx1010; use math SDPA or the Triton flash implementation from
+  `bench/triton_flash_canon.py`.
+- Custom nodes start only when their Python dependencies are installed in
+  `venv-comfy`. In a core-only install, nodes such as ComfyUI-GGUF,
+  VideoHelperSuite, controlnet_aux, easy-use, BrushNet, teacache, ultraflux,
+  was-node-suite, utils-nodes and sam3 fail to import. Use ComfyUI-Manager to
+  install the dependencies you need, or disable those nodes.
+- If `torch.cuda.is_available()` starts hanging and even a plain HIP
+  `hipStreamCreateWithFlags` blocks, the AMD driver is wedged (usually after
+  force-killing a process during CUDA init). Restart the display device, e.g.
+  `pnputil /restart-device "<GPU instance id>"` from an elevated shell, or
+  reboot. Never force-kill ComfyUI while it is initializing CUDA unless
+  necessary.
 
 ## 8. Validation and benchmarks
 
