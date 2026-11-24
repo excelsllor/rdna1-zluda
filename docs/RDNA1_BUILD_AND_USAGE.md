@@ -226,6 +226,10 @@ comfy-zluda-nodes.cmd
   `extra_model_paths.yaml` entries (`checkpoints`, `diffusion_models`,
   `text_encoders`, `loras`, `vae`, ...) at the existing model root. The
   ZLUDA instance then shares the same checkpoints, GGUF files and LoRAs.
+- `tools\install_auto.py` installs the `zluda_ops_auto` custom node. It patches
+  `F.linear` (Triton GEMV for inference M<=8, bf16 emulation) and causal SDPA
+  after PyTorch has configured its allocator. Use the custom-nodes launcher;
+  set `ZLUDA_OPS_DISABLE=1` to roll back. See `INTEGRATION.md`.
 - If `torch.cuda.is_available()` starts hanging and even a plain HIP
   `hipStreamCreateWithFlags` blocks, the AMD driver is wedged (usually after
   force-killing a process during CUDA init). Restart the display device, e.g.
@@ -249,6 +253,7 @@ run-zluda.cmd venv\Scripts\python.exe bench\regression.py
 run-zluda.cmd venv\Scripts\python.exe bench\gemv.py
 run-zluda.cmd venv\Scripts\python.exe bench\stage1.py
 run-zluda.cmd venv\Scripts\python.exe bench\flash_pack.py
+run-zluda-auto.cmd venv\Scripts\python.exe smoke\auto_test.py
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.

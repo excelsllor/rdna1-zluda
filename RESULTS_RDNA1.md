@@ -253,3 +253,24 @@ sequence not divisible by 128) fall back to PyTorch math SDPA.
 Non-causal Triton forward matches math but the backward kernel is causal-only;
 the wrapper uses math for non-causal training. Sliding window, varlen, softcap,
 dropout and flash-decoding remain open (Stage 2.2/2.3).
+## Out-of-the-box auto integration (2026-11-24)
+
+`zluda_ops.auto` patches `F.linear` and `F.scaled_dot_product_attention` with
+safe conditions and fallback. Scripts use `run-zluda-auto.cmd`; ComfyUI uses
+the `zluda_ops_auto` custom node installed by `tools/install_auto.py`.
+
+| case | original | auto | speedup | max abs err |
+|---|---|---|---|---|
+| linear fp16 M=1, K=4096 | 0.292 ms | 0.150 ms | 1.95x | 0.00024 |
+| linear fp16 M=4, K=4096 | 0.309 ms | 0.150 ms | 2.06x | 0.00024 |
+| linear fp16 M=8, K=4096 | 0.289 ms | 0.199 ms | 1.45x | 0.00049 |
+| linear fp32 M=1, K=4096 | 0.459 ms | 0.219 ms | 2.10x | 0 |
+| linear fp32 M=8, K=4096 | 0.447 ms | 0.365 ms | 1.22x | 0 |
+| linear fp16 M=1, K=3200 | 0.193 ms | 0.118 ms | 1.63x | 0.00024 |
+| bf16 linear 64x1024x1024 | 0.272 ms | 0.165 ms | 1.65x | 0.002 |
+| bf16 linear 64x4096x4096 | 2.227 ms | 1.243 ms | 1.79x | 0.016 |
+| causal SDPA 512, D64 | 0.657 ms | 0.413 ms | 1.59x | 0.001 |
+
+Auto GEMV uses fp32 products and fp32 accumulation; bf16 auto converts to
+fp32 and casts back; FA keeps fp32 softmax/LSE/accumulation. No int16 path
+exists and int8 remains unsupported. Details: `INTEGRATION.md`.

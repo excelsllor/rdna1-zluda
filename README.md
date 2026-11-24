@@ -6,6 +6,7 @@ runs PyTorch (CUDA 11.8 wheels), Triton, `torch.compile`, and Triton flash
 attention with working backward.
 
 - **Before / after:** [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
+- **Out-of-the-box acceleration:** [`INTEGRATION.md`](INTEGRATION.md)
 - **Results:** [`RESULTS_RDNA1.md`](RESULTS_RDNA1.md)
 - **Roadmap:** [`ROADMAP.md`](ROADMAP.md)
 - **Build and usage guide:** [`docs/RDNA1_BUILD_AND_USAGE.md`](docs/RDNA1_BUILD_AND_USAGE.md)
@@ -66,6 +67,7 @@ ComfyUI notes, and troubleshooting.
 ```bat
 run-zluda.cmd venv\Scripts\python.exe train.py
 run-zluda.cmd venv\Scripts\python.exe bench\matmul_bench.py
+run-zluda-auto.cmd venv\Scripts\python.exe inference.py
 ```
 
 ## Known limitations

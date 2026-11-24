@@ -21,6 +21,22 @@ flash attention. Full context in `RESULTS_RDNA1.md`; plans in `ROADMAP.md`.
 | Causal SDPA 2048 | fp16 fwd | 7.54 ms | 3.11 ms | **2.42x** |
 | Causal SDPA 512, GQA H=8/KV=2 | fp16 fwd | 0.85 ms | 0.54 ms | **1.57x** |
 
+## Out-of-the-box auto path
+
+`zluda_ops.auto` (or `run-zluda-auto.cmd`, or the ComfyUI `zluda_ops_auto`
+node) routes inference linear M=1..8 to Triton GEMV, small bf16 linear to fp32
+emulation and causal fp16 SDPA to Triton FA, with fallback:
+
+| case | original | auto | speedup |
+|---|---|---|---|
+| linear fp16 M=1 K=4096 | 0.292 ms | 0.150 ms | 1.95x |
+| linear fp32 M=1 K=4096 | 0.459 ms | 0.219 ms | 2.10x |
+| bf16 linear 64x4096x4096 | 2.227 ms | 1.243 ms | 1.79x |
+| causal SDPA 512 D64 | 0.657 ms | 0.413 ms | 1.59x |
+
+See [`INTEGRATION.md`](INTEGRATION.md) for conditions, accumulation policy and
+next steps.
+
 ## GEMV / skinny GEMM (N=K=4096, fp16, Triton `bench/gemv.py`)
 
 | M | Before: rocBLAS `F.linear` | After: Triton | Change | % of 448 GB/s |
