@@ -210,10 +210,22 @@ comfy-zluda-nodes.cmd
   gfx1010; use math SDPA or the Triton flash implementation from
   `bench/triton_flash_canon.py`.
 - Custom nodes start only when their Python dependencies are installed in
-  `venv-comfy`. In a core-only install, nodes such as ComfyUI-GGUF,
-  VideoHelperSuite, controlnet_aux, easy-use, BrushNet, teacache, ultraflux,
-  was-node-suite, utils-nodes and sam3 fail to import. Use ComfyUI-Manager to
-  install the dependencies you need, or disable those nodes.
+  `venv-comfy`. In a core-only install, nodes such as VideoHelperSuite,
+  controlnet_aux, easy-use, BrushNet, teacache, ultraflux, was-node-suite,
+  utils-nodes and sam3 fail to import. Use ComfyUI-Manager to install the
+  dependencies you need, or disable those nodes.
+- GGUF support (ComfyUI-GGUF) needs:
+
+  ```bat
+  venv-comfy\Scripts\python.exe -m pip install "gguf>=0.13.0" sentencepiece protobuf
+  ```
+
+  After installation the `UnetLoaderGGUF`/`DualCLIPLoaderGGUF` nodes load
+  `.gguf` models from the `diffusion_models` search paths.
+- Reuse an existing ComfyUI model library without copying files: point the
+  `extra_model_paths.yaml` entries (`checkpoints`, `diffusion_models`,
+  `text_encoders`, `loras`, `vae`, ...) at the existing model root. The
+  ZLUDA instance then shares the same checkpoints, GGUF files and LoRAs.
 - If `torch.cuda.is_available()` starts hanging and even a plain HIP
   `hipStreamCreateWithFlags` blocks, the AMD driver is wedged (usually after
   force-killing a process during CUDA init). Restart the display device, e.g.
