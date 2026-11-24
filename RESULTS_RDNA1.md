@@ -159,20 +159,95 @@ fp32 8.16 TF, fp16 6.91 TF, bf16 4.40 TF; math SDPA causal 1.14 TF at 2048.
 Clock/power monitoring is still open: neither ZLUDA NVML nor the installed
 ROCm 10.1 user space exposes rocm-smi/amd-smi on this Windows host.
 
-## Stage 1 - Triton GEMV (M=1) (2026-11-24)
+## Stage 1 - GEMV, batched GEMM and bf16 (2026-11-24)
 
-`bench/gemv.py`, N=K=4096, best of three runs:
+### GEMV / skinny GEMM (N=K=4096)
 
-| path | fp16 M=1 | fp32 M=1 |
+`bench/gemv.py`, best of two runs:
+
+| dtype | m | Triton | rocBLAS `F.linear` | % of 448 GB/s |
+|---|---|---|---|---|
+| fp16 | 1 | 0.114 ms / 294 GB/s | 0.296 ms / 114 GB/s | 66% |
+| fp16 | 4 | 0.121 ms / 278 GB/s | 0.315 ms / 107 GB/s | 62% |
+| fp16 | 8 | 0.139 ms / 242 GB/s | 0.309 ms / 109 GB/s | 54% |
+| fp16 | 16 | 0.218 ms / 155 GB/s | 0.312 ms / 108 GB/s | 35% |
+| fp16 | 32 | 0.435 ms / 78 GB/s | 0.447 ms / 76 GB/s | 17% |
+| fp32 | 1 | 0.216 ms / 311 GB/s | 0.433 ms / 155 GB/s | 69% |
+| fp32 | 4 | 0.236 ms / 284 GB/s | 0.453 ms / 148 GB/s | 63% |
+| fp32 | 8 | 0.230 ms / 292 GB/s | 0.446 ms / 151 GB/s | 65% |
+| fp32 | 16 | 0.415 ms / 163 GB/s | 0.456 ms / 148 GB/s | 36% |
+| fp32 | 32 | 0.925 ms / 73 GB/s | 0.604 ms / 112 GB/s | 16% |
+
+The Triton kernel loads each weight row once, keeps X in cache, uses fp16
+products with blockwise fp32 accumulation for M<=16 and full fp32 products for
+M=32. M=1/4/8 reach 54-69% of theoretical bandwidth, i.e. 78-82% of the
+measured 377 GB/s copy ceiling. M=16/32 are reduction/compute-bound; for fp32
+M=32 `F.linear` is faster and should be used as a fallback. `cublasSgemv`
+(fp32) is unsupported by libcublas.so.
+
+### GEMM shape grid and batched GEMM
+
+`bench/stage1.py`:
+
+| shape | fp32 | fp16 | bf16 |
+|---|---|---|---|
+| 2048^3 | 8.39 TF | 6.64 TF | 4.26 TF |
+| 4096^3 | 8.16 TF | 6.92 TF | 4.40 TF |
+| batched b=8, 1024^3 | 7.52 TF | 7.05 TF | - |
+| strided-batched b=8, 1024^3 | 7.51 TF | 6.90 TF | - |
+
+Tuned rocBLAS 7.1.1 is already shipped; the fp32 target of 8.8-9.2 TF and the
+HH 14-16 TF target require new Tensile kernels and remain open. Batched and
+strided-batched paths inherit the GEMM performance.
+
+### Epilogues
+
+64x4096x4096, fp32 / fp16:
+
+| path | fp32 | fp16 |
 |---|---|---|
-| cuBLAS GEMV (`torch.mv`) | 1.398 ms / 24 GB/s | not supported |
-| rocBLAS (`F.linear`) | 0.305 ms / 110 GB/s | 0.450 ms / 149 GB/s |
-| Triton `_gemv_rows` | 0.112-0.129 ms / 260-308 GB/s (58-69%) | 0.205-0.215 ms / 313-333 GB/s (70-74%) |
+| GEMM | 0.827 ms | 0.598 ms |
+| linear + bias | 0.877 ms | 0.645 ms |
+| GEMM + separate bias add | 0.858 ms | 0.636 ms |
+| linear + bias + residual | 0.907 ms | 0.676 ms |
+| linear + bias + GELU | 0.883 ms | 0.630 ms |
 
-The Triton kernel loads the weight row block once per program, keeps the
-activation vector in cache and accumulates in fp32. M=4 is only modestly
-better than rocBLAS (127 vs 112 GB/s fp16); M=16/32, dwordx4 unpacking and
-split-K remain open. `cublasSgemv` (fp32) is unsupported by libcublas.so.
+The cublasLt bias epilogue is correct but not faster than a separate add at
+this size; residual/activation epilogues are unfused. Bias error matches the
+unfused path (fp32 0, fp16 0.0038).
 
-`rocblaslt`/`Kernels.so-000-gfx1010.hsaco` messages from the hipBLASLt
-fallback are cosmetic.
+### bf16 emulation
+
+`zluda_ops/bf16.py` converts bf16 operands to fp32, runs the tuned fp32 GEMM
+and casts the result back:
+
+| n | native bf16 | fp32 emulation | relative error |
+|---|---|---|---|
+| 2048 | 3.75 ms / 4.58 TF | 2.52 ms / 6.83 TF | 0.0139 (both) |
+| 4096 | 31.23 ms / 4.40 TF | 17.35 ms / 7.92 TF | 0.0196 (both) |
+
+This meets the 6-7 TF bf16 target at the cost of temporary fp32 tensors.
+
+### int8
+
+`torch._int_mm` is rejected by the cuBLASLt fallback with
+`CUBLAS_STATUS_INVALID_VALUE`; no int8 path is available through ZLUDA today.
+Quantization remains Stage 3 work.
+## Stage 2 - SDPA-compatible Triton flash attention (2026-11-24)
+
+`zluda_ops/flash_attention.py` packages the canonical fwd+bwd kernels as an
+autograd Function with an SDPA-compatible entry point, a `FlashAttention`
+module and a `flash_attn_func` shim. GQA/MQA is handled by expanding K/V
+heads; unsupported cases (non-causal backward, masks, dropout, head_dim != 64,
+sequence not divisible by 128) fall back to PyTorch math SDPA.
+
+| case (fp16, B1 H8 D64) | Triton fwd | math fwd | fwd+bwd | fwd err | grad err |
+|---|---|---|---|---|---|
+| 512 causal | 0.48 ms | 0.84 ms | 1.38 ms | 0.002 | 0.002 |
+| 1024 causal | 1.10 ms | 2.05 ms | 3.59 ms | 0.002 | 0.004 |
+| 2048 causal | 3.11 ms | 7.54 ms | ~10.9 ms | 0.001 | 0.004 |
+| 512 causal, GQA H=8/KV=2 | 0.54 ms | 0.85 ms | 1.59 ms | 0.002 | 0.006 |
+
+Non-causal Triton forward matches math but the backward kernel is causal-only;
+the wrapper uses math for non-causal training. Sliding window, varlen, softcap,
+dropout and flash-decoding remain open (Stage 2.2/2.3).

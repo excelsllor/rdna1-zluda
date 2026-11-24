@@ -247,6 +247,8 @@ run-zluda.cmd venv\Scripts\python.exe smoke\flex_attn.py
 run-zluda.cmd venv\Scripts\python.exe bench\roofline.py
 run-zluda.cmd venv\Scripts\python.exe bench\regression.py
 run-zluda.cmd venv\Scripts\python.exe bench\gemv.py
+run-zluda.cmd venv\Scripts\python.exe bench\stage1.py
+run-zluda.cmd venv\Scripts\python.exe bench\flash_pack.py
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -292,4 +294,6 @@ Expected reference numbers are in `RESULTS_RDNA1.md`.
 - `RESULTS_RDNA1.md` — measurements and ZLUDA vs native ROCm comparison.
 - `ROADMAP.md` — priorities, stages, acceptance metrics.
 - `bench/`, `smoke/` — benchmark and validation scripts.
+- `zluda_ops/` — Python ops: SDPA-compatible causal flash attention (GQA
+  support) and a bf16→fp32 GEMM emulation helper.
 - `build-env.cmd`, `run-zluda.cmd` — build/run helpers.

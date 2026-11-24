@@ -125,10 +125,20 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
   172 ns, cache-resident load ~3.1 TB/s. Clock/power monitoring is blocked:
   ZLUDA NVML returns NotSupported and the ROCm 10.1 user space has no
   rocm-smi/amd-smi on Windows.
-- **2026-11-24 — Stage 1.2 (partial):** `bench/gemv.py` adds a Triton GEMV
-  kernel for M=1. fp16 260–308 GB/s (58–69%), fp32 313–333 GB/s (70–74%),
-  versus 110/149 GB/s through rocBLAS `linear`; `cublasSgemv` fp32 is
-  unsupported. M=16/32, dwordx4 unpacking and split-K remain open.
+- **2026-11-24 - Stage 1 (baseline complete):** `bench/gemv.py` adds a Triton
+  GEMV/skinny kernel for M=1..32. M=1 294/311 GB/s fp16/fp32 (66/69%), M=4 278,
+  M=8 242 (fp16), M=16/32 are compute-bound (155/78); rocBLAS linear is
+  108-155 GB/s and `cublasSgemv` fp32 is unsupported. `bench/stage1.py`
+  records the GEMM shape grid (fp32 8.16, fp16 6.92, bf16 4.40 TF at 4096),
+  batched/strided GEMM (7.5/6.9 TF), bias/residual/GELU epilogues, bf16 fp32
+  emulation (7.92 TF at 4096, meets the 6-7 TF target) and the unsupported
+  int8 path. Open: re-tuned Tensile for fp32 8.8-9.2/HH 14-16, M=16/32 GEMV,
+  fused non-bias epilogues, int8 (Stage 3).
+- **2026-11-24 - Stage 2.1 (partial):** `zluda_ops/flash_attention.py` exposes
+  the causal Triton FA as an autograd op, SDPA-compatible function and module;
+  GQA works, fwd 1.6-2.4x faster than math SDPA, grads within 0.006.
+  Non-causal backward and sliding/varlen/softcap/dropout fall back or remain
+  open.
 
 ## Definition of done (metrics)
 - fp32 GEMM 8.18→**8.8–9.2 TF**; HPA 6.96→**7.5–8**; HH 12.3→**14–16**;
