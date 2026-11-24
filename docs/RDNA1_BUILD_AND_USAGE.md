@@ -244,6 +244,9 @@ run-zluda.cmd venv\Scripts\python.exe bench\fp16_acc.py
 run-zluda.cmd venv\Scripts\python.exe bench\triton_flash_canon.py
 run-zluda.cmd venv\Scripts\python.exe bench\math_attn_fb.py
 run-zluda.cmd venv\Scripts\python.exe smoke\flex_attn.py
+run-zluda.cmd venv\Scripts\python.exe bench\roofline.py
+run-zluda.cmd venv\Scripts\python.exe bench\regression.py
+run-zluda.cmd venv\Scripts\python.exe bench\gemv.py
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -261,6 +264,14 @@ Expected reference numbers are in `RESULTS_RDNA1.md`.
   and `TRITON_PTXAS_PATH` to ZLUDA's `ptxas.exe`.
 - **Triton: undefined `__zluda_ptx_impl_ldmatrix_m8n8_x2_trans_b16`**: the
   `llvm_zluda` IR shim must be present (included in this tree).
+- **Triton fails in `load_binary` with `Triton Error [CUDA]: error`**: check
+  that `target\release\ptxas.exe` exists; rebuild it with
+  `build-env.cmd cargo build --release -p ptxas`. Triton uses this stub to
+  forward PTX to ZLUDA instead of producing NVIDIA SASS.
+- **No clocks/power telemetry**: ZLUDA NVML reports `NotSupported` and the
+  Windows ROCm 10.1 packages do not ship rocm-smi/amd-smi. Use the driver's
+  fixed performance profile for reproducible runs; utilization can still be
+  sampled with Windows GPU performance counters.
 - **`cudaErrorSymbolNotFound` with PyTorch**: you are using a cu128+ wheel
   (SASS only). Use `cu118`.
 - **`cublasLtMatmulAlgoGetHeuristic` / `cublasLtMatmulDescCreate` errors**:

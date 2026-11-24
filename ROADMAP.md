@@ -116,6 +116,20 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 - `ldmatrix.m8n8.x2.trans.b16` shim (or regenerate the bitcode), RDNA1 dp4a
   fallback, PTX cache-hint parsing, cuBLASLt→rocBLAS fallback; tests included.
 
+## Progress log
+
+- **2026-11-24 — Stage 0 (partial):** added `bench/roofline.py` and
+  `bench/regression.py`. 12/12 correctness checks pass; 4096 GEMM 8.16 TF
+  fp32 / 6.91 fp16 / 4.40 bf16. Roofline: FP32 ALU 5.0 TF (51%, Triton
+  codegen), FP16 ALU 18.8 TF (96%), memory 373–378 GB/s (83–85%), HBM latency
+  172 ns, cache-resident load ~3.1 TB/s. Clock/power monitoring is blocked:
+  ZLUDA NVML returns NotSupported and the ROCm 10.1 user space has no
+  rocm-smi/amd-smi on Windows.
+- **2026-11-24 — Stage 1.2 (partial):** `bench/gemv.py` adds a Triton GEMV
+  kernel for M=1. fp16 260–308 GB/s (58–69%), fp32 313–333 GB/s (70–74%),
+  versus 110/149 GB/s through rocBLAS `linear`; `cublasSgemv` fp32 is
+  unsupported. M=16/32, dwordx4 unpacking and split-K remain open.
+
 ## Definition of done (metrics)
 - fp32 GEMM 8.18→**8.8–9.2 TF**; HPA 6.96→**7.5–8**; HH 12.3→**14–16**;
   bf16 4.42→**6–7**.

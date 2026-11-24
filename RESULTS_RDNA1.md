@@ -132,3 +132,47 @@ torch 2.7/cu118; their CUDA kernels are sm80+ SASS/PTX); TF32 MMA in Triton
 - Scripts: `bench/matmul_bench.py`, `bench/fp16_acc.py`,
   `bench/triton_flash_canon.py`, `bench/math_attn_fb.py`, `smoke/*`.
 - Patch: `local-patches/zluda-rdna1-gfx1010.patch`.
+
+## Stage 0 - roofline and regression baseline (2026-11-24)
+
+Commands:
+
+```bat
+run-zluda.cmd venv\Scripts\python.exe bench\roofline.py
+run-zluda.cmd venv\Scripts\python.exe bench\regression.py
+```
+
+| metric | result | note |
+|---|---|---|
+| FP32 ALU (Triton, 4 chains) | 5.0 TF / 51% | Triton codegen limit; rocBLAS GEMM reaches 8.16 TF |
+| FP16 ALU (Triton, packed) | 18.8 TF / 96% | reaches the packed FP16 peak |
+| copy / add / triad | 373-378 GB/s / 83-85% | 448 GB/s theoretical |
+| reduction | 341-373 GB/s / 76-83% | read-only traffic |
+| HBM latency | 172 ns/load | dependent pointer chase, 32 MB |
+| cache-resident load | ~3.1 TB/s | 32 KB working set |
+| clocks / power | unavailable | ZLUDA NVML returns NotSupported |
+
+Regression gate: 12/12 correctness checks pass (matmul fp32/fp16/bf16,
+linear, conv2d, softmax, layernorm, SDPA math). Reference 4096 GEMM:
+fp32 8.16 TF, fp16 6.91 TF, bf16 4.40 TF; math SDPA causal 1.14 TF at 2048.
+
+Clock/power monitoring is still open: neither ZLUDA NVML nor the installed
+ROCm 10.1 user space exposes rocm-smi/amd-smi on this Windows host.
+
+## Stage 1 - Triton GEMV (M=1) (2026-11-24)
+
+`bench/gemv.py`, N=K=4096, best of three runs:
+
+| path | fp16 M=1 | fp32 M=1 |
+|---|---|---|
+| cuBLAS GEMV (`torch.mv`) | 1.398 ms / 24 GB/s | not supported |
+| rocBLAS (`F.linear`) | 0.305 ms / 110 GB/s | 0.450 ms / 149 GB/s |
+| Triton `_gemv_rows` | 0.112-0.129 ms / 260-308 GB/s (58-69%) | 0.205-0.215 ms / 313-333 GB/s (70-74%) |
+
+The Triton kernel loads the weight row block once per program, keeps the
+activation vector in cache and accumulates in fp32. M=4 is only modestly
+better than rocBLAS (127 vs 112 GB/s fp16); M=16/32, dwordx4 unpacking and
+split-K remain open. `cublasSgemv` (fp32) is unsupported by libcublas.so.
+
+`rocblaslt`/`Kernels.so-000-gfx1010.hsaco` messages from the hipBLASLt
+fallback are cosmetic.
