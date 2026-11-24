@@ -68,6 +68,7 @@ ComfyUI notes, and troubleshooting.
 run-zluda.cmd venv\Scripts\python.exe train.py
 run-zluda.cmd venv\Scripts\python.exe bench\matmul_bench.py
 run-zluda-auto.cmd venv\Scripts\python.exe inference.py
+run-zluda-train.cmd path\to\train.py
 ```
 
 ## Known limitations

@@ -25,6 +25,21 @@ or explicitly:
 import zluda_ops.auto
 ```
 
+Training / MHA-heavy models (P0 workaround for the cuDNN FMHA crash):
+
+```bat
+run-zluda-train.cmd path\to\train.py [args...]
+```
+
+This mode:
+- installs a slow-path `nn.MultiheadAttention` that avoids the unsupported
+  cuDNN/CUTLASS FMHA kernel and excludes it from Dynamo tracing;
+- disables the inference auto-dispatch (`ZLUDA_AUTO_OPS=0`) so `torch.compile`
+  is not disturbed by the `F.linear` wrapper;
+- caps VRAM at 85% (`ZLUDA_VRAM_FRACTION`).
+- `torch.compile` for this model is intentionally skipped: it takes ~30
+  minutes even on an NVIDIA T4 and is not a P0 blocker.
+
 ComfyUI: `tools\install_auto.py` installs the `zluda_ops_auto` custom node,
 which applies the patch after ComfyUI has configured the allocator:
 
@@ -40,10 +55,12 @@ Controls:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ZLUDA_AUTO_OPS=1` | off | load the patch through the venv `.pth` |
+| `ZLUDA_AUTO_OPS=1` | off | load the inference patch through the venv `.pth` |
 | `ZLUDA_OPS_DISABLE=1` | off | never install the patch |
 | `ZLUDA_AUTO_VERBOSE=1` | off | print the install message |
 | `ZLUDA_AUTO_BF16_MAX_MB` | 64 | max bf16 weight size for auto emulation; 0 disables |
+| `ZLUDA_MHA_SLOW=1` | off | force the slow math path for `nn.MultiheadAttention` |
+| `ZLUDA_VRAM_FRACTION` | 0.85 | per-process VRAM fraction for `run-zluda-train.cmd` |
 
 Safety conditions:
 

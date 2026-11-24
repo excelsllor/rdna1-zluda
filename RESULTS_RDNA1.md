@@ -274,3 +274,20 @@ the `zluda_ops_auto` custom node installed by `tools/install_auto.py`.
 Auto GEMV uses fp32 products and fp32 accumulation; bf16 auto converts to
 fp32 and casts back; FA keeps fp32 softmax/LSE/accumulation. No int16 path
 exists and int8 remains unsupported. Details: `INTEGRATION.md`.
+## P0 training stability (2026-11-24)
+
+The `bench_zluda_model_compile.py` failure was reproduced: PyTorch selected a
+cuDNN/CUTLASS FMHA kernel (`fmha_cutlassF_f16_aligned_64x64_rf_sm80`) that
+cannot execute on gfx1010; after the failed kernel attempts, backward reported
+`cublasSetWorkspace` `<unknown>`.
+
+Workaround/fix:
+- `zluda_ops/mha.py` forces the slow math path for `nn.MultiheadAttention`
+  (`need_weights=True`, fastpath disabled) and excludes it from Dynamo.
+- `run-zluda-train.cmd` installs the MHA patch, disables inference
+  auto-dispatch and caps VRAM at 85%.
+
+Result on the user model (`FeatureSetRanker`, fp16 autocast, 8 layers):
+- eager full step: **1040–1208 ms**, loss **0.00683**;
+- **0 FATAL** lines, no `cublasSetWorkspace` error;
+- `torch.compile` is skipped for this model: ~30 minutes even on an NVIDIA T4; not a P0 blocker.
