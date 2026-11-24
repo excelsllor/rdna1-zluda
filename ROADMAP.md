@@ -155,6 +155,23 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
   Non-causal backward and sliding/varlen/softcap/dropout fall back or remain
   open.
 
+## P0 status (2026-11-24)
+
+| Item | Status | Note |
+|---|---|---|
+| Training stability / MHA crash | **DONE (eager)** | slow-path MHA; full compile skipped |
+| fp16 accumulation UX | **DONE** | opt-in context, warnings, accuracy table; default off |
+| Tensile HH | **DONE** | existing 110 kernels; 16.73/17.94 TF with override |
+| Tensile SS/HPA | **OPEN** | 8.16/7.19 TF; no new `.dat/.co` kernels |
+| GEMV M1-8 / auto M<=32 | **DONE** | ~2x rocBLAS; inference only |
+| GEMV M16-32 target | **PARTIAL** | 155/78 GB/s; target 70-80% not met |
+| FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
+| FA masks/dropout/window/varlen | **FUNCTIONAL FALLBACK** | correct math; Triton path open |
+| Flash-decoding | **OPEN** | |
+| bf16 native / emulation | **DONE (emulation)** | 4.42 native / 7.92 emulated TF |
+| GPU monitoring | **PARTIAL** | utilization/VRAM; clocks/power blocked |
+| int8 compute | **IMPOSSIBLE** | storage/dequant only |
+
 ## Definition of done (metrics)
 - fp32 GEMM 8.18→**8.8–9.2 TF**; HPA 6.96→**7.5–8**; HH 12.3→**14–16**;
   bf16 4.42→**6–7**.

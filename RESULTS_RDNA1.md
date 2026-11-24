@@ -45,17 +45,17 @@ Triton; the default 8.5 does not exist), `TRITON_PTXAS_PATH`, isolated
 
 ## GEMM results (4096x4096)
 
-> Note: this table predates the P0-5 HH override. Current HH (fp16 accumulation):
-> **16.73 TF** at 4096 and **17.94 TF** at 2048; default 12.1/9.5. SS remains
-> ~8.16 TF and HPA ~7.19 TF. See the P0-5 section at the end. Measurements
-> use random data; zeros/ones/uninitialized buffers are not representative.
+Measurements use random data. Zeros/ones/uninitialized buffers can be ~1 TF
+higher because of GPU power/compression effects and are not representative.
 
-| path | fp32 | fp16 (fp32 accum) | bf16 |
-|---|---|---|---|
-| ROCm 10.1 stock rocBLAS (fallback Tensile) | 28.3 ms / 4.85 TF | 32.6 ms / 4.21 TF | 59.3 ms / 2.32 TF |
-| **ROCm 10.1 + tuned rocBLAS 7.1.1** | **16.8–16.9 ms / 8.13–8.18 TF** | **19.7–19.8 ms / 6.93–6.96 TF** | **31.1 ms / 4.42 TF** |
-| native ROCm 10.1 torch | 32.8 ms / 4.19 TF | 42.2 ms / 3.25 TF | 57.7 ms / 2.38 TF |
+| path | fp32 | fp16 (fp32 accum) | fp16 (fp16 accum) | bf16 native | bf16 fp32 emulation |
+|---|---|---|---|---|---|
+| ROCm 10.1 stock rocBLAS (fallback Tensile) | 4.85 TF | 4.21 TF | — | 2.32 TF | — |
+| **ROCm 10.1 + tuned rocBLAS 7.1.1** | **8.16 TF** | **6.94 TF** | **12.1 TF default / 16.73 TF override** | **4.42 TF** | **7.92 TF** |
+| native ROCm 10.1 torch | 4.19 TF | 3.25 TF | — | 2.38 TF | — |
 
+HH 2048: **17.94 TF** with the existing-kernel override (default 9.5 TF).
+SS/HPA targets remain open (8.16/7.19 TF).
 - fp32 reaches **~84% of theoretical peak** — normal for a well-tuned GEMM.
 - fp16 with fp32 accumulation is bounded by FP32 rate: the tuned HPA kernels use
   `v_fma_mix` (verified by disassembling the Tensile code objects), so ~7 TF is

@@ -18,6 +18,13 @@ try:
 except Exception as exc:
     print(f"zluda train: VRAM limit unavailable: {exc}", flush=True)
 
+if os.environ.get("ZLUDA_FP16_ACC") == "1":
+    try:
+        torch._C._set_cublas_allow_fp16_accumulation(True)
+        print("zluda train: HH fp16 accumulation enabled (experimental)", flush=True)
+    except Exception as exc:
+        print(f"zluda train: fp16 accumulation unavailable: {exc}", flush=True)
+
 if os.environ.get("ZLUDA_AUTO_OPS") == "1":
     import zluda_ops.auto
 else:

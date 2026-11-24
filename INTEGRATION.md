@@ -60,6 +60,7 @@ Controls:
 | `ZLUDA_AUTO_VERBOSE=1` | off | print the install message |
 | `ZLUDA_AUTO_BF16_MAX_MB` | 64 | max bf16 weight size for auto emulation; 0 disables |
 | `ZLUDA_MHA_SLOW=1` | off | force the slow math path for `nn.MultiheadAttention` |
+| `ZLUDA_FP16_ACC=1` | off | experimental HH fp16 accumulation for training |
 | `ZLUDA_VRAM_FRACTION` | 0.85 | per-process VRAM fraction for `run-zluda-train.cmd` |
 
 Safety conditions:
@@ -105,6 +106,14 @@ divisible by 128 and no mask/dropout. `flash_attn_func` supports sliding
 fallback (not the Triton kernel); Triton mask/dropout/window/varlen kernels
 are open. A 1-layer TransformerEncoder compiles in ~1 s; the full 8-layer
 model is skipped because compile takes ~30 min even on a T4.
+
+## Training with HH (experimental)
+
+`run-zluda-train-hh.cmd path\to\train.py` enables global fp16 accumulation
+(`ZLUDA_FP16_ACC=1`) for training. The `gfx1010_hh.csv` override will apply to
+matching HH GEMMs. This is not the default: fp16 accumulation can reduce
+gradient accuracy and should be validated for your model. `run-zluda-train.cmd`
+keeps HPA (fp32 accumulation).
 
 ## Accumulation policy
 
