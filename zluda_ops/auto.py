@@ -53,13 +53,13 @@ def _linear(input, weight, bias=None):
 
 def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
           scale=None, enable_gqa=False):
-    if (not _compiling() and is_causal and attn_mask is None and dropout_p == 0.0
+    if (not _compiling() and attn_mask is None and dropout_p == 0.0
             and query.is_cuda and query.dtype == torch.float16
             and query.shape[-1] == 64 and query.shape[2] % 128 == 0):
         try:
             return _fa.scaled_dot_product_attention(
                 query, key, value, attn_mask=None, dropout_p=0.0,
-                is_causal=True, scale=scale, enable_gqa=enable_gqa,
+                is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
             )
         except Exception:
             pass
