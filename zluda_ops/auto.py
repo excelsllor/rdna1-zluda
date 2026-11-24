@@ -39,7 +39,8 @@ def _linear(input, weight, bias=None):
                 return _bf16.linear(input, weight, bias)
             except Exception:
                 pass
-        if (not _needs_grad(input, weight, bias) and input.dim() == 2 and input.shape[0] <= 8
+        max_m = 16 if input.dtype == torch.float32 else 32
+        if (not _needs_grad(input, weight, bias) and input.dim() == 2 and input.shape[0] <= max_m
                 and input.dtype in (torch.float16, torch.float32)
                 and weight.dtype == input.dtype and _gemv._supported(input, weight, bias)):
             try:

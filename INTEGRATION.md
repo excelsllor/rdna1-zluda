@@ -96,6 +96,14 @@ back.
 that warns and restores the previous setting. Use it only for inference and
 validate accuracy (`bench/fp16_ux.py`); it is off by default.
 
+## Attention API
+
+Causal and non-causal Triton FA work for fp16, head_dim=64, sequence lengths
+divisible by 128 and no mask/dropout. `flash_attn_func` supports sliding
+`window_size`; `flash_attn_varlen_func` accepts packed q/k/v and
+`cu_seqlens`. Masks, dropout, sliding window and varlen currently use the
+correct math fallback (not the Triton kernel); Triton mask/dropout is open.
+
 ## Accumulation policy
 
 | Path | Inputs | Products | Accumulation | Output |

@@ -320,3 +320,21 @@ The Triton backward kernel now has a non-causal path. B1 H8 D64 fp16:
 
 Masks, dropout, sliding window, varlen and flash-decoding still use the math
 fallback or remain open.
+## P0 sliding window / varlen (2026-11-24)
+
+`flash_attn_func(window_size=...)` and `flash_attn_varlen_func` are available.
+They currently use the correct math fallback (autograd verified); the Triton
+kernel still handles only mask/dropout-free causal/non-causal attention.
+
+| case | result |
+|---|---|
+| sliding causal 128, window (32,0) | fwd max err 0 |
+| varlen [64,128], causal | fwd max err 0.001, grad OK |
+| non-causal 512/1024 Triton | fwd err 2e-4, grad err 5e-4/2e-4 |
+
+## P0 auto GEMV M<=32 (2026-11-24)
+
+`zluda_ops.auto` dispatches Triton GEMV for M<=16 fp32 and M<=32 fp16
+(inference/no-grad only). Correctness vs original `F.linear`: fp16 max err
+5e-4, fp32 <=1.4e-6. M=16/32 target bandwidth (70-80%) remains open; fp32 M=32
+uses the rocBLAS fallback because it is faster.
