@@ -22,28 +22,45 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 
 ## Priority matrix
 
-| Priority | Workstream | Benefit | Effort | Dependencies |
-|---|---|---|---|---|
-| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | basis for all decisions | low | — |
-| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | ~2x fp16 (inference) | low | done, needs UX |
-| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | HH achieved via existing override; SS/HPA open | medium | rocBLAS 7.1.1 |
-| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | decode (LLM inference) | medium | benchmarks |
-| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | training + inference | medium | fwd+bwd exists |
-| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | 1.5–2x decode | medium | FA integration |
-| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | largest memory win for 8 GB | high | GEMV/GEMM |
-| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | LLM on 5700 XT | high | outside ZLUDA |
-| **P1** | bf16 emulation: convert once per tile, high-half mask | 4.4→6–7 TF | medium | Tensile/LLVM |
-| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | memory/speed | medium | Triton |
-| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | SD/CNN speedup if MIOpen wins | medium | test first; no ZLUDA-native kernels |
-| **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | high if SD is a target | medium-high | measure first |
-| **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | +5–15% | medium | Tensile |
-| **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | +5–20% on kernels | low-medium | benchmarks |
-| **P2** | xformers / flash-attn CUDA compatibility: source builds for cu118, PTX execution through ZLUDA, API-compatible wrapper + benchmarks | ecosystem compatibility | high | cu118 toolchain; risk: sm80 kernels and no matrix cores |
-| **P2** | Allocator (`PYTORCH_HIP_ALLOC_CONF`), HIP Graphs, offload, gfx1010 runtime stability | OOM/latency/stability | medium | tests |
-| **P3** | Paged attention / vLLM, prefix caching, speculative decoding | serving only | high | decide on serving |
-| **P3** | 8-bit optimizer storage only (no int8 compute); bitsandbytes/SmoothQuant int8 kernels rejected | memory only | high | — |
-| **P3** | Distribution (wheels/Docker), CI on GPU, ExLlamaV2/A1111/onnx integrations | usability | medium | — |
-| **Icebox** | SageAttention (user decision); int8 GEMM/tensor acceleration (hardware absent); ROCm rollback; Vulkan/OpenCL backend | rejected/out of scope | — | — |
+| Priority | Workstream | Status | Benefit | Effort | Dependencies |
+|---|---|---|---|---|---|
+| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** | basis for all decisions | low | clocks/power blocked |
+| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
+| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **PARTIAL** | HH achieved; SS/HPA open | medium | rocBLAS 7.1.1; toolchain for new kernels |
+| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
+| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks/dropout/window/varlen are math fallback |
+| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
+| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
+| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
+| **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
+| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **OPEN** | memory/speed | medium | Triton |
+| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **AUDIT DONE / TEST OPEN** | SD/CNN speedup if MIOpen wins | medium | MIOpen; no ZLUDA-native kernels |
+| **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **OPEN** | high if SD is a target | medium-high | measure first |
+| **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | **PARTIAL** | +5–15% | medium | measured, not fused/auto |
+| **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | **OPEN** | +5–20% on kernels | low-medium | benchmarks |
+| **P2** | xformers / flash-attn CUDA compatibility: source builds for cu118, PTX through ZLUDA, API wrapper + benchmarks | **OPEN** | ecosystem compatibility | high | sm80 kernels; no matrix cores |
+| **P2** | Allocator (`PYTORCH_HIP_ALLOC_CONF`), HIP Graphs, offload, gfx1010 runtime stability | **PARTIAL** | OOM/latency/stability | medium | ComfyUI workaround; no full fix |
+| **P3** | Paged attention / vLLM, prefix caching, speculative decoding | **OPEN** | serving only | high | decide on serving |
+| **P3** | 8-bit optimizer storage only; bitsandbytes/SmoothQuant int8 kernels rejected | **OPEN** | memory only | high | no int8 units |
+| **P3** | Distribution (wheels/Docker), CI on GPU, ExLlamaV2/A1111/onnx integrations | **OPEN** | usability | medium | no GPU CI yet |
+| **Icebox** | SageAttention; int8 GEMM/tensor acceleration (hardware absent); ROCm rollback; Vulkan/OpenCL backend | **REJECTED** | out of scope | — | — |
+
+Status keys: **DONE**, **PARTIAL**, **OPEN**, **BLOCKED**, **REJECTED**, and **AUDIT DONE / TEST OPEN**.
+
+## Stage status
+
+| Stage | Status | Note |
+|---|---|---|
+| 0 — Foundation | **PARTIAL** | roofline/regression done; clocks/power blocked |
+| 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
+| 2 — Attention | **PARTIAL** | causal/non-causal/GQA done; masks/dropout/window/varlen fallback; flash-decoding open |
+| 3 — Quantization | **OPEN** | storage path not implemented; no int8 compute |
+| 4 — Fused kernels | **OPEN** | not started |
+| 5 — Diffusion/MIOpen | **PARTIAL** | Winograd audit done; benchmark and auto-selection open |
+| 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
+| 7 — Compiler/LLVM/Triton | **OPEN** | WGP/CU and autotune not started |
+| 8 — Integrations/distribution | **PARTIAL** | ComfyUI auto/GGUF works; wheels/CI/other apps open |
+| Parallel — Upstreaming | **PARTIAL** | gfx1010 fixes in fork; upstream PRs not done |
 
 ## Stages
 
