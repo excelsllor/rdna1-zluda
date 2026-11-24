@@ -1,67 +1,143 @@
 # Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 
 Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
-runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements.
+runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
+`docs/RDNA1_BUILD_AND_USAGE.md` for build/usage instructions.
 
-## Done (2026-11-24)
+## Facts and constraints
 
-- [x] Build upstream ZLUDA v7-preview.21 (LLVM static, x64 release).
-- [x] gfx1010 fixes: `:xnack-` ISA/CPU parsing, `dp4a` software fallback,
-      `ld`/`st` cache-hint parsing, llvm_zluda IR shim for
-      `ldmatrix.m8n8.x2.trans.b16`.
-- [x] cuBLASLt→rocBLAS fallback with per-row bias and fp16-compute descriptors.
-- [x] Tuned rocBLAS for gfx1010: HIP 6.4.2 package and ROCm 10.1 + rocBLAS 7.1.1
-      unified stack (fp32 8.18 TF, ~84% of peak; fp16 HPA 6.96 TF).
-- [x] Optional fp16 accumulation path (packed `v_pk_fma_f16`): up to 12.7 TF.
-- [x] PyTorch 2.7.1+cu118 venv, Triton 3.3.1, torch.compile/Inductor.
-- [x] Triton flash attention forward+backward (correct gradients) and
-      FlexAttention; benchmarks vs math SDPA.
+- gfx1010: 40 CU / 20 WGP, wave32, **no matrix units (no tensor cores/MFMA)**,
+  **no `v_dot4`** (dp4a absent). Packed FP16 (`v_pk_fma_f16`) only with
+  fp16 accumulation.
+- Peaks: FP32 9.75 TFLOPS, FP16 19.51 TFLOPS (packed 2:1 only), no bf16
+  hardware. Memory 448 GB/s, 8 GB VRAM, PCIe 4.0 x16 (~25 GB/s host link).
+- Runtime: ROCm 10.1 user space (HIP 7.16, MIOpen) + rocBLAS 7.1.1 with tuned
+  gfx1010 Tensile libraries. PyTorch `2.7.1+cu118` (PTX path), Triton 3.3.1.
+- ZLUDA compiles device code with `-wavefrontsize64,+cumode` (wave32 + CU mode).
+- Known limitations: PyTorch SDPA flash/memory-efficient kernels are not
+  available on gfx1010 (no MFMA); `cuXXX` performance libraries are mapped to
+  ROCm equivalents where possible (hipBLASLt has no gfx1010 kernels, so a
+  rocBLAS fallback is used).
 
-## Next
+## Priority matrix
 
-### 1. Custom Tensile tuning for gfx1010 (GEMM)
-- Build Tensile toolchain matching rocBLAS 7.1.1 (ROCm 7.1.1 sources).
-- Generate/tune `SS` (fp32), `HH_HPA` (fp16 in, fp32 accum) and `HH`
-  (fp16 in/out, fp16 accum) for the shapes used by ML workloads (e.g.
-  1024/2048/4096 square, K in 1024..16384, batched).
-- Targets: fp32 8.8–9.2 TF, HPA 7.5–8 TF, HH 14–16 TF.
-- Effort: hours to days on this GPU; ship resulting `.dat`/`.co` sets and a
-  launcher profile. Risk: medium (library format/version must match `rocblas.dll`).
+| Priority | Workstream | Benefit | Effort | Dependencies |
+|---|---|---|---|---|
+| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | basis for all decisions | low | — |
+| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | ~2x fp16 (inference) | low | done, needs UX |
+| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | +8–15% GEMM, HH 12→14–16 TF | medium | rocBLAS 7.1.1 |
+| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | decode (LLM inference) | medium | benchmarks |
+| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | training + inference | medium | fwd+bwd exists |
+| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | 1.5–2x decode | medium | FA integration |
+| **P1** | int4/int8 weight-only: GEMV (decode), dequant+GEMM (prefill), group-size 32/64/128 | largest win for 8 GB | high | GEMV/GEMM |
+| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) for the llama.cpp HIP backend (MMQ without dp4a) | LLM on 5700 XT | high | outside ZLUDA |
+| **P1** | bf16 emulation: convert once per tile, high-half mask | 4.4→6–7 TF | medium | Tensile/LLVM |
+| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | memory/speed | medium | Triton |
+| **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | high if SD is a target | medium-high | measure first |
+| **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | +5–15% | medium | Tensile |
+| **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | +5–20% on kernels | low-medium | benchmarks |
+| **P2** | xformers / flash-attn CUDA compatibility: source builds for cu118, PTX execution through ZLUDA, API-compatible wrapper + benchmarks | ecosystem compatibility | high | cu118 toolchain; risk: sm80 kernels and no matrix cores |
+| **P2** | Allocator (`PYTORCH_HIP_ALLOC_CONF`), HIP Graphs, offload, gfx1010 runtime stability | OOM/latency/stability | medium | tests |
+| **P3** | Paged attention / vLLM, prefix caching, speculative decoding | serving only | high | decide on serving |
+| **P3** | 8-bit optimizers, bitsandbytes, SmoothQuant | training/memory | high | — |
+| **P3** | Distribution (wheels/Docker), CI on GPU, ExLlamaV2/A1111/onnx integrations | usability | medium | — |
+| **Icebox** | SageAttention (user decision); ROCm rollback; Vulkan/OpenCL backend | rejected/out of scope | — | — |
 
-### 2. Packed-fp16 inference GEMM
-- Tune `HH` kernels for inference tile shapes; validate accuracy vs fp32
-  accumulation; expose a deliberate opt-in (torch flag
-  `_set_cublas_allow_fp16_accumulation`, or a ZLUDA env switch) and document it.
-- Consider mixed strategies: fp32 accumulation for training, fp16 accumulation
-  for inference only.
+## Stages
 
-### 3. Attention integration
-- Wrap the Triton flash kernel (fwd+bwd) in an `nn.Module`/custom op with
-  `scaled_dot_product_attention`-compatible signature, including causal masks.
-- Benchmark FlexAttention fwd+bwd at 1024/2048 and consider paged/varlen
-  variants.
-- Keep math SDPA fallback for unsupported shapes/head dims.
+### Stage 0 — Foundation (1–2 days)
+- Roofline microbenchmarks (ALU, memory bandwidth, LDS, latencies).
+- Correctness regression tests with dtype tolerances; performance grid
+  (GEMM/attention/GEMV).
+- Clock/power monitoring (sclk, mclk, temperature) and a fixed profile for
+  reproducible results.
 
-### 4. cuBLASLt fallback completeness
-- Support `RELU`/`GELU` (and AUX) epilogues; batched GEMM via
-  `rocblas_gemm_strided_batched_ex`; row-major orders.
-- Add unit tests comparing against cuBLAS-path results.
+### Stage 1 — GEMM (≈1 week)
+1. Tensile 7.1.1 tuning for SS / HH_HPA / HH over LLM shapes (K 1–16k,
+   M/N 1–8k, batched) and SD shapes; ship `.dat`/`.co` sets and a launcher
+   profile; regression tests.
+2. GEMV/skinny GEMM (M=1..32): Triton kernel with dwordx4 loads, unpack and
+   conversion, fp16 activations; target 70–80% of 448 GB/s.
+3. Batched/strided-batched GEMM; bias/activation/residual epilogues.
+4. bf16: convert once per tile into LDS/registers, mask for the high half;
+   target 6–7 TF.
+5. Evaluate int8 GEMM (unpack to fp16 + `v_pk_fma_f16`); fp8 storage for
+   memory/traffic savings.
 
-### 5. Upstreaming
-- Submit the `ldmatrix.m8n8.x2.trans.b16` shim (or add the missing function to
-  `zluda_ptx_impl.cpp` and regenerate both bitcode blobs with the documented
-  LLVM build).
-- Submit RDNA1 `dp4a` fallback, gcn_arch feature stripping, and the ld/st
-  cache-hint parser relaxations.
+### Stage 2 — Attention (≈1 week)
+1. Package Triton FA (fwd+bwd) as an op/nn.Module with an
+   `scaled_dot_product_attention`-compatible API, GQA/MQA, causal, sliding
+   window, varlen, softcap/dropout.
+2. Flash-decoding (split-KV + log-sum-exp merge) for decode at small batch.
+3. Benchmarks 512–8k against math SDPA; acceptance: ≥1.5x fwd at 2k+, decode
+   ≥1.5x at 4k+.
+4. Prefix caching / speculative decoding at framework level after Stage 3.
 
-### 6. Packaging
-- Release zip profiles: default (unified stack), inference (fp16 accumulate),
-  GEMM (HIP 6.4 + tuned rocBLAS).
-- Launcher: detect tuned rocBLAS libraries and warn if absent.
-- Automated benchmark harness with JSON output and regression tracking.
+### Stage 3 — Quantization (2–3 weeks; largest win for 8 GB)
+1. int4/int8 weight-only: GEMV (decode), dequant+GEMM (prefill), GPTQ/AWQ
+   group-size 32/64/128; accuracy validation vs fp16/fp32.
+2. GGUF k-quants for the llama.cpp HIP backend (MMQ without dp4a: unpack +
+   packed fp16), tracked outside ZLUDA.
+3. 8-bit optimizers / bitsandbytes only if training on 8 GB becomes a goal.
 
-### 7. Explicitly out of scope
+### Stage 4 — Fused kernels (≈1 week)
+- RMSNorm/LayerNorm fwd+bwd, RoPE, SwiGLU/GeGLU, softmax, chunked
+  cross-entropy, fused AdamW/clip, GPU sampling, gather/scatter/index_select.
+- Write only where Inductor is worse; inspect with `TORCH_LOGS=output_code`
+  first.
+
+### Stage 5 — Diffusion / MIOpen (1–2 weeks, after measurements)
+- Measure conv/batchnorm/RNN on gfx1010 in the unified stack.
+- Solver/perf-db work (implicit GEMM, Winograd, direct fp16), channels_last,
+  VAE tiling, GroupNorm+SiLU, SD attention with small heads.
+- Only if ComfyUI/SD/Flux is a primary target.
+
+### Stage 6 — Runtime and memory (parallel)
+- Allocator tuning (`expandable_segments`, `max_split_size_mb`,
+  `garbage_collection_threshold` — verify support).
+- HIP Graphs for decode; offload of weights/KV/optimizer with overlap;
+  gradient checkpointing; streaming safetensors loading.
+- Fix gfx1010-specific crashes/page faults and unsupported architecture checks.
+
+### Stage 7 — Compiler / LLVM / Triton (parallel)
+- WGP vs CU experiment (drop `+cumode`), `s_clause`/`s_waitcnt`/VMEM grouping,
+  `-O3`/fast-math where valid.
+- Autotune configs for wave32 and Inductor tables; correctness gates after
+  every change.
+
+### Stage 8 — Integrations and distribution
+- xformers / flash-attn CUDA compatibility (build from source for cu118,
+  execute sm80 PTX through ZLUDA, API-compatible wrappers; benchmark and
+  document limits).
+- llama.cpp HIP backend, ExLlamaV2/V3, ComfyUI/A1111/Forge, onnxruntime.
+- Wheels/Docker for easy installation; CI with local GPU runs.
+
+### Parallel track — Upstreaming
+- `ldmatrix.m8n8.x2.trans.b16` shim (or regenerate the bitcode), RDNA1 dp4a
+  fallback, PTX cache-hint parsing, cuBLASLt→rocBLAS fallback; tests included.
+
+## Definition of done (metrics)
+- fp32 GEMM 8.18→**8.8–9.2 TF**; HPA 6.96→**7.5–8**; HH 12.3→**14–16**;
+  bf16 4.42→**6–7**.
+- GEMV int4: ≥**70–80%** of 448 GB/s; 7B int4 decode target **35–60 tok/s**
+  (theoretical ~100).
+- Flash fwd 2048: 3.09→**≤2.8 ms**; flash-decoding 4k+: **≥1.5–2x**;
+  gradient error ≤**1e-3**.
+- Chunked CE: logits memory reduced by the chunk factor.
+- MIOpen/SD: measurable conv/UNet speedup in ComfyUI over the current unified
+  stack.
+- Reproducible results: JSON reports, fixed clocks, local/CI runs.
+
+## Risks
+- Tensile library format must match the `rocblas.dll` version (regression
+  tests required).
+- fp16 accumulation changes numerics: opt-in only, with an accuracy table.
+- MIOpen may lack the needed solvers/perf-db: measure before investing.
+- xformers/flash-attn CUDA kernels target sm80+ SASS/PTX; RDNA1 has no matrix
+  cores, so gains may be limited or negative — timeboxed investigation.
+- Paged/vLLM only if serving is required.
+
+## Rejected approaches
 - SageAttention (user decision).
-- xformers / flash-attn source builds for sm80+ CUTLASS kernels: no RDNA1
-  support; would require major porting work and matrix-core features that the
-  hardware lacks.
+- Rolling back ROCm (breaks ZLUDA/native torch on gfx1010).
+- Vulkan/OpenCL backend (loses required functionality).
