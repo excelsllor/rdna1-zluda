@@ -304,3 +304,22 @@ Expected reference numbers are in `RESULTS_RDNA1.md`.
 - `zluda_ops/` — Python ops: SDPA-compatible causal flash attention (GQA
   support) and a bf16→fp32 GEMM emulation helper.
 - `build-env.cmd`, `run-zluda.cmd` — build/run helpers.
+
+### Tensile HH override
+
+`run-zluda.cmd` applies `tensile_overrides/gfx1010_hh.csv` through
+`ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH` and sets `ROCBLAS_USE_HIPBLASLT=0`.
+It targets HH (fp16 in/out and fp16 compute) square shapes 1024/2048/4096 and
+uses kernels already present in the tuned rocBLAS 7.1.1 library:
+
+| n | default HH | override |
+|---|---|---|
+| 2048 | ~9.5 TF | **17.94 TF** |
+| 4096 | ~12.1 TF | **16.73 TF** |
+
+The profile is build-local and is ignored with a warning if the indices do
+not match the installed rocBLAS. Remove the file or unset the variable to
+roll back. It only matches when PyTorch fp16 accumulation is explicitly
+enabled (`torch._C._set_cublas_allow_fp16_accumulation(True)`); HPA/SS lines
+are intentionally not included. Use random data for measurements: zeros,
+ones and uninitialized buffers are not representative.

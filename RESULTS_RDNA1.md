@@ -365,3 +365,21 @@ No Tensile toolchain or rocblas-bench is present in the Windows ROCm 10.1
 package; only the existing tuned rocBLAS 7.1.1 libraries exist. The fp32
 8.8-9.2 TF and HH 14-16 TF targets require new `.dat/.co` kernels and remain
 blocked externally.
+## P0-5 Tensile kernels already present (2026-11-24)
+
+The tuned rocBLAS 7.1.1 library contains 110 HH solutions for gfx1010. A
+`ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH` profile selects better existing kernels;
+no Tensile rebuild was needed.
+
+| n | default HH | override HH | speedup |
+|---|---|---|---|
+| 1024 | ~12.4 TF | ~12.9 TF | 1.04x |
+| 2048 | ~9.5 TF | **17.94 TF** | 1.89x |
+| 4096 | ~12.1 TF | **16.73 TF** | 1.38x |
+
+Profile: `tensile_overrides/gfx1010_hh.csv`; launcher: `run-zluda.cmd`.
+Raw index mapping on this build: `raw = -solution_index - 10`.
+
+SS remains ~8.16 TF and HPA ~7.19 TF; their P0-5 targets are not reached by
+the existing kernels. Measurements with zeros/ones/uninitialized buffers are
+inflated (SS up to ~9.1 TF) and are not representative of random model data.

@@ -14,6 +14,8 @@ flash attention. Full context in `RESULTS_RDNA1.md`; plans in `ROADMAP.md`.
 | GEMM 4096 | fp16 (fp32 accum) | 32.6 ms / 4.21 TF | 19.7 ms / 6.96 TF | **1.65x** |
 | GEMM 4096 | bf16 native | 59.3 ms / 2.32 TF | 31.1 ms / 4.42 TF | **1.91x** |
 | GEMM 4096 | bf16 via fp32 emulation | 59.3 ms / 2.32 TF | 17.35 ms / 7.92 TF | **3.41x** |
+| GEMM 4096 | HH override (existing kernel) | 12.1 TF | 16.73 TF | **1.38x** |
+| GEMM 2048 | HH override (existing kernel) | 9.5 TF | 17.94 TF | **1.89x** |
 | GEMV 4096, M=1 | fp16 | 0.296 ms / 114 GB/s | 0.114 ms / 294 GB/s | **2.58x** |
 | GEMV 4096, M=1 | fp32 | 0.433 ms / 155 GB/s | 0.216 ms / 311 GB/s | **2.01x** |
 | GEMV 4096, M=4 | fp16 | 0.315 ms / 107 GB/s | 0.121 ms / 278 GB/s | **2.60x** |
