@@ -1,5 +1,7 @@
 # ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 
+Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
+
 Date: 2026-11-24
 GPU: AMD Radeon RX 5700 XT (Navi 10, gfx1010:xnack-, 40 CU / 2560 SP, 8 GB)
 Theoretical peaks: **FP32 9.754 TFLOPS**, **FP16 19.51 TFLOPS** (packed 2:1).
