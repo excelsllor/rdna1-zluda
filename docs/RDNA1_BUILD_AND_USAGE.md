@@ -14,9 +14,9 @@ priorities are in `ROADMAP.md`.
 - Rust stable (1.85+; tested with 1.96).
 - Git 2.40+ and Git LFS.
 - Python 3.10 (for the PyTorch environment).
-- A ROCm/HIP runtime (see section 4). The official HIP SDK 6.4 is enough for
-  the core, but `cuDNN`/MIOpen support requires the ROCm 10.1 user space from
-  the TheRock gfx1010 packages.
+- A ROCm 10.1 user space for gfx1010 (see section 4): HIP 7.16, MIOpen,
+  rocFFT and rocSPARSE from the TheRock gfx1010 packages, with rocBLAS replaced
+  by the tuned 7.1.1 build.
 
 ## 2. Clone
 
@@ -68,10 +68,10 @@ Notes:
 
 ## 4. Runtime stack
 
-ZLUDA loads the HIP runtime and performance libraries at run time. Two stacks
-are supported; the unified one is recommended.
+ZLUDA loads the HIP runtime and performance libraries at run time. This fork
+supports a single stack.
 
-### 4.1 Unified stack (recommended): ROCm 10.1 + tuned rocBLAS 7.1.1
+### 4.1 ROCm 10.1 + tuned rocBLAS 7.1.1
 
 - ROCm 10.1 user space from the TheRock gfx1010 packages (HIP 7.16, MIOpen,
   rocFFT, rocSPARSE). The easiest source is the PyTorch ROCm environment
@@ -101,17 +101,9 @@ Notes:
 - ROCm 10.1's stock rocBLAS only contains fallback Tensile kernels for gfx1010;
   the tuned package adds real kernels (SS/HH/HPA) and roughly doubles GEMM
   throughput.
-- ROCm 10.1's rocBLAS rejects Tensile libraries built for 6.4/7.1 unless the
-  matching `rocblas.dll` from that package is used, which is why both the dll
-  and the library are replaced together.
+- rocBLAS validates Tensile libraries against its own version; the tuned
+  libraries must match the shipped `rocblas.dll`, so both are replaced together.
 - Keep the stock files as backup; new ROCm updates can overwrite them.
-
-### 4.2 Fallback stack: HIP SDK 6.4 + tuned rocBLAS 6.4.2
-
-- Official HIP SDK 6.4 (from AMD) copied to a separate directory.
-- Tuned package `rocm.gfx1010-xnack-gfx1012-xnack-.for.hip6.4.2.7z`.
-- No MIOpen in this stack, so `cudnn`/convolution through cuDNN is unavailable.
-- Use it only for GEMM-heavy work without convolutions.
 
 ## 5. PyTorch environment
 
@@ -131,7 +123,7 @@ Triton must produce PTX, not NVIDIA SASS; point it at ZLUDA's `ptxas.exe` stub
 
 ## 6. Environment variables and launchers
 
-`run-zluda.cmd` (unified stack) sets:
+`run-zluda.cmd` sets:
 
 ```bat
 set HIP_PATH=<runtime root>
@@ -143,8 +135,6 @@ set TORCHINDUCTOR_CACHE_DIR=<repo>\.inductor_cache
 set PATH=target\release;<runtime root>\bin;%PATH%
 target\release\zluda.exe -- %*
 ```
-
-`run-zluda-gemm.cmd` is the same with the HIP 6.4 runtime root.
 
 Important:
 
@@ -279,4 +269,4 @@ Expected reference numbers are in `RESULTS_RDNA1.md`.
 - `RESULTS_RDNA1.md` — measurements and ZLUDA vs native ROCm comparison.
 - `ROADMAP.md` — priorities, stages, acceptance metrics.
 - `bench/`, `smoke/` — benchmark and validation scripts.
-- `build-env.cmd`, `run-zluda.cmd`, `run-zluda-gemm.cmd` — build/run helpers.
+- `build-env.cmd`, `run-zluda.cmd` — build/run helpers.

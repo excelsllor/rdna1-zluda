@@ -15,8 +15,9 @@ attention with working backward.
 | Path | FP32 | FP16 (fp32 accum) | BF16 |
 |---|---|---|---|
 | ROCm 10.1 stock rocBLAS (fallback Tensile) | 4.85 TF | 4.21 TF | 2.32 TF |
-| HIP 6.4 + tuned rocBLAS 6.4.2 | 7.36–7.50 TF | 6.28–6.37 TF | 3.46 TF |
-| **ROCm 10.1 + tuned rocBLAS 7.1.1 (recommended)** | **8.13–8.18 TF** | **6.93–6.96 TF** | **4.42 TF** |
+| **ROCm 10.1 + tuned rocBLAS 7.1.1 (supported)** | **8.13–8.18 TF** | **6.93–6.96 TF** | **4.42 TF** |
+
+Only the unified ROCm 10.1 + tuned rocBLAS 7.1.1 stack is supported by this fork.
 
 - FP16 with fp16 accumulation (inference opt-in): **10.4–12.7 TF**.
 - Triton flash attention (B1H8D64, causal): fwd 0.48 / 1.08 / 3.09 ms at
@@ -58,7 +59,7 @@ rocBLAS 7.1.1 + tuned gfx1010 Tensile libraries. Python environment:
 `torch==2.7.1+cu118` + `triton-windows==3.3.1`. See
 [`docs/RDNA1_BUILD_AND_USAGE.md`](docs/RDNA1_BUILD_AND_USAGE.md) for the exact
 steps, environment variables (`HIP_PATH`, `ZLUDA_CC=8.6`,
-`TRITON_PTXAS_PATH`), launchers (`run-zluda.cmd`, `run-zluda-gemm.cmd`),
+`TRITON_PTXAS_PATH`), launcher (`run-zluda.cmd`),
 ComfyUI notes, and troubleshooting.
 
 ```bat
