@@ -26,7 +26,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 |---|---|---|---|---|
 | **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | basis for all decisions | low | — |
 | **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | ~2x fp16 (inference) | low | done, needs UX |
-| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | +8–15% GEMM, HH 12→14–16 TF | medium | rocBLAS 7.1.1 |
+| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | HH achieved via existing override; SS/HPA open | medium | rocBLAS 7.1.1 |
 | **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | decode (LLM inference) | medium | benchmarks |
 | **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | training + inference | medium | fwd+bwd exists |
 | **P1** | Flash-decoding (split-KV) for long-context decode at small batch | 1.5–2x decode | medium | FA integration |
@@ -148,6 +148,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
   loss 0.00683, 0 FATAL, no `cublasSetWorkspace`. `torch.compile` is skipped
   for this model: it takes ~30 minutes even on an NVIDIA T4, so it is not a
   P0 blocker; use eager training or compile a smaller model.
+- **2026-11-24 - P0-5 HH kernels already existed:** the tuned rocBLAS 7.1.1 library contains 110 HH solutions for gfx1010. `tensile_overrides/gfx1010_hh.csv` selects better existing kernels via `ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH`; `run-zluda.cmd` applies it. HH 2048 **17.94 TF**, HH 4096 **16.73 TF** (defaults 9.5/12.1). No Tensile rebuild needed. SS/HPA remain ~8.2/7.2 TF; zeros/ones/uninitialized data inflated earlier numbers and are not representative.
 - **2026-11-24 - Stage 2.1 (partial):** `zluda_ops/flash_attention.py` exposes
   the causal Triton FA as an autograd op, SDPA-compatible function and module;
   GQA works, fwd 1.6-2.4x faster than math SDPA, grads within 0.006.

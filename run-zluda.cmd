@@ -11,5 +11,7 @@ set "TRITON_PTXAS_PATH=G:\zluda\target\release\ptxas.exe"
 set "TRITON_CACHE_DIR=G:\zluda\.triton_cache"
 set "TORCHINDUCTOR_CACHE_DIR=G:\zluda\.inductor_cache"
 set "PATH=G:\zluda\target\release;G:\zluda\hip\bin;%PATH%"
+set "ROCBLAS_USE_HIPBLASLT=0"
+if exist "%~dp0tensile_overrides\gfx1010_hh.csv" set "ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH=%~dp0tensile_overrides\gfx1010_hh.csv"
 
 "G:\zluda\target\release\zluda.exe" -- %*

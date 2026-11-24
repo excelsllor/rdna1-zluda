@@ -7,6 +7,7 @@ attention with working backward.
 
 - **Before / after:** [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
 - **Out-of-the-box acceleration:** [`INTEGRATION.md`](INTEGRATION.md)
+- **Tensile HH override:** [`tensile_overrides/README.md`](tensile_overrides/README.md)
 - **Results:** [`RESULTS_RDNA1.md`](RESULTS_RDNA1.md)
 - **Roadmap:** [`ROADMAP.md`](ROADMAP.md)
 - **Build and usage guide:** [`docs/RDNA1_BUILD_AND_USAGE.md`](docs/RDNA1_BUILD_AND_USAGE.md)
