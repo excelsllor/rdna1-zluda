@@ -361,14 +361,64 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     return TritonFlashAttention.apply(q, k, v, bool(is_causal), float(scale))
 
 
+def _window_mask(sq, sk, causal, window_size, device):
+    qi = torch.arange(sq, device=device)[:, None]
+    ki = torch.arange(sk, device=device)[None, :]
+    allowed = torch.ones((sq, sk), dtype=torch.bool, device=device)
+    if causal:
+        allowed &= qi >= ki
+    left, right = window_size
+    if left >= 0:
+        allowed &= (qi - ki) <= left
+    if right >= 0:
+        allowed &= (ki - qi) <= right
+    return ~allowed
+
+
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                     window_size=(-1, -1), softcap=0.0, alibi_slopes=None,
                     deterministic=False, return_attn_probs=False):
-    if window_size != (-1, -1) or softcap != 0.0 or alibi_slopes is not None or return_attn_probs:
-        raise NotImplementedError("sliding window, softcap, alibi and attention probabilities are not implemented")
+    if softcap != 0.0 or alibi_slopes is not None or return_attn_probs:
+        raise NotImplementedError("softcap, alibi and attention probabilities are not implemented")
+    if window_size != (-1, -1):
+        mask = _window_mask(q.shape[2], k.shape[2], causal, window_size, q.device)
+        return scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale,
+        )
     return scaled_dot_product_attention(
         q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale,
     )
+
+
+def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None,
+                           max_seqlen_k=None, dropout_p=0.0, softmax_scale=None,
+                           causal=False, window_size=(-1, -1), softcap=0.0,
+                           alibi_slopes=None, deterministic=False,
+                           return_attn_probs=False, block_table=None):
+    if softcap != 0.0 or alibi_slopes is not None or return_attn_probs or block_table is not None:
+        raise NotImplementedError("softcap, alibi, paged attention and attention probabilities are not implemented")
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        raise ValueError("varlen expects q/k/v shaped [total_tokens, heads, head_dim]")
+    qs = cu_seqlens_q.tolist()
+    ks = cu_seqlens_k.tolist()
+    if len(qs) != len(ks):
+        raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same length")
+    outs = []
+    for i in range(len(qs) - 1):
+        qa, qb = qs[i], qs[i + 1]
+        ka, kb = ks[i], ks[i + 1]
+        qi = q[qa:qb].transpose(0, 1).unsqueeze(0)
+        ki = k[ka:kb].transpose(0, 1).unsqueeze(0)
+        vi = v[ka:kb].transpose(0, 1).unsqueeze(0)
+        mask = None
+        if window_size != (-1, -1):
+            mask = _window_mask(qi.shape[2], ki.shape[2], causal, window_size, q.device)
+        oi = scaled_dot_product_attention(
+            qi, ki, vi, attn_mask=mask, dropout_p=dropout_p,
+            is_causal=(causal and mask is None), scale=softmax_scale,
+        )
+        outs.append(oi[0].transpose(0, 1))
+    return torch.cat(outs, dim=0)
 
 
 class FlashAttention(nn.Module):
@@ -389,4 +439,4 @@ def attention(q, k, v, causal=True):
     return scaled_dot_product_attention(q, k, v, is_causal=causal)
 
 
-__all__ = ["TritonFlashAttention", "attention", "scaled_dot_product_attention", "flash_attn_func", "FlashAttention"]
+__all__ = ["TritonFlashAttention", "attention", "scaled_dot_product_attention", "flash_attn_func", "flash_attn_varlen_func", "FlashAttention"]
