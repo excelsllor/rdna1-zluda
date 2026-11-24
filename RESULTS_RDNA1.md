@@ -338,3 +338,30 @@ kernel still handles only mask/dropout-free causal/non-causal attention.
 (inference/no-grad only). Correctness vs original `F.linear`: fp16 max err
 5e-4, fp32 <=1.4e-6. M=16/32 target bandwidth (70-80%) remains open; fp32 M=32
 uses the rocBLAS fallback because it is faster.
+## P0 edge cases: masks, dropout, sliding, varlen (2026-11-24)
+
+`scaled_dot_product_attention`/`flash_attn_func`/`flash_attn_varlen_func`
+accept masks, dropout, sliding `window_size` and packed varlen inputs. These
+paths currently use the correct math fallback; fwd/bwd completed without
+errors (mask grad ~2e-5, dropout grad ~1.4e-5).
+
+| case | result |
+|---|---|
+| bool mask 128x128 | fwd+backward OK |
+| dropout_p=0.1 | fwd+backward OK |
+| sliding causal window (32,0) | fwd err 0 |
+| varlen [64,128], causal | fwd err 0.001, grad OK |
+
+## P0 compile smoke (2026-11-24)
+
+A single `nn.TransformerEncoderLayer` (d=128, 4 heads, seq 32) compiled with
+`torch.compile(dynamic=True, fullgraph=False)` and ran in ~1 s with the
+slow-path MHA. The full 8-layer model compile remains skipped (~30 min even on
+an NVIDIA T4).
+
+## P0 Tensile gap (2026-11-24)
+
+No Tensile toolchain or rocblas-bench is present in the Windows ROCm 10.1
+package; only the existing tuned rocBLAS 7.1.1 libraries exist. The fp32
+8.8-9.2 TF and HH 14-16 TF targets require new `.dat/.co` kernels and remain
+blocked externally.
