@@ -1,5 +1,8 @@
 mod r#impl;
 
+#[cfg(windows)]
+mod rocblas;
+
 macro_rules! unimplemented {
     ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {
         $(

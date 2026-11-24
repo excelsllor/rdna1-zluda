@@ -1,8 +1,102 @@
 use cuda_types::{cublas::*, cublaslt::*};
 use hip_runtime_sys::hipStream_t;
 use hipblaslt_sys::*;
-use std::{mem, sync::OnceLock};
+use std::collections::HashMap;
+use std::mem;
+use std::sync::{Mutex, OnceLock};
 use zluda_common::{constants, FromCuda, ZludaObject};
+
+// Marker written into a synthetic cublasLtMatmulAlgo_t to request the
+// rocBLAS fallback (used when hipBLASLt has no kernels for this GPU).
+const FALLBACK_ALGO_MAGIC: u64 = 0x5A4C_5544_415F_4C54;
+
+static HIPBLASLT_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+struct LayoutInfo {
+    dtype: i32,
+    rows: u64,
+    cols: u64,
+    ld: i64,
+    order: i32,
+    batch_count: i32,
+}
+
+#[derive(Clone, Copy)]
+struct DescInfo {
+    compute_type: i32,
+    scale_type: i32,
+    trans_a: i32,
+    trans_b: i32,
+    epilogue: i32,
+    bias_ptr: usize,
+    bias_dtype: i32,
+    force_rocblas: bool,
+}
+
+fn layouts() -> &'static Mutex<HashMap<usize, LayoutInfo>> {
+    static M: OnceLock<Mutex<HashMap<usize, LayoutInfo>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn descs() -> &'static Mutex<HashMap<usize, DescInfo>> {
+    static M: OnceLock<Mutex<HashMap<usize, DescInfo>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(windows)]
+fn rocm_dtype(hip_dtype: i32) -> Option<i32> {
+    use crate::rocblas::*;
+    let dt = if hip_dtype == hipDataType::HIP_R_16F.0 as i32 {
+        DT_F16
+    } else if hip_dtype == hipDataType::HIP_R_32F.0 as i32 {
+        DT_F32
+    } else if hip_dtype == hipDataType::HIP_R_64F.0 as i32 {
+        DT_F64
+    } else if hip_dtype == hipDataType::HIP_R_16BF.0 as i32 {
+        DT_BF16
+    } else if hip_dtype == hipDataType::HIP_R_8I.0 as i32 {
+        DT_I8
+    } else {
+        return None;
+    };
+    Some(dt)
+}
+
+#[cfg(windows)]
+fn rocm_compute(hip_compute: i32) -> Option<i32> {
+    use crate::rocblas::*;
+    let ct = if hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_16F.0 as i32 {
+        DT_F16
+    } else if hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_32F.0 as i32
+        || hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_32F_PEDANTIC.0 as i32
+        || hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_32F_FAST_16F.0 as i32
+        || hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_32F_FAST_16BF.0 as i32
+        || hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_32F_FAST_TF32.0 as i32
+    {
+        DT_F32
+    } else if hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_64F.0 as i32 {
+        DT_F64
+    } else if hip_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_32I.0 as i32 {
+        DT_I32
+    } else {
+        return None;
+    };
+    Some(ct)
+}
+
+#[cfg(windows)]
+fn rocm_op(hip_op: i32) -> Option<i32> {
+    use crate::rocblas::*;
+    if hip_op == hipblasOperation_t::HIPBLAS_OP_N.0 as i32 {
+        Some(OP_N)
+    } else if hip_op == hipblasOperation_t::HIPBLAS_OP_T.0 as i32 {
+        Some(OP_T)
+    } else {
+        None
+    }
+}
 
 fn hipblaslt() -> Result<&'static super::HipblasltVtable, hipblasLtError> {
     static LOCK: OnceLock<Result<super::HipblasltVtable, hipblasLtError>> = OnceLock::new();
@@ -172,27 +266,190 @@ pub(crate) fn matmul(
     workspace_size_in_bytes: usize,
     stream: hipStream_t,
 ) -> cublasStatus_t {
-    unsafe {
-        hipblaslt()?.hipblasLtMatmul(
-            light_handle.handle,
-            compute_desc,
-            alpha,
-            a,
-            a_desc,
-            b,
-            b_desc,
-            beta,
-            c,
-            c_desc,
+    let mut algo_prefix = [0u8; 8];
+    algo_prefix.copy_from_slice(&algo.data[..8]);
+    let fallback_requested = u64::from_ne_bytes(algo_prefix) == FALLBACK_ALGO_MAGIC;
+
+    if !fallback_requested
+        && !HIPBLASLT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let result = unsafe {
+            hipblaslt()?.hipblasLtMatmul(
+                light_handle.handle,
+                compute_desc,
+                alpha,
+                a,
+                a_desc,
+                b,
+                b_desc,
+                beta,
+                c,
+                c_desc,
+                d,
+                d_desc,
+                &algo,
+                workspace,
+                workspace_size_in_bytes,
+                stream,
+            )
+        };
+        if result.is_ok() {
+            return Ok(());
+        }
+        HIPBLASLT_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(windows)]
+    {
+        if unsafe {
+            rocblas_fallback(
+                compute_desc, alpha, a, a_desc, b, b_desc, beta, c, c_desc, d, d_desc, stream,
+            )
+        }
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    cublasStatus_t::ERROR_NOT_SUPPORTED
+}
+
+#[cfg(windows)]
+unsafe fn rocblas_fallback(
+    compute_desc: hipblasLtMatmulDesc_t,
+    alpha: *const ::core::ffi::c_void,
+    a: *const ::core::ffi::c_void,
+    a_desc: hipblasLtMatrixLayout_t,
+    b: *const ::core::ffi::c_void,
+    b_desc: hipblasLtMatrixLayout_t,
+    beta: *const ::core::ffi::c_void,
+    c: *const ::core::ffi::c_void,
+    c_desc: hipblasLtMatrixLayout_t,
+    d: *mut ::core::ffi::c_void,
+    d_desc: hipblasLtMatrixLayout_t,
+    stream: hipStream_t,
+) -> Result<(), ()> {
+    let desc = descs()
+        .lock()
+        .unwrap()
+        .get(&(compute_desc.0 as usize))
+        .copied()
+        .ok_or(())?;
+    let a_info = layouts()
+        .lock()
+        .unwrap()
+        .get(&(a_desc.0 as usize))
+        .copied()
+        .ok_or(())?;
+    let b_info = layouts()
+        .lock()
+        .unwrap()
+        .get(&(b_desc.0 as usize))
+        .copied()
+        .ok_or(())?;
+    let c_info = layouts()
+        .lock()
+        .unwrap()
+        .get(&(c_desc.0 as usize))
+        .copied()
+        .ok_or(())?;
+    let d_info = layouts()
+        .lock()
+        .unwrap()
+        .get(&(d_desc.0 as usize))
+        .copied()
+        .ok_or(())?;
+
+    // rocBLAS fallback only supports plain column-major, single-batch GEMMs.
+    for info in [a_info, b_info, c_info, d_info] {
+        if info.order != 0 || info.batch_count > 1 {
+            return Err(());
+        }
+    }
+
+    let a_type = rocm_dtype(a_info.dtype).ok_or(())?;
+    let b_type = rocm_dtype(b_info.dtype).ok_or(())?;
+    let c_type = rocm_dtype(c_info.dtype).ok_or(())?;
+    let d_type = rocm_dtype(d_info.dtype).ok_or(())?;
+    let compute_type = rocm_compute(desc.compute_type).ok_or(())?;
+    let ta = rocm_op(desc.trans_a).ok_or(())?;
+    let tb = rocm_op(desc.trans_b).ok_or(())?;
+
+    let m = i32::try_from(d_info.rows).map_err(|_| ())?;
+    let n = i32::try_from(d_info.cols).map_err(|_| ())?;
+    let k = if ta == crate::rocblas::OP_N {
+        i32::try_from(a_info.cols).map_err(|_| ())?
+    } else {
+        i32::try_from(a_info.rows).map_err(|_| ())?
+    };
+    if m <= 0 || n <= 0 || k < 0 {
+        return Err(());
+    }
+    if a.is_null() || b.is_null() || d.is_null() {
+        return Err(());
+    }
+
+    let lda = i32::try_from(a_info.ld).map_err(|_| ())?;
+    let ldb = i32::try_from(b_info.ld).map_err(|_| ())?;
+    let ldc = i32::try_from(c_info.ld).map_err(|_| ())?;
+    let ldd = i32::try_from(d_info.ld).map_err(|_| ())?;
+
+    let c_ptr = if c.is_null() { d as *const ::core::ffi::c_void } else { c };
+    let (c_type_eff, ldc_eff) = if c.is_null() {
+        (d_type, ldd)
+    } else {
+        (c_type, ldc)
+    };
+
+    crate::rocblas::gemm(
+        ta,
+        tb,
+        m,
+        n,
+        k,
+        alpha,
+        a,
+        a_type,
+        lda,
+        b,
+        b_type,
+        ldb,
+        beta,
+        c_ptr,
+        c_type_eff,
+        ldc_eff,
+        d,
+        d_type,
+        ldd,
+        compute_type,
+        stream.0.cast(),
+    )?;
+
+    if desc.epilogue == hipblasLtEpilogue_t::HIPBLASLT_EPILOGUE_DEFAULT.0 as i32 {
+        return Ok(());
+    }
+    if desc.epilogue == hipblasLtEpilogue_t::HIPBLASLT_EPILOGUE_BIAS.0 as i32 {
+        let bias = desc.bias_ptr as *const ::core::ffi::c_void;
+        if bias.is_null() {
+            return Err(());
+        }
+        if desc.bias_dtype >= 0 && desc.bias_dtype != d_info.dtype {
+            return Err(());
+        }
+        return crate::rocblas::add_bias(
+            m,
+            n,
+            bias,
             d,
-            d_desc,
-            &algo,
-            workspace,
-            workspace_size_in_bytes,
-            stream,
-        )
-    }?;
-    Ok(())
+            d_type,
+            ldd,
+            compute_type,
+            stream.0.cast(),
+        );
+    }
+
+    Err(())
 }
 
 pub(crate) fn matmul_algo_get_heuristic(
@@ -207,8 +464,27 @@ pub(crate) fn matmul_algo_get_heuristic(
     heuristic_results_array: &mut cublasLtMatmulHeuristicResult_t,
     return_algo_count: &mut ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    let mut hip_algos = vec![unsafe { mem::zeroed() }; requested_algo_count as usize];
-    unsafe {
+    let requested = requested_algo_count.max(1) as usize;
+    let force_rocblas = descs()
+        .lock()
+        .unwrap()
+        .get(&(operation_desc.0 as usize))
+        .map(|d| d.force_rocblas)
+        .unwrap_or(false);
+    if (force_rocblas || HIPBLASLT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed))
+        && requested_algo_count >= 1
+    {
+        heuristic_results_array.algo = cublasLtMatmulAlgo_t {
+            data: [FALLBACK_ALGO_MAGIC, 0, 0, 0, 0, 0, 0, 0],
+        };
+        heuristic_results_array.workspaceSize = 0;
+        heuristic_results_array.state = cublasStatus_t::SUCCESS;
+        heuristic_results_array.wavesCount = 0.0;
+        *return_algo_count = 1;
+        return Ok(());
+    }
+    let mut hip_algos = vec![unsafe { mem::zeroed() }; requested];
+    let status = unsafe {
         hipblaslt()?.hipblasLtMatmulAlgoGetHeuristic(
             light_handle.handle,
             operation_desc,
@@ -221,22 +497,41 @@ pub(crate) fn matmul_algo_get_heuristic(
             hip_algos.as_mut_ptr(),
             return_algo_count,
         )
-    }?;
-    if *return_algo_count as usize > hip_algos.len() {
-        return cublasStatus_t::ERROR_INTERNAL_ERROR;
+    };
+    if !status.is_ok() || *return_algo_count == 0 {
+        HIPBLASLT_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    for (idx, hip_algo) in hip_algos
-        .into_iter()
-        .take(*return_algo_count as usize)
-        .enumerate()
-    {
-        let heuristic_results_array: *mut cublasLtMatmulHeuristicResult_t = heuristic_results_array;
-        let result = unsafe { &mut *heuristic_results_array.add(idx) };
-        result.algo = cuda_algo_from_hip(hip_algo.algo);
-        result.workspaceSize = hip_algo.workspaceSize;
-        result.state = hip_algo.state.map_err(|e| cublasError_t::from(e));
-        result.wavesCount = hip_algo.wavesCount;
+    if status.is_ok() && *return_algo_count > 0 {
+        if *return_algo_count as usize > hip_algos.len() {
+            return cublasStatus_t::ERROR_INTERNAL_ERROR;
+        }
+        for (idx, hip_algo) in hip_algos
+            .into_iter()
+            .take(*return_algo_count as usize)
+            .enumerate()
+        {
+            let heuristic_results_array: *mut cublasLtMatmulHeuristicResult_t = heuristic_results_array;
+            let result = unsafe { &mut *heuristic_results_array.add(idx) };
+            result.algo = cuda_algo_from_hip(hip_algo.algo);
+            result.workspaceSize = hip_algo.workspaceSize;
+            result.state = hip_algo.state.map_err(|e| cublasError_t::from(e));
+            result.wavesCount = hip_algo.wavesCount;
+        }
+        return Ok(());
     }
+    // hipBLASLt has no usable kernels for this device (e.g. gfx1010/RDNA1).
+    // Emit a synthetic algo; cublasLtMatmul will route it to rocBLAS.
+    if requested_algo_count >= 1 {
+        heuristic_results_array.algo = cublasLtMatmulAlgo_t {
+            data: [FALLBACK_ALGO_MAGIC, 0, 0, 0, 0, 0, 0, 0],
+        };
+        heuristic_results_array.workspaceSize = 0;
+        heuristic_results_array.state = cublasStatus_t::SUCCESS;
+        heuristic_results_array.wavesCount = 0.0;
+        *return_algo_count = 1;
+        return Ok(());
+    }
+    status?;
     Ok(())
 }
 
@@ -245,12 +540,43 @@ pub(crate) fn matmul_desc_create(
     compute_type: hipblasComputeType_t,
     scale_type: hipDataType,
 ) -> cublasStatus_t {
-    unsafe { hipblaslt()?.hipblasLtMatmulDescCreate(matmul_desc, compute_type, scale_type) }?;
+    let requested_compute = compute_type.0 as i32;
+    // hipBLASLt on some ROCm versions rejects fp16 compute descriptors, and it
+    // has no gfx1010 kernels anyway. Create a plain fp32 descriptor and force
+    // cublasLtMatmul to use the rocBLAS fallback, which honours fp16 compute.
+    let force_rocblas = requested_compute == hipblasComputeType_t::HIPBLAS_COMPUTE_16F.0 as i32;
+    let create_compute = if force_rocblas {
+        hipblasComputeType_t::HIPBLAS_COMPUTE_32F
+    } else {
+        compute_type
+    };
+    let create_scale = if force_rocblas {
+        hipDataType::HIP_R_32F
+    } else {
+        scale_type
+    };
+    unsafe {
+        hipblaslt()?.hipblasLtMatmulDescCreate(matmul_desc, create_compute, create_scale)
+    }?;
+    descs().lock().unwrap().insert(
+        matmul_desc.0 as usize,
+        DescInfo {
+            compute_type: requested_compute,
+            scale_type: scale_type.0 as i32,
+            trans_a: hipblasOperation_t::HIPBLAS_OP_N.0 as i32,
+            trans_b: hipblasOperation_t::HIPBLAS_OP_N.0 as i32,
+            epilogue: hipblasLtEpilogue_t::HIPBLASLT_EPILOGUE_DEFAULT.0 as i32,
+            bias_ptr: 0,
+            bias_dtype: -1,
+            force_rocblas,
+        },
+    );
     Ok(())
 }
 
 pub(crate) fn matmul_desc_destroy(matmul_desc: hipblasLtMatmulDesc_t) -> cublasStatus_t {
     unsafe { hipblaslt()?.hipblasLtMatmulDescDestroy(matmul_desc) }?;
+    descs().lock().unwrap().remove(&(matmul_desc.0 as usize));
     Ok(())
 }
 
@@ -265,8 +591,11 @@ pub(crate) fn matmul_desc_set_attribute(
             return cublasStatus_t::ERROR_INVALID_VALUE;
         }
         let scale_type = cudaDataType_t(unsafe { *buf.cast() });
-        if scale_type != cudaDataType_t::CUDA_R_32F {
+        if scale_type != cudaDataType_t::CUDA_R_32F && scale_type != cudaDataType_t::CUDA_R_16F {
             return cublasStatus_t::ERROR_NOT_SUPPORTED;
+        }
+        if let Some(desc) = descs().lock().unwrap().get_mut(&(matmul_desc.0 as usize)) {
+            desc.scale_type = scale_type.0 as i32;
         }
         return Ok(());
     }
@@ -277,28 +606,72 @@ pub(crate) fn matmul_desc_set_attribute(
                 matmul_desc,
                 buf,
                 hip_attr,
-            )?
+            )?;
+            if size_in_bytes >= 4 && !buf.is_null() {
+                let cuda_op = unsafe { *buf.cast::<u32>() };
+                let hip_op = match cuda_op {
+                    0 => hipblasOperation_t::HIPBLAS_OP_N.0 as i32,
+                    1 => hipblasOperation_t::HIPBLAS_OP_T.0 as i32,
+                    2 => hipblasOperation_t::HIPBLAS_OP_C.0 as i32,
+                    _ => return cublasStatus_t::ERROR_INVALID_VALUE,
+                };
+                if let Some(desc) = descs().lock().unwrap().get_mut(&(matmul_desc.0 as usize)) {
+                    desc.trans_a = hip_op;
+                }
+            }
         }
         hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_TRANSB => {
             convert_and_set_attribute::<cublasOperation_t, hipblasOperation_t>(
                 matmul_desc,
                 buf,
                 hip_attr,
-            )?
+            )?;
+            if size_in_bytes >= 4 && !buf.is_null() {
+                let cuda_op = unsafe { *buf.cast::<u32>() };
+                let hip_op = match cuda_op {
+                    0 => hipblasOperation_t::HIPBLAS_OP_N.0 as i32,
+                    1 => hipblasOperation_t::HIPBLAS_OP_T.0 as i32,
+                    2 => hipblasOperation_t::HIPBLAS_OP_C.0 as i32,
+                    _ => return cublasStatus_t::ERROR_INVALID_VALUE,
+                };
+                if let Some(desc) = descs().lock().unwrap().get_mut(&(matmul_desc.0 as usize)) {
+                    desc.trans_b = hip_op;
+                }
+            }
         }
         hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_EPILOGUE => {
             convert_and_set_attribute::<cublasLtEpilogue_t, hipblasLtEpilogue_t>(
                 matmul_desc,
                 buf,
                 hip_attr,
-            )?
+            )?;
+            if size_in_bytes >= 4 && !buf.is_null() {
+                let epilogue = unsafe { *buf.cast::<u32>() } as i32;
+                if let Some(desc) = descs().lock().unwrap().get_mut(&(matmul_desc.0 as usize)) {
+                    desc.epilogue = epilogue;
+                }
+            }
         }
         hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE => {
-            convert_and_set_attribute::<cudaDataType, hipDataType>(matmul_desc, buf, hip_attr)?
+            convert_and_set_attribute::<cudaDataType, hipDataType>(matmul_desc, buf, hip_attr)?;
+            if size_in_bytes >= 4 && !buf.is_null() {
+                let dtype = unsafe { *buf.cast::<u32>() } as i32;
+                if let Some(desc) = descs().lock().unwrap().get_mut(&(matmul_desc.0 as usize)) {
+                    desc.bias_dtype = dtype;
+                }
+            }
         }
-        hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_BIAS_POINTER => unsafe {
-            hipblaslt()?.hipblasLtMatmulDescSetAttribute(matmul_desc, hip_attr, buf, size_in_bytes)
-        }?,
+        hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_BIAS_POINTER => {
+            unsafe {
+                hipblaslt()?.hipblasLtMatmulDescSetAttribute(matmul_desc, hip_attr, buf, size_in_bytes)
+            }?;
+            if size_in_bytes >= 8 && !buf.is_null() {
+                let bias_ptr = unsafe { *buf.cast::<usize>() };
+                if let Some(desc) = descs().lock().unwrap().get_mut(&(matmul_desc.0 as usize)) {
+                    desc.bias_ptr = bias_ptr;
+                }
+            }
+        }
         _ => return cublasStatus_t::ERROR_NOT_SUPPORTED,
     }
     Ok(())
@@ -365,11 +738,23 @@ pub(crate) fn matrix_layout_create(
     ld: i64,
 ) -> cublasStatus_t {
     unsafe { hipblaslt()?.hipblasLtMatrixLayoutCreate(mat_layout, type_, rows, cols, ld) }?;
+    layouts().lock().unwrap().insert(
+        mat_layout.0 as usize,
+        LayoutInfo {
+            dtype: type_.0 as i32,
+            rows,
+            cols,
+            ld,
+            order: hipblasLtOrder_t::HIPBLASLT_ORDER_COL.0 as i32,
+            batch_count: 1,
+        },
+    );
     Ok(())
 }
 
 pub(crate) fn matrix_layout_destroy(mat_layout: hipblasLtMatrixLayout_t) -> cublasStatus_t {
     unsafe { hipblaslt()?.hipblasLtMatrixLayoutDestroy(mat_layout) }?;
+    layouts().lock().unwrap().remove(&(mat_layout.0 as usize));
     Ok(())
 }
 
@@ -382,5 +767,35 @@ pub(crate) fn matrix_layout_set_attribute(
     unsafe {
         hipblaslt()?.hipblasLtMatrixLayoutSetAttribute(mat_layout, attr, buf, size_in_bytes)
     }?;
+    if buf.is_null() {
+        return Ok(());
+    }
+    let mut map = layouts().lock().unwrap();
+    let Some(info) = map.get_mut(&(mat_layout.0 as usize)) else {
+        return Ok(());
+    };
+    match attr {
+        hipblasLtMatrixLayoutAttribute_t::HIPBLASLT_MATRIX_LAYOUT_ROWS if size_in_bytes >= 8 => {
+            info.rows = unsafe { *buf.cast::<u64>() };
+        }
+        hipblasLtMatrixLayoutAttribute_t::HIPBLASLT_MATRIX_LAYOUT_COLS if size_in_bytes >= 8 => {
+            info.cols = unsafe { *buf.cast::<u64>() };
+        }
+        hipblasLtMatrixLayoutAttribute_t::HIPBLASLT_MATRIX_LAYOUT_LD if size_in_bytes >= 8 => {
+            info.ld = unsafe { *buf.cast::<i64>() };
+        }
+        hipblasLtMatrixLayoutAttribute_t::HIPBLASLT_MATRIX_LAYOUT_ORDER if size_in_bytes >= 4 => {
+            info.order = unsafe { *buf.cast::<i32>() };
+        }
+        hipblasLtMatrixLayoutAttribute_t::HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT
+            if size_in_bytes >= 4 =>
+        {
+            info.batch_count = unsafe { *buf.cast::<i32>() };
+        }
+        hipblasLtMatrixLayoutAttribute_t::HIPBLASLT_MATRIX_LAYOUT_TYPE if size_in_bytes >= 4 => {
+            info.dtype = unsafe { *buf.cast::<i32>() };
+        }
+        _ => {}
+    }
     Ok(())
 }

@@ -242,8 +242,20 @@ fn get_best_ptx_and_compile(
     // TODO: get this information on initialization
     let hip_properties = get_hip_properties()?;
     let gcn_arch = get_gcn_arch(&hip_properties)?;
+    // gcn_arch may carry target features, e.g. "gfx1010:xnack-"
+    let isa_version = gcn_arch
+        .split(':')
+        .next()
+        .unwrap_or(gcn_arch)
+        .trim_start_matches("gfx")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
     let attributes = ExtraCacheAttributes {
         clock_rate: hip_properties.clockRate as u32,
+        isa_version,
         is_debug: cfg!(debug_assertions),
     };
     let mut cache_with_key = match (text, global_state.cache_path.as_ref()) {
@@ -257,9 +269,21 @@ fn get_best_ptx_and_compile(
     let cached_binary = load_cached_binary(&mut cache_with_key);
     let (elf_module, sm_version, zluda32) = cached_binary
         .ok_or(CUerror::UNKNOWN)
-        .or_else(|_| compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key))?;
+        .or_else(|_| {
+            compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key).map_err(|e| {
+                eprintln!("zluda: failed to compile module for {gcn_arch}: {e:?}");
+                e
+            })
+        })?;
     let mut hip_module = unsafe { mem::zeroed() };
-    unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) }?;
+    let load_status = unsafe { hipModuleLoadData(&mut hip_module, elf_module.as_ptr().cast()) };
+    if load_status.is_err() {
+        eprintln!(
+            "zluda: hipModuleLoadData failed for {gcn_arch} ({} bytes): {load_status:?}",
+            elf_module.len()
+        );
+        load_status?;
+    }
     Ok((hip_module, sm_version, zluda32))
 }
 
@@ -281,6 +305,7 @@ pub(crate) fn load_hip_module(
 struct ExtraCacheAttributes {
     is_debug: bool,
     clock_rate: u32,
+    isa_version: u32,
 }
 
 fn get_hip_properties<'a>() -> Result<hipDeviceProp_tR0600, CUerror> {
@@ -340,10 +365,14 @@ fn compile_and_cache(
         ast,
         ptx::Attributes {
             clock_rate: attributes.clock_rate,
+            isa_version: attributes.isa_version,
         },
         |_| {},
     )
-    .map_err(|_| CUerror::UNKNOWN)?;
+    .map_err(|e| {
+        eprintln!("zluda: ptx -> llvm translation failed: {e}");
+        CUerror::UNKNOWN
+    })?;
     let ptx_impl = llvm_module.linked_bitcode();
     let sm_version = llvm_module.metadata.sm_version;
     let metadata32 = llvm_module.metadata32.as_ref().map(Metadata32Bit::new);
@@ -357,7 +386,10 @@ fn compile_and_cache(
         llvm_module.metadata32,
         None,
     )
-    .map_err(|_| CUerror::UNKNOWN)?;
+    .map_err(|e| {
+        eprintln!("zluda: llvm_zluda::compile failed for {gcn_arch}: {e}");
+        CUerror::UNKNOWN
+    })?;
     if let Some((cache, key)) = cache_with_key {
         key.last_access = zluda_cache::ModuleCache::time_now();
         cache.insert_module(key, &elf_module);

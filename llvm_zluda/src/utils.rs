@@ -1,6 +1,7 @@
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
 use llvm_sys::bit_reader::LLVMParseBitcodeInContext2;
 use llvm_sys::bit_writer::LLVMWriteBitcodeToMemoryBuffer;
+use llvm_sys::ir_reader::LLVMParseIRInContext2;
 use llvm_sys::core::*;
 use llvm_sys::linker::LLVMLinkModules2;
 use llvm_sys::object::{LLVMBinaryRef, LLVMObjectFileIsSymbolIteratorAtEnd, LLVMSymbolIteratorRef};
@@ -61,6 +62,31 @@ impl Module {
         };
         let mut module: LLVMModuleRef = unsafe { mem::zeroed() };
         let status = unsafe { LLVMParseBitcodeInContext2(ctx.get(), memory_buffer, &mut module) };
+        if status != 0 {
+            None
+        } else {
+            Some(Self(module))
+        }
+    }
+
+    pub fn try_from_ir(ctx: &Context, ir: &[u8], name: Option<&CStr>) -> Option<Self> {
+        let ir: Vec<i8> = ir.iter().map(|&v| i8::from_ne_bytes([v])).collect();
+        let memory_buffer: LLVMMemoryBufferRef = unsafe {
+            LLVMCreateMemoryBufferWithMemoryRangeCopy(
+                ir.as_ptr(),
+                ir.len(),
+                name.map(|n| n.as_ptr()).unwrap_or(ptr::null()),
+            )
+        };
+        let mut module: LLVMModuleRef = unsafe { mem::zeroed() };
+        let mut err: *mut std::ffi::c_char = ptr::null_mut();
+        let status =
+            unsafe { LLVMParseIRInContext2(ctx.get(), memory_buffer, &mut module, &mut err) };
+        if !err.is_null() {
+            let message = unsafe { CStr::from_ptr(err) };
+            eprintln!("zluda: failed to parse IR module: {}", message.to_string_lossy());
+            unsafe { llvm_sys::core::LLVMDisposeMessage(err) };
+        }
         if status != 0 {
             None
         } else {

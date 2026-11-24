@@ -67,9 +67,10 @@ pub(crate) fn run<'input>(
     id_defs: GlobalStringIdentResolver2<'input>,
     directives: Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>,
     fp_mode: FloatingPointMode,
+    attributes: Attributes,
 ) -> Result<llvm::Module, TranslateError> {
     let module = llvm::Module::new(context, LLVM_UNNAMED);
-    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode);
+    let mut emit_ctx = ModuleEmitContext::new(context, &module, &id_defs, fp_mode, attributes);
     for directive in directives {
         match directive {
             Directive2::Variable(linking, variable) => emit_ctx.emit_global(linking, variable)?,
@@ -84,6 +85,14 @@ pub(crate) fn run<'input>(
     Ok(module)
 }
 
+/// Whether the target implements v_dot4/v_dot8 instructions (needed for dp4a).
+/// Notably gfx1010 (RDNA1) does not.
+fn has_dot_instructions(isa_version: u32) -> bool {
+    matches!(isa_version, 90 | 906 | 908 | 909 | 1011 | 1012 | 940..=959)
+        || (1030..=1039).contains(&isa_version)
+        || (1100..=1299).contains(&isa_version)
+}
+
 struct ModuleEmitContext<'a, 'input> {
     context: LLVMContextRef,
     module: LLVMModuleRef,
@@ -91,6 +100,7 @@ struct ModuleEmitContext<'a, 'input> {
     id_defs: &'a GlobalStringIdentResolver2<'input>,
     resolver: ResolveIdent,
     fp_mode: FloatingPointMode,
+    attributes: Attributes,
 }
 
 impl<'a, 'input> ModuleEmitContext<'a, 'input> {
@@ -99,6 +109,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
         module: &llvm::Module,
         id_defs: &'a GlobalStringIdentResolver2<'input>,
         fp_mode: FloatingPointMode,
+        attributes: Attributes,
     ) -> Self {
         ModuleEmitContext {
             context: context.get(),
@@ -107,6 +118,7 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
             id_defs,
             resolver: ResolveIdent::new(&id_defs),
             fp_mode,
+            attributes,
         }
     }
 
@@ -515,6 +527,7 @@ struct MethodEmitContext<'a> {
     carry_flag: Option<LLVMValueRef>,
     base_32bit_memory: Option<SpirvWord>,
     is_kernel: bool,
+    isa_version: u32,
     fp: FloatingPoint,
 }
 
@@ -542,6 +555,7 @@ impl<'a> MethodEmitContext<'a> {
             carry_flag: None,
             base_32bit_memory,
             is_kernel,
+            isa_version: parent.attributes.isa_version,
             fp,
         }
     }
@@ -3554,6 +3568,11 @@ impl<'a> MethodEmitContext<'a> {
             }
             _ => return Err(error_unreachable()),
         };
+        if !has_dot_instructions(self.isa_version) {
+            // Some targets (notably gfx1010) do not implement v_dot4
+            // instructions, so compute the dot product with regular ALU ops.
+            return self.emit_dp4a_software(data.atype == ast::ScalarType::S32, arguments);
+        }
         let pred = get_scalar_type(self.context, ast::ScalarType::Pred);
         let zero = unsafe { LLVMConstInt(pred, 0, 0) };
         self.emit_intrinsic(
@@ -3576,6 +3595,40 @@ impl<'a> MethodEmitContext<'a> {
                 (zero, pred),
             ],
         )?;
+        Ok(())
+    }
+
+    fn emit_dp4a_software(
+        &mut self,
+        signed: bool,
+        arguments: ast::Dp4aArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let i32_ty = get_scalar_type(self.context, ast::ScalarType::S32);
+        let a = self.resolver.value(arguments.src1)?;
+        let b = self.resolver.value(arguments.src2)?;
+        let mut acc = self.resolver.value(arguments.src3)?;
+        let builder = self.builder;
+        let name = LLVM_UNNAMED.as_ptr();
+        for i in 0..4u64 {
+            let extract = |value: LLVMValueRef| unsafe {
+                if signed {
+                    let shl_amount = LLVMConstInt(i32_ty, 24 - 8 * i, 0);
+                    let shifted = LLVMBuildShl(builder, value, shl_amount, name);
+                    let ashr_amount = LLVMConstInt(i32_ty, 24, 0);
+                    LLVMBuildAShr(builder, shifted, ashr_amount, name)
+                } else {
+                    let shr_amount = LLVMConstInt(i32_ty, 8 * i, 0);
+                    let shifted = LLVMBuildLShr(builder, value, shr_amount, name);
+                    let mask = LLVMConstInt(i32_ty, 0xFF, 0);
+                    LLVMBuildAnd(builder, shifted, mask, name)
+                }
+            };
+            let a_byte = extract(a);
+            let b_byte = extract(b);
+            let product = unsafe { LLVMBuildMul(builder, a_byte, b_byte, name) };
+            acc = unsafe { LLVMBuildAdd(builder, acc, product, name) };
+        }
+        self.resolver.with_result(arguments.dst, |_| acc);
         Ok(())
     }
 

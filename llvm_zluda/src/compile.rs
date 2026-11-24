@@ -20,6 +20,51 @@ use std::{fs, ptr};
 use tempfile::NamedTempFile;
 
 const OCKL_MODULE: &[u8] = include_bytes!("device-libs/ockl.bc");
+const LD_MATRIX_SHIMS: &[u8] = br#"; ModuleID = 'zluda_shims'
+source_filename = "zluda_shims.ll"
+target triple = "amdgcn-amd-amdhsa"
+
+declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)
+declare i32 @llvm.amdgcn.mbcnt.lo(i32, i32)
+declare i32 @llvm.amdgcn.mbcnt.hi(i32, i32)
+
+define linkonce_odr <2 x i32> @__zluda_ptx_impl_ldmatrix_m8n8_x2_trans_b16(ptr addrspace(3) %address) {
+entry:
+  %lane_lo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)
+  %lane = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 %lane_lo)
+  %x0 = call i32 @zluda_ldmatrix_trans_single(ptr addrspace(3) %address, i32 0, i32 %lane)
+  %x1 = call i32 @zluda_ldmatrix_trans_single(ptr addrspace(3) %address, i32 8, i32 %lane)
+  %v0 = insertelement <2 x i32> poison, i32 %x0, i32 0
+  %v1 = insertelement <2 x i32> %v0, i32 %x1, i32 1
+  ret <2 x i32> %v1
+}
+
+define internal i32 @zluda_ldmatrix_trans_single(ptr addrspace(3) %address, i32 %warp_offset, i32 %lane) {
+entry:
+  %base = ptrtoint ptr addrspace(3) %address to i32
+  %lane_mod4 = and i32 %lane, 3
+  %lane_div4 = lshr i32 %lane, 2
+  %lane_div4_mul2 = shl i32 %lane_div4, 1
+  %lane_mod4_mul2 = shl i32 %lane_mod4, 1
+  %off_lo = add i32 %lane_mod4_mul2, %warp_offset
+  %byte_lo = shl i32 %off_lo, 2
+  %ra_lo = call i32 @llvm.amdgcn.ds.bpermute(i32 %byte_lo, i32 %base)
+  %a_lo = add i32 %ra_lo, %lane_div4_mul2
+  %p_lo = inttoptr i32 %a_lo to ptr addrspace(3)
+  %lo = load i16, ptr addrspace(3) %p_lo, align 2
+  %off_hi = add i32 %off_lo, 1
+  %byte_hi = shl i32 %off_hi, 2
+  %ra_hi = call i32 @llvm.amdgcn.ds.bpermute(i32 %byte_hi, i32 %base)
+  %a_hi = add i32 %ra_hi, %lane_div4_mul2
+  %p_hi = inttoptr i32 %a_hi to ptr addrspace(3)
+  %hi = load i16, ptr addrspace(3) %p_hi, align 2
+  %vec0 = insertelement <2 x i16> poison, i16 %lo, i32 0
+  %vec1 = insertelement <2 x i16> %vec0, i16 %hi, i32 1
+  %packed = bitcast <2 x i16> %vec1 to i32
+  ret i32 %packed
+}
+"#;
+
 
 // https://llvm.org/docs/AMDGPUUsage.html#address-spaces
 const CONSTANT_ADDRESS_SPACE: u32 = 4;
@@ -56,6 +101,9 @@ fn path_to_cstring(path: &std::path::Path) -> Result<CString, String> {
 }
 
 fn get_isa_version_from_gcn_arch(gcn_arch: &str) -> Result<u32, String> {
+    // ROCm reports the architecture together with target features, e.g.
+    // "gfx1010:xnack-". Only the leading "gfxNNNN" token is numeric.
+    let gcn_arch = gcn_arch.split(':').next().unwrap_or(gcn_arch);
     let base: u32 = gcn_arch
         .replace("gfx", "")
         .parse()
@@ -112,6 +160,17 @@ pub fn compile(
     linked.link(ptx_impl)?;
     linked.link(ockl)?;
 
+    // Textual IR cannot be parsed into a context that discards value names.
+    unsafe { LLVMContextSetDiscardValueNames(ctx.get(), 0) };
+    let shims = Module::try_from_ir(ctx, LD_MATRIX_SHIMS, Some(c"zluda_shims.ll"));
+    unsafe { LLVMContextSetDiscardValueNames(ctx.get(), 1) };
+    let shims = shims.ok_or(("Failed to parse shim IR").to_string())?;
+    unsafe {
+        LLVMSetDataLayout(shims.get(), LLVMGetDataLayoutStr(linked.get()));
+        LLVMSetTarget(shims.get(), LLVMGetTarget(linked.get()));
+    }
+    linked.link(shims)?;
+
     linked.verify()?;
 
     if let Some(hook) = compiler_hook {
@@ -122,7 +181,10 @@ pub fn compile(
     }
 
     let triple = c"amdgcn-amd-amdhsa";
-    let cpu = std::ffi::CString::new(gcn_arch).map_err(|_| ("invalid gcn_arch").to_string())?;
+    // ROCm reports architecture with target features, e.g. "gfx1010:xnack-",
+    // but the AMDGPU TargetMachine only accepts the bare processor name.
+    let cpu_name = gcn_arch.split(':').next().unwrap_or(gcn_arch);
+    let cpu = std::ffi::CString::new(cpu_name).map_err(|_| ("invalid gcn_arch").to_string())?;
     let features = c"-wavefrontsize64,+cumode";
 
     let mut target = unsafe { std::mem::zeroed() };

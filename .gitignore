@@ -6,3 +6,10 @@ Cargo.lock
 
 ptx/lib/zluda_ptx_impl.ll
 ptx/lib/zluda_ptx_impl_constrained.ll
+venv/
+hip/
+.triton_cache/
+.inductor_cache/
+.rocmlibs/
+*.log
+

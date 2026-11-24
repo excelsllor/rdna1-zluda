@@ -2143,9 +2143,6 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st
     st{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.vec}.type  [a], b{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st instruction with cache policy/eviction priority/cache hints".to_string()));
-        }
         Instruction::St {
             data: StData {
                 qualifier: weak.unwrap_or(RawLdStQualifier::Weak).into(),
@@ -2168,9 +2165,6 @@ derive_parser!(
         }
     }
     st.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.relaxed instruction with cache policy/eviction priority/cache hints".to_string()));
-        }
         Instruction::St {
             data: StData {
                 qualifier: ast::LdStQualifier::Relaxed(scope),
@@ -2182,9 +2176,6 @@ derive_parser!(
         }
     }
     st.release.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.vec}.type [a], b{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("st.release instruction with cache policy/eviction priority/cache hints".to_string()));
-        }
         Instruction::St {
             data: StData {
                 qualifier: ast::LdStQualifier::Release(scope),
@@ -2223,10 +2214,7 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld
     ld{.weak}{.ss}{.cop}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type   d, [a]{.unified}{, cache_policy} => {
-        let (a, unified) = a;
-        if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || unified || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
-        }
+        let (a, _unified) = a;
         Instruction::Ld {
             data: LdDetails {
                 qualifier: weak.unwrap_or(RawLdStQualifier::Weak).into(),
@@ -2239,9 +2227,6 @@ derive_parser!(
         }
     }
     ld.volatile{.ss}{.level::prefetch_size}{.vec}.type                                                      d, [a] => {
-        if level_prefetch_size.is_some() {
-            state.errors.push(PtxError::Todo("ld.volatile instruction with prefetch size".to_string()));
-        }
         Instruction::Ld {
             data: LdDetails {
                 qualifier: volatile.into(),
@@ -2254,9 +2239,6 @@ derive_parser!(
         }
     }
     ld.relaxed.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.relaxed instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
-        }
         Instruction::Ld {
             data: LdDetails {
                 qualifier: ast::LdStQualifier::Relaxed(scope),
@@ -2269,9 +2251,6 @@ derive_parser!(
         }
     }
     ld.acquire.scope{.ss}{.level::eviction_priority}{.level::cache_hint}{.level::prefetch_size}{.vec}.type  d, [a]{, cache_policy} => {
-        if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.acquire instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
-        }
         Instruction::Ld {
             data: LdDetails {
                 qualifier: ast::LdStQualifier::Acquire(scope),
@@ -2317,9 +2296,6 @@ derive_parser!(
             if let Some(level_eviction_priority) = level_eviction_priority {
                 state.errors.push(PtxError::SyntaxError(format!("cannot have both {} and {} in {:?}", cop, level_eviction_priority, state.text)));
             }
-        }
-        if level_eviction_priority.is_some() || level_cache_hint || level_prefetch_size.is_some() || cache_policy.is_some() {
-            state.errors.push(PtxError::Todo("ld.global.nc instruction with cache policy/eviction priority/cache hints/prefetch size".to_string()));
         }
         Instruction::Ld {
             data: LdDetails {

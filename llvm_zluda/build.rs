@@ -35,6 +35,9 @@ fn main() {
         .define("LLVM_ENABLE_LIBXML2", "OFF")
         .define("LLVM_ENABLE_LIBEDIT", "OFF")
         .define("LLVM_ENABLE_LIBPFM", "OFF")
+        // LLVM's DIA/PDB support requires ATL headers, which are not installed
+        // in the local Visual Studio Build Tools. ZLUDA does not need them.
+        .define("LLVM_ENABLE_DIA_SDK", "OFF")
         .define("LLVM_ENABLE_ZLIB", "OFF")
         .define("LLVM_ENABLE_ZSTD", "OFF")
         .define("LLVM_INCLUDE_BENCHMARKS", "OFF")
