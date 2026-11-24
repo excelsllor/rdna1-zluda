@@ -254,6 +254,8 @@ run-zluda.cmd venv\Scripts\python.exe bench\gemv.py
 run-zluda.cmd venv\Scripts\python.exe bench\stage1.py
 run-zluda.cmd venv\Scripts\python.exe bench\flash_pack.py
 run-zluda-auto.cmd venv\Scripts\python.exe smoke\auto_test.py
+run-zluda.cmd venv\Scripts\python.exe bench\fp16_ux.py
+run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.

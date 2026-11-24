@@ -291,3 +291,32 @@ Result on the user model (`FeatureSetRanker`, fp16 autocast, 8 layers):
 - eager full step: **1040–1208 ms**, loss **0.00683**;
 - **0 FATAL** lines, no `cublasSetWorkspace` error;
 - `torch.compile` is skipped for this model: ~30 minutes even on an NVIDIA T4; not a P0 blocker.
+## P0 fp16 accumulation UX (2026-11-24)
+
+`zluda_ops.fp16acc` exposes a warning-emitting context manager and an explicit
+unsafe opt-in guard. Default remains fp32 accumulation.
+
+| n | fp32 accum | fp16 accum | max abs diff | relative max |
+|---|---|---|---|---|
+| 1024 | 0.40 ms / 5.36 TF | 0.20 ms / 10.98 TF | 1.78 | 0.0109 |
+| 2048 | 2.57 ms / 6.69 TF | 1.76 ms / 9.77 TF | 4.63 | 0.0206 |
+| 4096 | 19.81 ms / 6.94 TF | 11.14 ms / 12.34 TF | 8.00 | 0.0214 |
+
+## P0 monitoring (2026-11-24)
+
+`bench/monitor.py` samples Windows GPU utilization and VRAM (idle: ~1.6%,
+8176 MB visible). ZLUDA NVML reports `NotSupported` for utilization,
+temperature, clocks and power; no rocm-smi/amd-smi is bundled with the Windows
+ROCm 10.1 user space, so clocks/power/temperature remain unavailable.
+
+## P0 non-causal flash attention (2026-11-24)
+
+The Triton backward kernel now has a non-causal path. B1 H8 D64 fp16:
+
+| s | fwd | fwd+bwd | fwd err | grad err |
+|---|---|---|---|---|
+| 512 | 0.39 ms (math 0.74) | 1.63 ms | 0.0002 | 0.0005 |
+| 1024 | 1.12 ms (math 2.15) | 3.66 ms | 0.0002 | 0.0004 |
+
+Masks, dropout, sliding window, varlen and flash-decoding still use the math
+fallback or remain open.

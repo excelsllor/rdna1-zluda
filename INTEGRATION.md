@@ -90,6 +90,12 @@ slower than the `bench/gemv.py` fast mode, which uses fp16 products for the
 reported peak numbers). bf16 auto uses fp32 conversion, fp32 GEMM and casts
 back.
 
+## fp16 accumulation
+
+`zluda_ops.fp16acc.fp16_accumulation(enable=True)` is an opt-in context manager
+that warns and restores the previous setting. Use it only for inference and
+validate accuracy (`bench/fp16_ux.py`); it is off by default.
+
 ## Accumulation policy
 
 | Path | Inputs | Products | Accumulation | Output |
