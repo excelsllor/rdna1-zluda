@@ -45,6 +45,11 @@ Triton; the default 8.5 does not exist), `TRITON_PTXAS_PATH`, isolated
 
 ## GEMM results (4096x4096)
 
+> Note: this table predates the P0-5 HH override. Current HH (fp16 accumulation):
+> **16.73 TF** at 4096 and **17.94 TF** at 2048; default 12.1/9.5. SS remains
+> ~8.16 TF and HPA ~7.19 TF. See the P0-5 section at the end. Measurements
+> use random data; zeros/ones/uninitialized buffers are not representative.
+
 | path | fp32 | fp16 (fp32 accum) | bf16 |
 |---|---|---|---|
 | ROCm 10.1 stock rocBLAS (fallback Tensile) | 28.3 ms / 4.85 TF | 32.6 ms / 4.21 TF | 59.3 ms / 2.32 TF |
