@@ -5,6 +5,7 @@ Fork of [vosen/ZLUDA](https://github.com/vosen/ZLUDA) focused on AMD RDNA1
 runs PyTorch (CUDA 11.8 wheels), Triton, `torch.compile`, and Triton flash
 attention with working backward.
 
+- **Before / after:** [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
 - **Results:** [`RESULTS_RDNA1.md`](RESULTS_RDNA1.md)
 - **Roadmap:** [`ROADMAP.md`](ROADMAP.md)
 - **Build and usage guide:** [`docs/RDNA1_BUILD_AND_USAGE.md`](docs/RDNA1_BUILD_AND_USAGE.md)
