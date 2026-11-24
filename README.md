@@ -15,14 +15,21 @@ attention with working backward.
 
 ## At a glance (RX 5700 XT, 4096² GEMM)
 
-| Path | FP32 | FP16 (fp32 accum) | BF16 |
-|---|---|---|---|
-| ROCm 10.1 stock rocBLAS (fallback Tensile) | 4.85 TF | 4.21 TF | 2.32 TF |
-| **ROCm 10.1 + tuned rocBLAS 7.1.1 (supported)** | **8.13–8.18 TF** | **6.93–6.96 TF** | **4.42 TF** |
+| Path | FP32 | FP16 (fp32 accum) | FP16 (fp16 accum) | BF16 |
+|---|---|---|---|---|
+| ROCm 10.1 stock rocBLAS (fallback Tensile) | 4.85 TF | 4.21 TF | — | 2.32 TF |
+| **ROCm 10.1 + tuned rocBLAS 7.1.1 (supported)** | **8.16 TF** | **6.94 TF** | **12.1 TF default / 16.73 TF override** | **4.42 TF** |
 
 Only the unified ROCm 10.1 + tuned rocBLAS 7.1.1 stack is supported by this fork.
+Measurements use random data; zeros/ones/uninitialized buffers are not
+representative (they can add ~1 TF through GPU power/compression effects).
 
-- FP16 with fp16 accumulation (inference opt-in): **10.4–12.7 TF**.
+- FP16 with fp16 accumulation (inference opt-in): **16.73 TF** at 4096 and
+  **17.94 TF** at 2048 with the existing-kernel override; default 12.1/9.5 TF.
+  Requires `torch._C._set_cublas_allow_fp16_accumulation(True)`; `run-zluda.cmd`
+  applies the override automatically. See `tensile_overrides/README.md`.
+- SS remains ~8.16 TF and HPA ~7.19 TF; the HH target is met, SS/HPA targets
+  remain open.
 - Triton flash attention (B1H8D64, causal): fwd 0.48 / 1.08 / 3.09 ms at
   s=512 / 1024 / 2048 (math SDPA: 0.65 / 1.79 / 7.66 ms); forward+backward
   1.42 / 3.70 / 10.92 ms, gradients match math SDPA.
