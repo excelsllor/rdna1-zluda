@@ -13,3 +13,4 @@ hip/
 .rocmlibs/
 *.log
 
+local-patches/*.bundle
