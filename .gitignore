@@ -16,3 +16,9 @@ hip/
 local-patches/*.bundle
 
 bench/results/
+
+__pycache__/
+*.pyc
+.triton_cache*/
+.inductor_cache*/
+.zluda_cache*/
