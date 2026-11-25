@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..8c103df91f53f1bf88e34f3ceab76e67020ea44b
+index 0000000000000000000000000000000000000000..859b6797181ef1f480fbd35ac1757739950e7ca3
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,472 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,20 @@ index 0000000000000000000000000000000000000000..8c103df91f53f1bf88e34f3ceab76e67
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - cross-backend comparison (Vulkan vs native ROCm vs ZLUDA):**
++  built F32/BF16 GGUF variants for Vulkan/llama.cpp; found the native ROCm torch
++  environment in `D:\comfyui\Data\Packages\ComfyUIrocm\venv` (torch
++  2.14.0+rocm10.1.0, HIP 7.16) and ran the math-SDPA matrix there. ZLUDA beats
++  native ROCm torch on this model (fp16 4831 vs 3082 prefill / 28.8 vs 19.8
++  decode; fp32 5418 vs 1177; bf16 3450 vs 2845). fp16 accumulation is the
++  biggest PyTorch knob on ZLUDA (7450 prefill math, 9460 with Triton FA) and is
++  a cuBLAS concept (ignored by ROCm, absent on Vulkan). ZLUDA attention stacks
++  measured: math, SDPA-fast (falls back to math), Triton FA (+16% prefill),
++  flex attention (works), flash_attn/flex shims (prefill good, decode needs
++  work), xformers shim OOM. Vulkan llama.cpp GGUF matrix
++  F16/F32/BF16 measured (high variance across runs). Full report:
++  docs/CROSS_BACKEND_COMPARISON.md; raw data in
++  bench/results/cross_backend_summary.json.
 +- **2026-11-25 - llama.cpp under ZLUDA WORKS (custom PTX build), same-engine
 +  Vulkan comparison:** built llama.cpp locally with portable CUDA 12.4.1
 +  (nvcc 12.4.131, VS 2022) and `-DCMAKE_CUDA_ARCHITECTURES=86-virtual`
@@ -2621,6 +2635,340 @@ index 0000000000000000000000000000000000000000..8c103df91f53f1bf88e34f3ceab76e67
 +  int8 matrix units. Only storage + dequant to fp16 is meaningful.
 +- Rolling back ROCm (breaks ZLUDA/native torch on gfx1010).
 +- Vulkan/OpenCL backend (loses required functionality).
+diff --git a/bench/attention_matrix.py b/bench/attention_matrix.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..121a95c82089fe3a12775497cd83d10e1590a768
+--- /dev/null
++++ b/bench/attention_matrix.py
+@@ -0,0 +1,328 @@
++"""Attention-stack matrix benchmark for the ZLUDA/PyTorch engine.
++
++One configuration per process (clean state):
++  --dtype {fp16,fp32,bf16}
++  --acc 0|1                 fp16 accumulation (cublas HH) - fp16 only
++  --attn {math,sdpa_fast,triton_fa,flex,flash_attn_shim,xformers_shim}
++  --compile                  torch.compile (mode --compile-mode)
++  --prefill N --decode N
++
++Measures prefill/decode throughput, peak VRAM and the correctness of the
++configured attention path (logits vs a math-SDPA reference computed with the
++same weights/dtype). Unsupported combinations are reported instead of crashing.
++
++Run under tools/gpu_watchdog.ps1 for safety on this machine, e.g.:
++
++  venv\\Scripts\\python.exe bench\\attention_matrix.py --dtype fp16 --attn triton_fa --prefill 2048 --decode 8
++"""
++
++import argparse
++import json
++import sys
++import time
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from bench.common import bench_median, save_report  # noqa: E402
++
++DEFAULT_MODEL = str(Path(__file__).resolve().parents[1] / "models" / "Qwen2.5-0.5B-Instruct")
++_ORIG_SDPA_REF = F.scaled_dot_product_attention
++
++
++def make_attn_patch(mode, model_cfg):
++    """Return (patch_fn, unpatch_fn) that installs the attention backend."""
++    orig = F.scaled_dot_product_attention
++    state = {"calls": 0, "errors": 0, "last_error": None}
++
++    def _orig_sdpa_with(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa):
++        from torch.nn.attention import SDPBackend, sdpa_kernel
++
++        with sdpa_kernel(SDPBackend.MATH):
++            return _ORIG_SDPA_REF(q, k, v, attn_mask=attn_mask,
++                                  dropout_p=dropout_p, is_causal=is_causal,
++                                  scale=scale, enable_gqa=enable_gqa)
++
++    if mode == "math":
++        from torch.nn.attention import SDPBackend, sdpa_kernel
++
++        def math_sdpa(*args, **kwargs):
++            state["calls"] += 1
++            with sdpa_kernel(SDPBackend.MATH):
++                return orig(*args, **kwargs)
++
++        F.scaled_dot_product_attention = math_sdpa
++        return lambda: setattr(F, "scaled_dot_product_attention", orig), state
++
++    if mode == "sdpa_fast":
++        def default_sdpa(*args, **kwargs):
++            state["calls"] += 1
++            try:
++                return orig(*args, **kwargs)  # default backend selection
++            except Exception as exc:  # noqa: BLE001
++                state["errors"] += 1
++                state["last_error"] = f"{type(exc).__name__}: {exc}"
++                from torch.nn.attention import SDPBackend, sdpa_kernel
++
++                with sdpa_kernel(SDPBackend.MATH):
++                    return orig(*args, **kwargs)
++
++        F.scaled_dot_product_attention = default_sdpa
++        return lambda: setattr(F, "scaled_dot_product_attention", orig), state
++
++    if mode == "triton_fa":
++        import zluda_ops.auto as auto_ops
++
++        auto_ops.install()
++        return auto_ops.uninstall, state
++
++    if mode == "flash_attn_shim":
++        import flash_attn
++
++        def shim_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
++                      scale=None, enable_gqa=False):
++            state["calls"] += 1
++            try:
++                qq = q.transpose(1, 2).contiguous()
++                kk = k.transpose(1, 2).contiguous()
++                vv = v.transpose(1, 2).contiguous()
++                out = flash_attn.flash_attn_func(qq, kk, vv, dropout_p=dropout_p,
++                                                 softmax_scale=scale, causal=is_causal)
++                return out.transpose(1, 2).contiguous()
++            except Exception as exc:  # noqa: BLE001
++                state["errors"] += 1
++                state["last_error"] = f"{type(exc).__name__}: {exc}"
++                from torch.nn.attention import SDPBackend, sdpa_kernel
++
++                with sdpa_kernel(SDPBackend.MATH):
++                    return _orig_sdpa_with(q, k, v, attn_mask, dropout_p,
++                                           is_causal, scale, enable_gqa)
++
++
++        F.scaled_dot_product_attention = shim_sdpa
++        return lambda: setattr(F, "scaled_dot_product_attention", orig), state
++
++    if mode == "xformers_shim":
++        import xformers.ops as xops
++
++        def xf_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
++                    scale=None, enable_gqa=False):
++            state["calls"] += 1
++            try:
++                qq = q.transpose(1, 2).contiguous()
++                kk = k.transpose(1, 2).contiguous()
++                vv = v.transpose(1, 2).contiguous()
++                bias = xops.LowerTriangularMask() if is_causal else None
++                out = xops.memory_efficient_attention(qq, kk, vv, attn_bias=bias,
++                                                      p=dropout_p, scale=scale)
++                return out.transpose(1, 2).contiguous()
++            except Exception as exc:  # noqa: BLE001
++                state["errors"] += 1
++                state["last_error"] = f"{type(exc).__name__}: {exc}"
++                from torch.nn.attention import SDPBackend, sdpa_kernel
++
++                with sdpa_kernel(SDPBackend.MATH):
++                    return _orig_sdpa_with(q, k, v, attn_mask, dropout_p,
++                                           is_causal, scale, enable_gqa)
++
++        F.scaled_dot_product_attention = xf_sdpa
++        return lambda: setattr(F, "scaled_dot_product_attention", orig), state
++
++    if mode == "flex":
++        from torch.nn.attention.flex_attention import (create_block_mask,
++                                                       flex_attention)
++        cache = {}
++
++        def get_mask(b, h, s):
++            key = (b, h, s)
++            if key not in cache:
++                def causal(bm, hm, qi, ki):
++                    return qi >= ki
++
++                cache[key] = create_block_mask(causal, B=b, H=h, Q_LEN=s, KV_LEN=s,
++                                               device=q0.device, _compile=False)
++            return cache[key]
++
++        q0 = torch.zeros(1, 1, 1, 1, device="cuda")
++
++        def flex_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
++                      scale=None, enable_gqa=False):
++            state["calls"] += 1
++            try:
++                b, h, s, d = q.shape
++                mask = None
++                if is_causal:
++                    if (b, h, s) not in cache:
++                        def causal(bm, hm, qi, ki):
++                            return qi >= ki
++
++                        cache[(b, h, s)] = create_block_mask(
++                            causal, B=b, H=h, Q_LEN=s, KV_LEN=s, device=q.device,
++                            _compile=False)
++                    mask = cache[(b, h, s)]
++                out = flex_attention(q, k, v, block_mask=mask, scale=scale)
++                return out
++            except Exception as exc:  # noqa: BLE001
++                state["errors"] += 1
++                state["last_error"] = f"{type(exc).__name__}: {exc}"
++                from torch.nn.attention import SDPBackend, sdpa_kernel
++
++                with sdpa_kernel(SDPBackend.MATH):
++                    return _orig_sdpa_with(q, k, v, attn_mask, dropout_p,
++                                           is_causal, scale, enable_gqa)
++
++        F.scaled_dot_product_attention = flex_sdpa
++        return lambda: setattr(F, "scaled_dot_product_attention", orig), state
++
++    raise ValueError(f"unknown attention mode {mode}")
++
++
++def load_model(dtype, path):
++    from transformers import AutoModelForCausalLM, AutoTokenizer
++    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
++    base = dict(local_files_only=True, low_cpu_mem_usage=True,
++                attn_implementation="sdpa")
++    try:
++        model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, **base)
++    except TypeError:
++        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype, **base)
++    model = model.eval()
++    return tokenizer, model
++
++
++def run_forward(model, ids):
++    with torch.no_grad():
++        return model(input_ids=ids, use_cache=True, logits_to_keep=1)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", default=DEFAULT_MODEL)
++    parser.add_argument("--dtype", default="fp16", choices=["fp16", "fp32", "bf16"])
++    parser.add_argument("--acc", type=int, default=0, choices=[0, 1])
++    parser.add_argument("--bf16-emul", action="store_true",
++                        help="bf16 weights stored as bf16 but compute in fp32 (emulation)")
++    parser.add_argument("--attn", default="math",
++                        choices=["math", "sdpa_fast", "triton_fa", "flex",
++                                 "flash_attn_shim", "xformers_shim"])
++    parser.add_argument("--compile", action="store_true")
++    parser.add_argument("--compile-mode", default="default")
++    parser.add_argument("--prefill", type=int, default=2048)
++    parser.add_argument("--decode", type=int, default=8)
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    parser.add_argument("--tag", default="")
++    args = parser.parse_args()
++    torch.manual_seed(0)
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    torch.cuda.reset_peak_memory_stats()
++    dtypes = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
++    result = {"dtype": args.dtype, "acc": args.acc, "attn": args.attn,
++              "bf16_emul": args.bf16_emul,
++              "compile": args.compile, "tag": args.tag,
++              "prefill": args.prefill, "decode": args.decode}
++
++    if args.acc and args.dtype != "fp16":
++        result["error"] = "fp16-accum applies to fp16 only"
++        save_report("attention_matrix", result)
++        print(json.dumps(result))
++        return 0
++    if args.acc:
++        torch._C._set_cublas_allow_fp16_accumulation(True)
++
++    unpatch = None
++    def log(msg):
++        print(f"[attn-matrix] {msg}", flush=True)
++    try:
++        log("loading model")
++        tokenizer, model = load_model(dtypes[args.dtype], args.model)
++        unpatch, state = make_attn_patch(args.attn, model.config)
++        if args.bf16_emul:
++            # bf16 storage, fp32 compute: cast every parameter to fp32 after the
++            # bf16 round-trip (weights keep bf16 precision, math runs in fp32)
++            for prm in model.parameters():
++                prm.data = prm.data.float()
++            log("bf16-emul: parameters cast to fp32")
++        log("attention patched, moving model to GPU")
++        model = model.cuda()
++        if args.compile:
++            model = torch.compile(model, dynamic=False, mode=args.compile_mode)
++        ids = torch.randint(0, model.config.vocab_size, (1, args.prefill),
++                            device="cuda")
++        # correctness reference: math SDPA with the same weights
++        ref = None
++        if args.attn != "math":
++            F.scaled_dot_product_attention = _ref_math_orig()
++            try:
++                ref = run_forward(model, ids).logits.clone()
++            finally:
++                unpatch()
++                unpatch, state = make_attn_patch(args.attn, model.config)
++        log("warmup forward")
++        run_forward(model, ids)
++        torch.cuda.synchronize()
++        log("measuring prefill")
++        prefill_ms = bench_median(lambda: run_forward(model, ids), rounds=2, iters=1)
++        with torch.no_grad():
++            out = model(input_ids=ids, use_cache=True, logits_to_keep=1)
++            past = out.past_key_values
++            tok = out.logits[:, -1:].argmax(-1)
++            for _ in range(args.decode):
++                o2 = model(input_ids=tok, past_key_values=past, use_cache=True,
++                           logits_to_keep=1)
++                past = o2.past_key_values
++                tok = o2.logits[:, -1:].argmax(-1)
++        log("measuring decode")
++        torch.cuda.synchronize()
++        t0 = time.perf_counter()
++        with torch.no_grad():
++            for _ in range(args.decode):
++                o2 = model(input_ids=tok, past_key_values=past, use_cache=True,
++                           logits_to_keep=1)
++                past = o2.past_key_values
++                tok = o2.logits[:, -1:].argmax(-1)
++        torch.cuda.synchronize()
++        decode_ms = (time.perf_counter() - t0) / max(1, args.decode) * 1000
++        result.update({
++            "prefill_ms": prefill_ms, "prefill_tok_s": args.prefill / prefill_ms * 1000,
++            "decode_ms_per_tok": decode_ms, "decode_tok_s": 1000 / decode_ms,
++            "peak_mb": torch.cuda.max_memory_allocated() / 1024**2,
++            "attn_calls": state.get("calls"), "attn_errors": state.get("errors"),
++            "attn_last_error": state.get("last_error"),
++        })
++        if ref is not None:
++            try:
++                out2 = run_forward(model, ids).logits
++                result["logits_max_abs_diff"] = float((out2 - ref).abs().max())
++            except Exception as exc:  # noqa: BLE001
++                result["logits_error"] = f"{type(exc).__name__}: {exc}"
++    except Exception as exc:  # noqa: BLE001
++        result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
++    finally:
++        if unpatch:
++            try:
++                unpatch()
++            except Exception:
++                pass
++    save_report("attention_matrix", result)
++    print(json.dumps(result, indent=2))
++    return 0
++
++
++def _ref_math_orig():
++    """Math-only SDPA wrapper used for the correctness reference."""
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    def math_only(q, k, v, *a, **kw):
++        with sdpa_kernel(SDPBackend.MATH):
++            return _ORIG_SDPA_REF(q, k, v, *a, **kw)
++
++    return math_only
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/bench_gpu.py b/bench/bench_gpu.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..9c495c8b940dbbad0310d93caf8ed480a23c3f49
@@ -6494,6 +6842,809 @@ index 0000000000000000000000000000000000000000..23d7a589bcba6d7f28e1fb3a64a98624
 +if __name__ == "__main__":
 +    main()
 +
+diff --git a/bench/results/cross_backend_summary.json b/bench/results/cross_backend_summary.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..0347ef4cb83812cfa0ad1a9845970310ca966929
+--- /dev/null
++++ b/bench/results/cross_backend_summary.json
+@@ -0,0 +1,796 @@
++{
++  "fp16_math_acc0": {
++    "dtype": "fp16",
++    "acc": 0,
++    "attn": "math",
++    "compile": false,
++    "tag": "fp16_math_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 211.96039999995264,
++    "prefill_tok_s": 4831.091090601021,
++    "decode_ms_per_tok": 34.673225000005914,
++    "decode_tok_s": 28.840697685312787,
++    "peak_mb": 1123.4462890625,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:34:39",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp16_sdpa_fast_acc0": {
++    "dtype": "fp16",
++    "acc": 0,
++    "attn": "sdpa_fast",
++    "compile": false,
++    "tag": "fp16_sdpa_fast_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 212.3596499998257,
++    "prefill_tok_s": 4822.008324090007,
++    "decode_ms_per_tok": 36.97397499990984,
++    "decode_tok_s": 27.046050634329646,
++    "peak_mb": 1123.736328125,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "logits_max_abs_diff": 0.0,
++    "timestamp": "2026-11-25T21:25:11",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp16_triton_fa_acc0": {
++    "dtype": "fp16",
++    "acc": 0,
++    "attn": "triton_fa",
++    "compile": false,
++    "tag": "fp16_triton_fa_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 183.9615500000491,
++    "prefill_tok_s": 5566.380583332369,
++    "decode_ms_per_tok": 34.26182499993047,
++    "decode_tok_s": 29.187003319351184,
++    "peak_mb": 1123.4462890625,
++    "attn_calls": 0,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "logits_max_abs_diff": 0.02734375,
++    "timestamp": "2026-11-25T21:35:10",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp16_flash_attn_shim_acc0": {
++    "dtype": "fp16",
++    "acc": 0,
++    "attn": "flash_attn_shim",
++    "compile": false,
++    "tag": "fp16_flash_attn_shim_acc0",
++    "prefill": 512,
++    "decode": 4,
++    "prefill_ms": 99.65470000020105,
++    "prefill_tok_s": 5137.740618344816,
++    "decode_ms_per_tok": 617.7410249999866,
++    "decode_tok_s": 1.6188013415492708,
++    "peak_mb": 1053.4091796875,
++    "attn_calls": 31296,
++    "attn_errors": 31104,
++    "attn_last_error": "RuntimeError: The size of tensor a (14) must match the size of tensor b (2) at non-singleton dimension 1",
++    "logits_max_abs_diff": 0.03125,
++    "timestamp": "2026-11-25T21:36:31",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp16_xformers_shim_acc0": {
++    "dtype": "fp16",
++    "acc": 0,
++    "attn": "xformers_shim",
++    "compile": false,
++    "tag": "fp16_xformers_shim_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 7.98 GiB of which 901.88 MiB is free. 6.79 GiB allowed; Of the allocated memory 6.02 GiB is allocated by PyTorch, and 783.48 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setti",
++    "timestamp": "2026-11-25T21:33:45",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp16_flex_acc0": {
++    "dtype": "fp16",
++    "acc": 0,
++    "attn": "flex",
++    "compile": false,
++    "tag": "fp16_flex_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 210.07030000009763,
++    "prefill_tok_s": 4874.558659646433,
++    "decode_ms_per_tok": 33.990475000109655,
++    "decode_tok_s": 29.420006634116586,
++    "peak_mb": 1123.751953125,
++    "attn_calls": 384,
++    "attn_errors": 384,
++    "attn_last_error": "ValueError: Expect query and key/value to have the same number of heads but got Hq=14 and Hkv=2. Try setting enable_gqa=True for GQA.",
++    "logits_max_abs_diff": 0.0,
++    "timestamp": "2026-11-25T21:34:02",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp16_math_acc1": {
++    "dtype": "fp16",
++    "acc": 1,
++    "attn": "math",
++    "compile": false,
++    "tag": "fp16_math_acc1",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 137.45505000019875,
++    "prefill_tok_s": 7449.708104565961,
++    "decode_ms_per_tok": 19.620649999978923,
++    "decode_tok_s": 50.966711092704585,
++    "peak_mb": 1123.4462890625,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:34:54",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp16_triton_fa_acc1": {
++    "dtype": "fp16",
++    "acc": 1,
++    "attn": "triton_fa",
++    "compile": false,
++    "tag": "fp16_triton_fa_acc1",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 108.2430999999815,
++    "prefill_tok_s": 9460.187300624013,
++    "decode_ms_per_tok": 20.446774999982154,
++    "decode_tok_s": 48.90746829271965,
++    "peak_mb": 1123.4462890625,
++    "attn_calls": 0,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "logits_max_abs_diff": 0.22265625,
++    "timestamp": "2026-11-25T21:35:26",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "fp32_math_acc0": {
++    "dtype": "fp32",
++    "acc": 0,
++    "attn": "math",
++    "compile": false,
++    "tag": "fp32_math_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 188.99809999993522,
++    "prefill_tok_s": 5418.043885099115,
++    "decode_ms_per_tok": 28.135425000073155,
++    "decode_tok_s": 35.5423811795059,
++    "peak_mb": 2073.30322265625,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:35:42",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "bf16_math_acc0": {
++    "dtype": "bf16",
++    "acc": 0,
++    "attn": "math",
++    "compile": false,
++    "tag": "bf16_math_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 296.8156500000987,
++    "prefill_tok_s": 3449.9528579428325,
++    "decode_ms_per_tok": 89.82242499996573,
++    "decode_tok_s": 11.133077291115013,
++    "peak_mb": 1123.4462890625,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:35:59",
++    "gpu": {
++      "torch": "2.7.1+cu118",
++      "cuda": "11.8",
++      "hip": null,
++      "hip_path": "G:\\zluda\\hip",
++      "zluda_cc": "8.6",
++      "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "3.3.1"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "rocm_fp16_acc0": {
++    "dtype": "fp16",
++    "acc": 0,
++    "attn": "math",
++    "compile": false,
++    "tag": "rocm_fp16_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 332.2576000000481,
++    "prefill_tok_s": 3081.946056312487,
++    "decode_ms_per_tok": 50.43537500000639,
++    "decode_tok_s": 19.82735332095525,
++    "peak_mb": 1146.44677734375,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:41:02",
++    "gpu": {
++      "torch": "2.14.0+rocm10.1.0",
++      "cuda": null,
++      "hip": "7.16.26385",
++      "hip_path": "C:\\Program Files\\AMD\\ROCm\\6.4",
++      "zluda_cc": null,
++      "device": "AMD Radeon RX 5700 XT",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "unavailable: ModuleNotFoundError"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "rocm_fp16_acc1": {
++    "dtype": "fp16",
++    "acc": 1,
++    "attn": "math",
++    "compile": false,
++    "tag": "rocm_fp16_acc1",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 330.47514999998384,
++    "prefill_tok_s": 3098.5688333904986,
++    "decode_ms_per_tok": 50.158075000013014,
++    "decode_tok_s": 19.936969271642514,
++    "peak_mb": 1146.44677734375,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:41:15",
++    "gpu": {
++      "torch": "2.14.0+rocm10.1.0",
++      "cuda": null,
++      "hip": "7.16.26385",
++      "hip_path": "C:\\Program Files\\AMD\\ROCm\\6.4",
++      "zluda_cc": null,
++      "device": "AMD Radeon RX 5700 XT",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "unavailable: ModuleNotFoundError"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "rocm_fp32_acc0": {
++    "dtype": "fp32",
++    "acc": 0,
++    "attn": "math",
++    "compile": false,
++    "tag": "rocm_fp32_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 869.9699000001146,
++    "prefill_tok_s": 1177.0522175535787,
++    "decode_ms_per_tok": 60.43384999998125,
++    "decode_tok_s": 16.54701793779993,
++    "peak_mb": 2096.3037109375,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:41:34",
++    "gpu": {
++      "torch": "2.14.0+rocm10.1.0",
++      "cuda": null,
++      "hip": "7.16.26385",
++      "hip_path": "C:\\Program Files\\AMD\\ROCm\\6.4",
++      "zluda_cc": null,
++      "device": "AMD Radeon RX 5700 XT",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "unavailable: ModuleNotFoundError"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "rocm_bf16_acc0": {
++    "dtype": "bf16",
++    "acc": 0,
++    "attn": "math",
++    "compile": false,
++    "tag": "rocm_bf16_acc0",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 359.9738499999603,
++    "prefill_tok_s": 2844.651076738249,
++    "decode_ms_per_tok": 94.43239999995967,
++    "decode_tok_s": 10.589585777767239,
++    "peak_mb": 1146.44677734375,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:41:48",
++    "gpu": {
++      "torch": "2.14.0+rocm10.1.0",
++      "cuda": null,
++      "hip": "7.16.26385",
++      "hip_path": "C:\\Program Files\\AMD\\ROCm\\6.4",
++      "zluda_cc": null,
++      "device": "AMD Radeon RX 5700 XT",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "unavailable: ModuleNotFoundError"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  },
++  "rocm_bf16emul_math": {
++    "dtype": "bf16",
++    "acc": 0,
++    "attn": "math",
++    "bf16_emul": true,
++    "compile": false,
++    "tag": "rocm_bf16emul_math",
++    "prefill": 1024,
++    "decode": 4,
++    "prefill_ms": 268.6534000001757,
++    "prefill_tok_s": 3811.602607669698,
++    "decode_ms_per_tok": 38.41644999999971,
++    "decode_tok_s": 26.0305155734069,
++    "peak_mb": 2096.3037109375,
++    "attn_calls": 384,
++    "attn_errors": 0,
++    "attn_last_error": null,
++    "timestamp": "2026-11-25T21:42:16",
++    "gpu": {
++      "torch": "2.14.0+rocm10.1.0",
++      "cuda": null,
++      "hip": "7.16.26385",
++      "hip_path": "C:\\Program Files\\AMD\\ROCm\\6.4",
++      "zluda_cc": null,
++      "device": "AMD Radeon RX 5700 XT",
++      "multi_processor_count": 20,
++      "total_memory_gb": 7.98,
++      "l2_cache_mb": 4.0,
++      "allow_tf32": false,
++      "float32_matmul_precision": "highest",
++      "triton": "unavailable: ModuleNotFoundError"
++    },
++    "protocol": {
++      "data": "random data (torch.randn) unless stated otherwise",
++      "timing": "mean per round, median across rounds, warmup per round",
++      "order": "variant order shuffled between rounds when comparing",
++      "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++    },
++    "clocks": {
++      "adapter": "AMD Radeon RX 5700 XT",
++      "engine_clock_mhz": null,
++      "memory_clock_mhz": null,
++      "vddc_mv": null,
++      "temperature_c": null,
++      "activity_pct": null,
++      "power_pct": null,
++      "errors": {
++        "overdriveN_status": -8,
++        "overdrive6_status": -8,
++        "overdrive6_temperature": -8,
++        "overdrive6_power": -1
++      }
++    }
++  }
++}
+\ No newline at end of file
 diff --git a/bench/results/llamacpp_zluda_vs_vulkan.json b/bench/results/llamacpp_zluda_vs_vulkan.json
 new file mode 100644
 index 0000000000000000000000000000000000000000..fa3adc726e16e65771a961d47bbf06aef93ba84e
@@ -6957,6 +8108,103 @@ index 0000000000000000000000000000000000000000..453c5bc2f73c481f1c1e2b79117a97c3
 +if __name__ == "__main__":
 +    main()
 +
+diff --git a/bench/run_attention_matrix.py b/bench/run_attention_matrix.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c537f856b0fd6e3f50187cc73ea9d88779950136
+--- /dev/null
++++ b/bench/run_attention_matrix.py
+@@ -0,0 +1,91 @@
++"""Run the attention-matrix benchmark configurations sequentially.
++
++Each configuration runs in its own `attention_matrix.py` process with a hard
++timeout; results are parsed from the JSON outputs and summarised to
++bench/results/attention_matrix_summary.json. Designed to run as one background
++job (no nested process trees on this machine).
++
++Usage:
++  venv\\Scripts\\python.exe bench\\run_attention_matrix.py --dtypes fp16 --prefill 1024 --decode 4
++  venv\\Scripts\\python.exe bench\\run_attention_matrix.py --dtypes fp16,fp32,bf16 --acc
++"""
++
++import argparse
++import json
++import re
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++RESULTS = REPO / "bench" / "results"
++OUT_SUMMARY = RESULTS / "attention_matrix_summary.json"
++
++
++def run_config(args, tag, timeout_s):
++    cmd = [str(REPO / "run-zluda.cmd"), "venv\\Scripts\\python.exe",
++           str(REPO / "bench" / "attention_matrix.py"), *args, "--tag", tag]
++    t0 = time.perf_counter()
++    try:
++        proc = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True,
++                              timeout=timeout_s)
++        out = (proc.stdout or "") + (proc.stderr or "")
++        m = re.search(r"\{.*\n\}", out, re.S)
++        payload = json.loads(m.group(0)) if m else {"error": out[-500:]}
++    except subprocess.TimeoutExpired:
++        payload = {"error": f"timeout after {timeout_s}s"}
++    except Exception as exc:  # noqa: BLE001
++        payload = {"error": f"{type(exc).__name__}: {exc}"}
++    payload["tag"] = tag
++    payload["wall_s"] = round(time.perf_counter() - t0, 1)
++    print(f"[runner] {tag}: prefill={payload.get('prefill_tok_s')} "
++          f"decode={payload.get('decode_tok_s')} err={payload.get('error')} "
++          f"wall={payload['wall_s']}s", flush=True)
++    return payload
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dtypes", default="fp16")
++    parser.add_argument("--acc", action="store_true", help="also run fp16+accum")
++    parser.add_argument("--attn", default="math,sdpa_fast,triton_fa,flash_attn_shim,xformers_shim,flex")
++    parser.add_argument("--prefill", type=int, default=1024)
++    parser.add_argument("--decode", type=int, default=4)
++    parser.add_argument("--timeout", type=int, default=900)
++    parser.add_argument("--compile", action="store_true")
++    args = parser.parse_args()
++    RESULTS.mkdir(parents=True, exist_ok=True)
++    old_rows = []
++    if OUT_SUMMARY.exists():
++        try:
++            old_rows = json.loads(OUT_SUMMARY.read_text(encoding="utf-8"))
++        except Exception:  # noqa: BLE001
++            old_rows = []
++    rows = [r for r in old_rows if r.get("tag") not in {None}]
++
++    dtypes = [d for d in args.dtypes.split(",") if d]
++    attns = [a for a in args.attn.split(",") if a]
++    for dtype in dtypes:
++        for attn in attns:
++            configs = [{"dtype": dtype, "attn": attn, "acc": 0}]
++            if args.acc and dtype == "fp16":
++                configs.append({"dtype": dtype, "attn": attn, "acc": 1})
++            for cfg in configs:
++                tag = f"{dtype}_{attn}_acc{cfg['acc']}"
++                argv = ["--dtype", dtype, "--attn", attn,
++                        "--prefill", str(args.prefill), "--decode", str(args.decode)]
++                if cfg["acc"]:
++                    argv += ["--acc", "1"]
++                if args.compile:
++                    argv += ["--compile"]
++                rows = [r for r in rows if r.get("tag") != tag]
++                rows.append(run_config(argv, tag, args.timeout))
++                # persist after every config so a later crash keeps progress
++                OUT_SUMMARY.write_text(json.dumps(rows, indent=2), encoding="utf-8")
++    print(f"[runner] done, {len(rows)} configs -> {OUT_SUMMARY}", flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/run_vulkan_matrix.py b/bench/run_vulkan_matrix.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..4ef28acb6638632607e219a001b0be7183b9b4a4
@@ -8455,6 +9703,142 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +set "ZLUDA_AUTO_VERBOSE=1"
 +cd /d "%COMFY_DIR%" || exit /b 1
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
+diff --git a/docs/CROSS_BACKEND_COMPARISON.md b/docs/CROSS_BACKEND_COMPARISON.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1a7f1f0a33209ebc1034d6316e77aec60c60103
+--- /dev/null
++++ b/docs/CROSS_BACKEND_COMPARISON.md
+@@ -0,0 +1,129 @@
++# Cross-backend comparison: Vulkan vs native ROCm vs ZLUDA (gfx1010)
++
++Date: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B-Instruct.
++Engines: llama.cpp Vulkan (Ollama 0.40.18) for Vulkan; native `torch
++2.14.0+rocm10.1.0` (HIP 7.16, from the ComfyUIrocm venv) for ROCm; this ZLUDA
++fork with PyTorch 2.7.1+cu118 + Triton 3.3.1 for ZLUDA. All PyTorch runs are
++capped at 85% VRAM. GPU clocks cannot be fixed (+-15-30% run-to-run spread);
++numbers are single runs unless noted, so differences below ~20% are not
++significant.
++
++## 1. PyTorch engines, math SDPA, prefill 1024 / decode 4
++
++| config | prefill tok/s (ZLUDA) | decode tok/s (ZLUDA) | peak MB | prefill tok/s (ROCm) | decode tok/s (ROCm) | peak MB |
++|---|---|---|---|---|---|---|
++| fp16 | **4831** | **28.8** | 1123 | 3082 | 19.8 | 1146 |
++| fp16 + fp16-accum | **7450** | **51.0** | 1123 | 3099 (*) | 19.9 (*) | 1146 |
++| fp32 | **5418** | **35.5** | 2073 | 1177 | 16.5 | 2096 |
++| bf16 native | **3450** | **11.1** | 1123 | 2845 | 10.6 | 1146 |
++| bf16 emulated (bf16 weights -> fp32 compute) | crash (**) | crash | - | 3812 | 26.0 | 2096 |
++
++(*) The ROCm build ignores `torch._C._set_cublas_allow_fp16_accumulation`; fp16
++accumulation is a cuBLAS/HPA concept, so ROCm has no equivalent switch and Vulkan
++has no such concept at all (llama.cpp computes in the model tensor type).
++(**) ZLUDA bf16-emul process died without producing a report (most likely VRAM:
++an fp32 copy on top of the bf16 model), so it is not measured.
++
++ROCm bf16-emul is 1.34x faster than native bf16 on ROCm because it routes the
++GEMMs through the faster fp32 path; on ZLUDA the same trick needs more VRAM than
++the 85% cap allows on this 8 GB card.
++
++## 2. ZLUDA attention stacks (fp16, prefill 1024 / decode 4)
++
++| attention path | prefill tok/s | decode tok/s | notes |
++|---|---|---|---|
++| math SDPA | 4831 | 28.8 | baseline |
++| SDPA default ("fast") | 4822 | 27.0 | falls back to math (flash/mem-efficient/cudnn unavailable on ZLUDA) |
++| Triton flash-attention (`zluda_ops`) | **5566** | 29.2 | our FA kernel, seq %128==0 |
++| flex attention (`torch.nn.attention.flex_attention`) | 4875 | 29.4 | Triton block-mask path works |
++| flash_attn API shim | 5138 | 1.6 (!) | prefill good; decode degenerates (API/fallback overhead per token) |
++| xformers shim | OOM | OOM | `memory_efficient_attention` allocation blow-up in decode |
++| math + fp16-accum | 7450 | 51.0 | best PyTorch configuration |
++| Triton FA + fp16-accum | **9460** | 48.9 | best overall ZLUDA prefill |
++
++Attention availability by engine:
++
++| feature | Vulkan (llama.cpp) | ROCm (native torch) | ZLUDA (torch) |
++|---|---|---|---|
++| math SDPA | n/a (llama.cpp kernels) | yes | yes |
++| SDPA fast backends (flash/mem-efficient/cudnn) | n/a | not usable on gfx1010 | not available (math fallback) |
++| Triton flash-attention | n/a | no Triton in the ROCm venv | yes (`zluda_ops`) |
++| flex attention | n/a | no Triton | yes |
++| flash_attn API | n/a | no (no wheel for gfx1010) | shim (works for prefill; decode anomaly) |
++| xformers API | n/a | no (CUTLASS kernels) | shim (OOM in decode as tested) |
++| llama.cpp flash attention (`-fa 1`) | yes | n/a | **fails** (`mma.sync` kernels unsupported by ZLUDA on RDNA1) |
++| torch.compile | n/a | not tested (no Triton) | prefill +42-49% (6449-6733 tok/s), decode unusable (recompiles per token; CUDA graphs unsupported) |
++
++## 3. Vulkan/llama.cpp (GGUF variants, same llama.cpp, FA=0, KV f16)
++
++| model | ctx | prefill tok/s | decode tok/s | note |
++|---|---|---|---|---|
++| F16 | 2048 | 6211 | 238.3 | stable retry (an outlier run gave 2640/29.3) |
++| F16 | 8192 | 2102-4179 | 28.5-172.7 | large run-to-run spread |
++| F32 | 2048 | 3989-5233 | 147.4-145.9 | |
++| F32 | 8192 | 466-3580 | 106.5-123.4 | high variance |
++| BF16 | 2048 | 1968-4559 | 76.7-218.6 | high variance |
++| BF16 | 8192 | 3319-3328 | 157.9-181.1 | fairly stable |
++
++FP16 accumulation / bf16-emulation do not exist in the Vulkan/llama.cpp
++configuration space: llama.cpp computes in the tensor types stored in the GGUF
++(F16/F32/BF16) and `-fa`/KV-cache flags are the available knobs. Earlier
++FA=1/KV=q8_0 numbers (Q4_K_M 4531/2741/946 prefill and 150.8/135.2/104.8 decode
++at 2k/8k/32k; F16 FA=0 6258/4179 prefill and 212.3/172.7 decode at 2k/8k) are in
++ENGINE_COMPARISON.md.
++
++## 4. Same-engine llama.cpp: Vulkan vs ZLUDA (F16 GGUF, FA=0, -ngl 99)
++
++| context | ZLUDA prefill | Vulkan prefill | ZLUDA decode | Vulkan decode |
++|---|---|---|---|---|
++| 2048 | 6144 | 6258 | 184.2 | 212.3 |
++| 8192 | 3294 | 4179 | 184.6 | 172.7 |
++| 32768 | 732 | n/a (Vulkan clamps F16 to 8192) | 183.9 | n/a |
++
++Full details: docs/LLAMACPP_VULKAN_VS_ZLUDA.md and
++docs/LLAMACPP_ZLUDA_BUILD.md (the custom compute_86-PTX llama.cpp build).
++
++## 5. Reading of the results
++
++- **ZLUDA beats native ROCm torch on every configuration measured** for this
++  model: fp16 +57% prefill / +46% decode, fp32 +4.6x prefill / +2.1x decode,
++  bf16 +21% prefill. The ZLUDA fork ships tuned gfx1010 Tensile overrides,
++  while the native ROCm torch uses the generic rocBLAS path.
++- fp16 accumulation is the single biggest PyTorch knob (+54% prefill on math,
++  +70% with Triton FA); it is a cuBLAS concept, ignored by ROCm and absent on
++  Vulkan.
++- On ZLUDA, Triton FA +16% prefill over math; flex attention and the flash_attn
++  shim are competitive for prefill, but the flash_attn-shim decode path and the
++  xformers shim need work before they are usable in generation loops.
++- Same-engine llama.cpp comparison is close (ZLUDA -2%/-21% prefill at 2k/8k,
++  decode -13%/+7%) and ZLUDA can run 32k context where Ollama clamps F16.
++- The Vulkan numbers have much larger run-to-run spread than the PyTorch ones,
++  so the llama.cpp comparison is the more meaningful Vulkan-vs-ZLUDA statement.
++
++## 6. Artefacts and reproduction
++
++- `bench/attention_matrix.py` - one configuration per process (dtype x fp16-acc
++  x bf16-emul x attention path x compile), reports prefill/decode/peak and
++  logits-vs-math correctness.
++- `bench/run_attention_matrix.py` - sequential runner; results merged into
++  `bench/results/attention_matrix_summary.json` and
++  `bench/results/cross_backend_summary.json`.
++- `bench/ollama_bench.py`, `bench/ollama_config.ps1`, `bench/run_vulkan_matrix.py`
++  for the Vulkan/Ollama side; GGUF F32/BF16 variants were produced locally with
++  llama.cpp `convert_hf_to_gguf.py`.
++- Native ROCm runs use `D:\comfyui\Data\Packages\ComfyUIrocm\venv\Scripts\python.exe`
++  (torch 2.14.0+rocm10.1.0, transformers 5.19, no Triton).
++- ZLUDA runs go through `run-zluda.cmd`; risky GPU workloads should use
++  `tools/gpu_watchdog.ps1` (kill-only by default - the driver-restart path
++  crashed Windows once).
++
++## 7. Known gaps
++
++- flash_attn-shim decode (1.6 tok/s) and xformers-shim OOM need debugging before
++  those shims can be recommended for generation.
++- torch.compile on ZLUDA: prefill win confirmed earlier, decode needs CUDA-graph
++  or per-token compile support; not re-measured here.
++- ROCm: no Triton, so Triton FA/flex/compile cannot be compared on ROCm.
++- Vulkan: only llama.cpp is available (Ollama); no PyTorch dtype/accumulation
++  controls.
++- Fixed clocks (BIOS/power-play) and repeated medians would tighten all numbers.
+\ No newline at end of file
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
