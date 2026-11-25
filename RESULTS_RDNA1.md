@@ -598,3 +598,38 @@ is 1.33x faster than math through the patched Python entry point (the raw kernel
 is 3.35x; the difference is Python dispatch overhead at these small latencies).
 
 `bench/flash_decode.py` reproduces both the correctness checks and the timings.
+
+## P1-3 Weight-only int4/int8 quantization (2026-11-25)
+
+`zluda_ops/quant.py` adds groupwise symmetric weight-only storage
+(groups 32/64/128, fp16 scales, two signed nibbles per byte) with int8/int4
+dequantizers and a fused Triton int4 dequant-GEMV that reads packed weights
+directly (no fp16 weight materialisation). The storage layout is documented and
+GPTQ/AWQ-style (groupwise scale); their exact nibble order/zero-point loading is
+a follow-up.
+
+| format | relative RMS error (random normal) | compression | 7B weights |
+|---|---|---|---|
+| int4, group 32 | 9.7% | 3.56x | 3.5 GB |
+| int4, group 64 | 10.8% | 3.76x | 3.5 GB |
+| int4, group 128 | 11.7% | 3.88x | 3.5 GB |
+| int8, group 128 | 0.65% | 1.97x | 7.0 GB |
+
+The int4 rounding error is that of plain RTN (no GPTQ error compensation); on
+real models GPTQ/AWQ-style compensation is expected to reduce it.
+
+Fused int4 GEMV (N=K=4096, fp16 activations):
+
+| M | int4 GEMV | fp16 GEMV | torch (dequant+linear) | speedup vs fp16 GEMV | max abs vs fp32 ref |
+|---|---|---|---|---|---|
+| 1 | 0.078 ms (114 GB/s packed) | 0.113 ms (297 GB/s) | 0.272 ms | **1.44-1.63x** | 1.6e-4 |
+| 8 | 0.202 ms | 0.180 ms | 0.274 ms | 0.89x | 2.0e-4 |
+
+Correctness of the fused kernel vs the fp32 dequant+linear reference is within
+2.4e-4 for M=1..16. The 70-80% of 448 GB/s target is not met: at 0.5 byte/weight
+the dequantisation (unpack, scale, converts) is compute/launch bound rather than
+bandwidth bound. Fixing register spills (smaller BK for M>=4 and contiguous
+paired x loads) took M=8 from 0.84 ms to 0.20 ms. Next steps: tiled/split-K int4
+GEMV, exact GPTQ/AWQ loading, and the prefill dequant-GEMM.
+
+`bench/quant.py` reproduces the error, correctness and speed tables.
