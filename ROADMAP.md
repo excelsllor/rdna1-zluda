@@ -248,6 +248,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - int4 solver audit:** decode-shape comparison of the fused int4
+  GEMV vs dequant-once + tuned fp16 GEMV (M=1, group 64): dequant-once wins on
+  every shape (43 vs 63 us qkv, 70 vs 120 gate/up, 75 vs 87 down, 832 vs 2329 us
+  lm_head, i.e. up to 2.8x), while fused int4 stays the memory-optimal choice
+  (4x smaller weights). For prefill the fused tiled int4 GEMM remains faster
+  than dequant-once. Recommendation documented in docs/SOLVER_AUDIT.md.
+- **2026-11-25 - auto conv gate fixed:** auto.py installs the F.conv2d patch for
+  ZLUDA_CONV_AUTO=1 as well (line-based edit after CRLF mismatch).
 - **2026-11-25 - conv solver selection:** implemented per-shape solver
   auto-selection in `zluda_ops/conv.py` (fp32 winograd weights cached by
   data_ptr/_version, one-time timing of fp16 vs fp32 candidates per shape,

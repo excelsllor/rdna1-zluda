@@ -116,21 +116,9 @@ def install():
     _orig_sdpa = F.scaled_dot_product_attention
     F.linear = _linear
     F.scaled_dot_product_attention = _sdpa
-    if os.environ.get("ZLUDA_CONV_FP32") == "1":
+    if (os.environ.get("ZLUDA_CONV_FP32") == "1"
+            or os.environ.get("ZLUDA_CONV_AUTO") == "1"):
         _conv.install()
-    return True
-
-
-def uninstall():
-    global _orig_linear, _orig_sdpa
-    if not installed():
-        return False
-    F.linear = _orig_linear
-    F.scaled_dot_product_attention = _orig_sdpa
-    _orig_linear = None
-    _orig_sdpa = None
-    _conv.uninstall()
-    _mha.uninstall()
     return True
 
 
