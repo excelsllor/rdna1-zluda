@@ -248,6 +248,17 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - engine comparison (Vulkan vs ZLUDA), first pass:** Ollama
+  Vulkan runs Qwen2.5-0.5B 100% on GPU (Q4_K_M: 4531 tok/s prefill and 150.8
+  tok/s decode at 2k context, 946/104.8 at 32k; F16 is clamped to 8192 context).
+  ZLUDA/PyTorch: prefill 4525 tok/s fp16, **7774 tok/s with fp16 accumulation**
+  (faster than Vulkan), 4984 fp32, 2798 bf16; decode 19-28 tok/s, i.e. **4-8x
+  slower than Vulkan** due to per-token launch overhead and the math attention
+  fallback - the main ZLUDA-side gap. llama.cpp-CUDA under ZLUDA is blocked by
+  `cudaLaunchKernelEx`/PDL (hangs with PDL disabled); bitsandbytes is excluded
+  (`named symbol not found`), replaced by a Triton blockwise-int8 AdamW
+  (4.6x faster step, 3.94x smaller state). Fixed a recursion bug in the Triton
+  FA math fallback. Full data: ENGINE_COMPARISON.md.
 - **2026-11-25 - P1-3 prefill extension:** added `quant.int4_matmul` (fused
   dequant-GEMM, weights never materialised as fp16) and
   `quant.int4_prefill_linear` (dequant-once reference). At N=K=4096 the fused

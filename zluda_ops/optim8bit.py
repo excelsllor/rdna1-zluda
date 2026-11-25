@@ -20,6 +20,7 @@ trajectory is not preserved (states are quantized), as in bitsandbytes.
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 BLOCK = 256
 
@@ -53,8 +54,8 @@ def _adamw8bit_kernel(P, G, MQ, VQ, MABS, VABS, N, lr, b1, b2, bc1, bc2, eps,
     v_amax = tl.max(tl.abs(v))
     m_amax = tl.maximum(m_amax, 1e-12)
     v_amax = tl.maximum(v_amax, 1e-12)
-    mq_new = tl.maximum(tl.minimum(tl.round(m / m_amax * 127.0), 127.0), -127.0)
-    vq_new = tl.maximum(tl.minimum(tl.round(v / v_amax * 127.0), 127.0), -127.0)
+    mq_new = tl.maximum(tl.minimum(libdevice.rint(m / m_amax * 127.0), 127.0), -127.0)
+    vq_new = tl.maximum(tl.minimum(libdevice.rint(v / v_amax * 127.0), 127.0), -127.0)
     tl.store(P + offs, p.to(P.dtype.element_ty), mask=mask)
     tl.store(MQ + offs, mq_new.to(tl.int8), mask=mask)
     tl.store(VQ + offs, vq_new.to(tl.int8), mask=mask)

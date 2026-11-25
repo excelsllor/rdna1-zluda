@@ -177,6 +177,8 @@ def main():
     parser.add_argument("--prefill", type=int, default=512)
     parser.add_argument("--decode", type=int, default=16)
     parser.add_argument("--train", action="store_true")
+    parser.add_argument("--exact-seq", action="store_true",
+                        help="use random token ids of exactly --prefill length (for FA tests)")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--vram-fraction", type=float, default=0.85)
     parser.add_argument("--tag", default="")
@@ -215,8 +217,13 @@ def main():
             compile_s = None
 
         text = "The quick brown fox jumps over the lazy dog. " * max(1, args.prefill // 10)
-        ids = tokenizer(text, return_tensors="pt", truncation=True,
-                        max_length=args.prefill).input_ids.cuda()
+        if args.exact_seq:
+            vocab = model.config.vocab_size
+            torch.manual_seed(0)
+            ids = torch.randint(0, vocab, (1, args.prefill), device="cuda")
+        else:
+            ids = tokenizer(text, return_tensors="pt", truncation=True,
+                            max_length=args.prefill).input_ids.cuda()
         seq = ids.shape[1]
         prefill_ms = measure_prefill(model, ids)
         decode_ms = measure_decode(model, ids, args.decode)
