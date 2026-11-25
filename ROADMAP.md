@@ -40,7 +40,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 | **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **DONE** | RMSNorm 8.2x fwd / 6.1x bwd, softmax 18.5x, RoPE 5.1-8.8x, SwiGLU 1.2-1.5x vs torch eager; chunked CE -28% peak memory but slower than torch | medium | Triton |
 | **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | fp16 anomaly root-caused: MIOpen picks Winograd (`ConvBinWinogradRxSf2x3g1`) only for fp32, fp16 gets GEMM (`GemmFwdRest`). Workaround `zluda_ops/conv.py`: cast-to-fp32 Winograd conv, **1.4-4.3x fwd / up to 1.9x fwd+bwd**, opt-in `ZLUDA_CONV_FP32=1`; channels_last unusable; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
-| **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **OPEN** | high if SD is a target | medium-high | measure first |
+| **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **PARTIAL** | find-db part **DONE**: user db auto-populated, solver already optimal (FAST/SEARCH change nothing), cold start is 1.2 s process init; channels_last unusable; VAE/GN+SiLU work open | high if SD is a target | medium-high | measured |
 | **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | **PARTIAL** | +5–15% | medium | measured, not fused/auto |
 | **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | **OPEN** | +5–20% on kernels | low-medium | benchmarks |
 | **P2** | xformers / flash-attn CUDA compatibility: source builds for cu118, PTX through ZLUDA, API wrapper + benchmarks | **OPEN** | ecosystem compatibility | high | sm80 kernels; no matrix cores |
@@ -248,6 +248,15 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - MIOpen find-db/solver:** no system find-db for gfx1010 is
+  shipped, but the user find-db (`~/.miopen`) is populated automatically and used
+  (~4.5 ms per new shape). The ~1.2 s first-convolution cost is process
+  initialisation, not find. `MIOPEN_FIND_MODE=FAST` and
+  `MIOPEN_FIND_ENFORCE=SEARCH` do not change steady-state throughput (SEARCH
+  only adds 45-124 ms to the first call), so the selected solvers are already
+  optimal for the tested shapes. `bench/miopen_db.py` reproduces this. The
+  remaining conv opportunity is the dtype solver split, addressed by
+  `zluda_ops/conv.py`.
 - **2026-11-25 - P1-2 (flash-decoding):** `zluda_ops/flash_decode.py`
   splits the KV cache into up to 16 chunks per (batch, head), computes partial
   (acc, m, l) and merges with the standard log-sum-exp formula. Decode shapes
