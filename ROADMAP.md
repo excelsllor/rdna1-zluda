@@ -248,6 +248,15 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - conv solver selection:** implemented per-shape solver
+  auto-selection in `zluda_ops/conv.py` (fp32 winograd weights cached by
+  data_ptr/_version, one-time timing of fp16 vs fp32 candidates per shape,
+  decision cached; `ZLUDA_CONV_AUTO=1`, legacy `ZLUDA_CONV_FP32=1` still works).
+  Measured: small shapes stay on fp16 (0.10 ms), mid/large shapes take the
+  cached-weight fp32 Winograd path - 1x128x32x32 0.12 vs 0.16 ms, 1x320x16x16
+  0.15 vs 0.22 ms, 1x64x128x128 0.22 vs 0.58 ms (2.7x); error 2e-3..4e-3.
+  Remaining audit items: int4 decode-shape configs, fused int8, rocFFT/SPARSE
+  paths (not exercised).
 - **2026-11-25 - solver/kernel audit (first pass):** GEMV configs were a single
   fixed (4096,4) - swept and replaced with a shape-aware TUNED_M1 table
   (qkv 28.5 us 2.07x vs rocBLAS, gate/up 40.1 us 2.01x, down_proj 53.7 us
