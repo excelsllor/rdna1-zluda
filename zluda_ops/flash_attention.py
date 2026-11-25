@@ -18,14 +18,22 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
                     N_CTX: tl.constexpr,
                     Mask, mask_stride_m, mask_stride_n,
                     MASK_TYPE: tl.constexpr,
-                    dropout_p, seed, off_hz, DROPOUT: tl.constexpr):
+                    dropout_p, seed, off_hz, wl, wr,
+                    DROPOUT: tl.constexpr, WINDOW: tl.constexpr):
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
+        if WINDOW:
+            lo = tl.maximum(0, start_m * BLOCK_M - wl)
+            lo = (lo // BLOCK_N) * BLOCK_N
     elif STAGE == 2:
         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)
     else:
         lo, hi = 0, N_CTX
+        if WINDOW:
+            lo = tl.maximum(0, start_m * BLOCK_M - wl)
+            lo = (lo // BLOCK_N) * BLOCK_N
+            hi = tl.minimum(N_CTX, (start_m + 1) * BLOCK_M + wr)
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
     for start_n in range(lo, hi, BLOCK_N):
@@ -47,6 +55,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,
         if STAGE == 2:
             cmask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = tl.where(cmask, qk, -1.0e6)
+        if WINDOW:
+            # Sliding window as arithmetic bounds: no dense mask allocation.
+            di = offs_m[:, None] - (start_n + offs_n[None, :])
+            qk = tl.where((di <= wl) & (di >= -wr), qk, -1.0e6)
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk -= m_ij[:, None]
         p = tl.math.exp2(qk)
@@ -83,13 +95,14 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,
               stride_oz, stride_oh, stride_om, stride_on,
               Z, H, N_CTX,
               Mask, mask_stride_z, mask_stride_h, mask_stride_m, mask_stride_n,
-              dropout_p, seed,
+              dropout_p, seed, window_left, window_right,
               HEAD_DIM: tl.constexpr,
               BLOCK_M: tl.constexpr,
               BLOCK_N: tl.constexpr,
               STAGE: tl.constexpr,
               MASK_TYPE: tl.constexpr,
-              DROPOUT: tl.constexpr):
+              DROPOUT: tl.constexpr,
+              WINDOW: tl.constexpr):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -123,13 +136,15 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,
                                         start_m, qk_scale, BLOCK_M, HEAD_DIM, BLOCK_N,
                                         4 - STAGE, offs_m, offs_n, N_CTX,
                                         Mask, mask_stride_m, mask_stride_n, MASK_TYPE,
-                                        dropout_p, seed, off_hz, DROPOUT)
+                                        dropout_p, seed, off_hz, window_left, window_right,
+                                        DROPOUT, WINDOW)
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
                                         start_m, qk_scale, BLOCK_M, HEAD_DIM, BLOCK_N,
                                         2, offs_m, offs_n, N_CTX,
                                         Mask, mask_stride_m, mask_stride_n, MASK_TYPE,
-                                        dropout_p, seed, off_hz, DROPOUT)
+                                        dropout_p, seed, off_hz, window_left, window_right,
+                                        DROPOUT, WINDOW)
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -155,8 +170,8 @@ def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
                    BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr, HEAD_DIM: tl.constexpr,
                    start_n, start_m, num_steps,
                    Mask, mask_stride_m, mask_stride_n,
-                   MASK_TYPE: tl.constexpr, dropout_p, seed, bhid,
-                   DROPOUT: tl.constexpr, MASK: tl.constexpr):
+                   MASK_TYPE: tl.constexpr, dropout_p, seed, bhid, wl, wr,
+                   DROPOUT: tl.constexpr, WINDOW: tl.constexpr, MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -182,6 +197,9 @@ def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
             pT = tl.where(mask, pT, 0.0)
+        if WINDOW:
+            di = offs_m[None, :] - offs_n[:, None]
+            pT = tl.where((di <= wl) & (di >= -wr), pT, 0.0)
         if DROPOUT:
             offs = (offs_m[None, :] * N_CTX + offs_n[:, None]
                     + bhid * 7919).to(tl.int32)
@@ -207,8 +225,8 @@ def _attn_bwd_dq(dq, q, K, V, do, m, D,
                  BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr, HEAD_DIM: tl.constexpr,
                  start_m, start_n, num_steps,
                  Mask, mask_stride_m, mask_stride_n,
-                 MASK_TYPE: tl.constexpr, dropout_p, seed, bhid,
-                 DROPOUT: tl.constexpr, MASK: tl.constexpr):
+                 MASK_TYPE: tl.constexpr, dropout_p, seed, bhid, wl, wr,
+                 DROPOUT: tl.constexpr, WINDOW: tl.constexpr, MASK: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -236,6 +254,9 @@ def _attn_bwd_dq(dq, q, K, V, do, m, D,
         if MASK:
             mask = (offs_m[:, None] >= offs_n_blk[None, :])
             p = tl.where(mask, p, 0.0)
+        if WINDOW:
+            di = offs_m[:, None] - offs_n_blk[None, :]
+            p = tl.where((di <= wl) & (di >= -wr), p, 0.0)
         if DROPOUT:
             offs = (offs_m[:, None] * N_CTX + offs_n_blk[None, :]
                     + bhid * 7919).to(tl.int32)
@@ -255,12 +276,12 @@ def _attn_bwd_dq(dq, q, K, V, do, m, D,
 def _attn_bwd(Q, K, V, sm_scale, DO, DQ, DK, DV, M, D,
               stride_z, stride_h, stride_tok, stride_d, H, N_CTX,
               Mask, mask_stride_z, mask_stride_h, mask_stride_m, mask_stride_n,
-              dropout_p, seed,
+              dropout_p, seed, window_left, window_right,
               BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr,
               BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr,
               BLK_SLICE_FACTOR: tl.constexpr, HEAD_DIM: tl.constexpr,
               CAUSAL: tl.constexpr, MASK_TYPE: tl.constexpr,
-              DROPOUT: tl.constexpr):
+              DROPOUT: tl.constexpr, WINDOW: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645996
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
@@ -292,19 +313,19 @@ def _attn_bwd(Q, K, V, sm_scale, DO, DQ, DK, DV, M, D,
         dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
                                 stride_tok, stride_d, H, N_CTX,
                                 MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,
-                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=True)
+                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=True)
         start_m += num_steps * MASK_BLOCK_M1
         num_steps = (N_CTX - start_m) // BLOCK_M1
         dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
                                 stride_tok, stride_d, H, N_CTX,
                                 BLOCK_M1, BLOCK_N1, HEAD_DIM,
-                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
+                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
     else:
         num_steps = N_CTX // BLOCK_M1
         dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
                                 stride_tok, stride_d, H, N_CTX,
                                 BLOCK_M1, BLOCK_N1, HEAD_DIM,
-                                start_n, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
+                                start_n, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv)
     dk *= sm_scale
@@ -324,17 +345,17 @@ def _attn_bwd(Q, K, V, sm_scale, DO, DQ, DK, DV, M, D,
         num_steps = BLOCK_M2 // MASK_BLOCK_N2
         dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
                           BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,
-                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=True)
+                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=True)
         end_n -= num_steps * MASK_BLOCK_N2
         num_steps = end_n // BLOCK_N2
         dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
                           BLOCK_M2, BLOCK_N2, HEAD_DIM,
-                          start_m, end_n - num_steps * BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
+                          start_m, end_n - num_steps * BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
     else:
         num_steps = N_CTX // BLOCK_N2
         dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
                           BLOCK_M2, BLOCK_N2, HEAD_DIM,
-                          start_m, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
+                          start_m, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
     tl.store(dq_ptrs, dq)
@@ -343,7 +364,7 @@ def _attn_bwd(Q, K, V, sm_scale, DO, DQ, DK, DV, M, D,
 class TritonFlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale, attn_mask, mask_type, mask_strides,
-                dropout_p):
+                dropout_p, window_left, window_right):
         head_dim = q.shape[-1]
         o = torch.empty_like(q)
         stage = 3 if causal else 1
@@ -351,6 +372,9 @@ class TritonFlashAttention(torch.autograd.Function):
         grid = (triton.cdiv(q.shape[2], 64), q.shape[0] * q.shape[1], 1)
         mz, mh, mm, mn = mask_strides
         mask_arg = attn_mask if attn_mask is not None else q
+        window = window_left is not None or window_right is not None
+        wl = window_left if window_left is not None else 1 << 30
+        wr = window_right if window_right is not None else 1 << 30
         dropout = dropout_p > 0.0
         if dropout:
             seed = (int(_DROPOUT_SEED_OVERRIDE) if _DROPOUT_SEED_OVERRIDE is not None
@@ -365,9 +389,9 @@ class TritonFlashAttention(torch.autograd.Function):
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
             q.shape[0], q.shape[1], q.shape[2],
             mask_arg, mz, mh, mm, mn,
-            dropout_p, seed,
+            dropout_p, seed, wl, wr,
             HEAD_DIM=head_dim, BLOCK_M=64, BLOCK_N=64, STAGE=stage,
-            MASK_TYPE=mask_type, DROPOUT=dropout,
+            MASK_TYPE=mask_type, DROPOUT=dropout, WINDOW=window,
             num_warps=4, num_stages=1,
         )
         ctx.save_for_backward(q, k, v, o, lse)
@@ -378,6 +402,8 @@ class TritonFlashAttention(torch.autograd.Function):
         ctx.mask_strides = mask_strides
         ctx.dropout_p = dropout_p
         ctx.dropout_seed = seed
+        ctx.window_left = window_left
+        ctx.window_right = window_right
         return o
 
     @staticmethod
@@ -400,20 +426,23 @@ class TritonFlashAttention(torch.autograd.Function):
         grid = (n_ctx // block_n1, 1, batch * n_head)
         mz, mh, mm, mn = ctx.mask_strides
         mask_arg = ctx.attn_mask if ctx.attn_mask is not None else q
+        window = ctx.window_left is not None or ctx.window_right is not None
+        wl = ctx.window_left if ctx.window_left is not None else 1 << 30
+        wr = ctx.window_right if ctx.window_right is not None else 1 << 30
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
             lse, delta,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             n_head, n_ctx,
             mask_arg, mz, mh, mm, mn,
-            ctx.dropout_p, ctx.dropout_seed,
+            ctx.dropout_p, ctx.dropout_seed, wl, wr,
             BLOCK_M1=block_m1, BLOCK_N1=block_n1,
             BLOCK_M2=block_m2, BLOCK_N2=block_n2,
             BLK_SLICE_FACTOR=2, HEAD_DIM=q.shape[-1], CAUSAL=ctx.causal,
-            MASK_TYPE=ctx.mask_type, DROPOUT=ctx.dropout_p > 0.0,
+            MASK_TYPE=ctx.mask_type, DROPOUT=ctx.dropout_p > 0.0, WINDOW=window,
             num_warps=8, num_stages=1,
         )
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
 def _unsupported(q, k, v, attn_mask, dropout_p):
@@ -484,40 +513,68 @@ def _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa):
 
 
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
-                                 is_causal=False, scale=None, enable_gqa=False):
+                                 is_causal=False, scale=None, enable_gqa=False,
+                                 window_left=None, window_right=None):
     q, k, v = query, key, value
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
     if _unsupported(q, k, v, attn_mask, dropout_p):
-        return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
+        return _fallback_math(q, k, v, attn_mask, dropout_p, is_causal, scale,
+                              enable_gqa, window_left, window_right)
     try:
         mask, mask_type, mask_strides = _prepare_attn_mask(attn_mask, q, k)
     except (ValueError, TypeError):
-        return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
+        return _fallback_math(q, k, v, attn_mask, dropout_p, is_causal, scale,
+                              enable_gqa, window_left, window_right)
     if k.shape[1] != q.shape[1]:
         if q.shape[1] % k.shape[1] != 0:
             raise ValueError("query heads must be a multiple of key/value heads")
         groups = q.shape[1] // k.shape[1]
         k = k.repeat_interleave(groups, dim=1)
         v = v.repeat_interleave(groups, dim=1)
+    # The backward preprocess kernel assumes a contiguous (B, H, N, D) layout;
+    # this is a no-op for the usual case and makes transposed views (varlen)
+    # correct.
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     return TritonFlashAttention.apply(
         q, k, v, bool(is_causal), float(scale), mask, mask_type, mask_strides,
-        float(dropout_p),
+        float(dropout_p), window_left, window_right,
     )
 
 
-def _window_mask(sq, sk, causal, window_size, device):
+def _window_allowed(sq, sk, causal, window_left, window_right, device):
+    """Dense keep-mask for the math fallback only (Triton uses arithmetic)."""
     qi = torch.arange(sq, device=device)[:, None]
     ki = torch.arange(sk, device=device)[None, :]
     allowed = torch.ones((sq, sk), dtype=torch.bool, device=device)
+    di = qi - ki
     if causal:
-        allowed &= qi >= ki
-    left, right = window_size
-    if left >= 0:
-        allowed &= (qi - ki) <= left
-    if right >= 0:
-        allowed &= (ki - qi) <= right
-    return ~allowed
+        allowed &= di >= 0
+    if window_left is not None:
+        allowed &= di <= window_left
+    if window_right is not None:
+        allowed &= di >= -window_right
+    return allowed
+
+
+def _fallback_math(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa,
+                   window_left, window_right):
+    if window_left is not None or window_right is not None:
+        allowed = _window_allowed(q.shape[2], k.shape[2], is_causal,
+                                  window_left, window_right, q.device)
+        if attn_mask is None:
+            attn_mask = allowed
+        elif attn_mask.dtype == torch.bool:
+            attn_mask = attn_mask & allowed
+        else:
+            attn_mask = attn_mask + torch.where(
+                allowed, torch.zeros((), device=q.device, dtype=attn_mask.dtype),
+                torch.full((), -1.0e9, device=q.device, dtype=attn_mask.dtype),
+            )
+        is_causal = False
+    return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
 
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
@@ -526,9 +583,12 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
     if softcap != 0.0 or alibi_slopes is not None or return_attn_probs:
         raise NotImplementedError("softcap, alibi and attention probabilities are not implemented")
     if window_size != (-1, -1):
-        mask = _window_mask(q.shape[2], k.shape[2], causal, window_size, q.device)
+        left, right = window_size
         return scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale,
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal,
+            scale=softmax_scale,
+            window_left=left if left >= 0 else None,
+            window_right=right if right >= 0 else None,
         )
     return scaled_dot_product_attention(
         q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale,
@@ -555,12 +615,13 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=Non
         qi = q[qa:qb].transpose(0, 1).unsqueeze(0)
         ki = k[ka:kb].transpose(0, 1).unsqueeze(0)
         vi = v[ka:kb].transpose(0, 1).unsqueeze(0)
-        mask = None
-        if window_size != (-1, -1):
-            mask = _window_mask(qi.shape[2], ki.shape[2], causal, window_size, q.device)
+        left, right = window_size
+        wl = left if left >= 0 else None
+        wr = right if right >= 0 else None
         oi = scaled_dot_product_attention(
-            qi, ki, vi, attn_mask=mask, dropout_p=dropout_p,
-            is_causal=(causal and mask is None), scale=softmax_scale,
+            qi, ki, vi, attn_mask=None, dropout_p=dropout_p,
+            is_causal=causal, scale=softmax_scale,
+            window_left=wl, window_right=wr,
         )
         outs.append(oi[0].transpose(0, 1))
     return torch.cat(outs, dim=0)
