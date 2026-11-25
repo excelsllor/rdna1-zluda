@@ -281,6 +281,7 @@ venv\Scripts\python.exe bench\gpu_clocks.py --seconds 3
 run-zluda.cmd venv\Scripts\python.exe bench\fa_mask.py --s 512 --bench
 run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench
 run-zluda.cmd venv\Scripts\python.exe bench\fa_window.py --s 512 --bench
+run-zluda.cmd venv\Scripts\python.exe bench\gemv_m32.py --n 4096 --k 4096 --mvec
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.

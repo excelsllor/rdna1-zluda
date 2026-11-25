@@ -177,8 +177,8 @@ ROCm 10.1 user space exposes rocm-smi/amd-smi on this Windows host.
 | fp16 | 1 | 0.114 ms / 294 GB/s | 0.296 ms / 114 GB/s | 66% |
 | fp16 | 4 | 0.121 ms / 278 GB/s | 0.315 ms / 107 GB/s | 62% |
 | fp16 | 8 | 0.139 ms / 242 GB/s | 0.309 ms / 109 GB/s | 54% |
-| fp16 | 16 | 0.218 ms / 155 GB/s | 0.312 ms / 108 GB/s | 35% |
-| fp16 | 32 | 0.435 ms / 78 GB/s | 0.447 ms / 76 GB/s | 17% |
+| fp16 | 16 | 0.192 ms / 176 GB/s | 0.276 ms / 122 GB/s | 39% |
+| fp16 | 32 | 0.410 ms / 83 GB/s | 0.408 ms / 84 GB/s | 19% |
 | fp32 | 1 | 0.216 ms / 311 GB/s | 0.433 ms / 155 GB/s | 69% |
 | fp32 | 4 | 0.236 ms / 284 GB/s | 0.453 ms / 148 GB/s | 63% |
 | fp32 | 8 | 0.230 ms / 292 GB/s | 0.446 ms / 151 GB/s | 65% |
@@ -506,3 +506,28 @@ without dense masks; a fused packed-varlen kernel is still open. The backward
 preprocess kernel assumes a contiguous (B,H,N,D) layout, so the Triton path now
 makes inputs contiguous (a no-op for normal calls) — this also fixes varlen
 gradients through transposed views.
+
+## P0-4 GEMV M=16/32 (2026-11-25)
+
+The M=16/32 target (70-80% of 448 GB/s) is not reachable with the reduction
+patterns available on gfx1010. Measured at N=K=4096, fp16 weights:
+
+| approach | M=16 | M=32 |
+|---|---|---|
+| row-per-program kernel (`_gemv_mvec`), best config | **176.5 GB/s (39%)** | **83.1 GB/s (19%)** |
+| split-K + `tl.dot`, best of 6 configs | 81.5 | 80.5 |
+| packed-fp16 products (PROD_F16) | 151.7 | 31-50 |
+| fp32 rocBLAS (`F.linear`) reference | 159.6 | 118.6 |
+
+`bench/gemv_m32.py` implements the split-K/`tl.dot` variant and the config sweep.
+The `tl.dot` path is slower because small M tiles do not provide enough
+parallelism and the atomic reduction adds traffic; packed-fp16 products reduce
+precision and throughput at these shapes.
+
+Decisions taken:
+
+- `bench/gemv.py` now uses fp32 products for M=16 (better accuracy and
+  **+13%** throughput, 176 vs 155 GB/s); peak numbers for M=1 improved to
+  302/331 GB/s (fp16/fp32) with the measurement protocol from P0-5.
+- M=32 keeps the rocBLAS fallback on the auto path (119 GB/s fp32 vs 76-83
+  Triton), and the 70-80% target is recorded as unreachable rather than open.
