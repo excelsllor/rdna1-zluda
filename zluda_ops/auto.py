@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from . import bf16 as _bf16
+from . import conv as _conv
 from . import flash_attention as _fa
 from . import flash_decode as _flash_decode
 from . import gemv as _gemv
@@ -101,6 +102,8 @@ def install():
     _orig_sdpa = F.scaled_dot_product_attention
     F.linear = _linear
     F.scaled_dot_product_attention = _sdpa
+    if os.environ.get("ZLUDA_CONV_FP32") == "1":
+        _conv.install()
     return True
 
 
@@ -112,6 +115,7 @@ def uninstall():
     F.scaled_dot_product_attention = _orig_sdpa
     _orig_linear = None
     _orig_sdpa = None
+    _conv.uninstall()
     _mha.uninstall()
     return True
 

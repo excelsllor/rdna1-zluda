@@ -690,3 +690,39 @@ on an NVIDIA T4). Chunked CE is kept as a memory-only option: it saves 28% peak
 memory at 4096x16384 but is slower than torch's fused CE.
 
 LayerNorm, GeGLU, fused AdamW/clip and GPU sampling remain open (see ROADMAP).
+
+## P1-1 follow-up: fp16 conv anomaly and the cast-to-fp32 workaround (2026-11-25)
+
+Root cause of the 2-4x fp16 conv slowdown: MIOpen selects **different solver
+families per dtype**. For fp32 3x3 it picks `ConvBinWinogradRxSf2x3g1`
+(miopenConvolutionFwdAlgoWinograd, find time 0.065 ms); for fp16 the same
+shape falls back to `GemmFwdRest` (miopenConvolutionFwdAlgoGEMM). Winograd is
+not selected for fp16 on gfx1010.
+
+Workaround implemented in `zluda_ops/conv.py`: for eligible fp16 3x3 stride-1
+dilation-1 group-1 convolutions, cast inputs and weights to fp32, run the fp32
+Winograd conv and cast the result back. fp16 inputs are exactly representable in
+fp32, so the result equals an fp32 convolution rounded to fp16 (gradients flow
+through the casts). `zluda_ops.auto` patches `F.conv2d` with it when
+`ZLUDA_CONV_FP32=1`.
+
+Measured with the warmed/shuffled protocol (VRAM 85%):
+
+| shape | fwd fp16 | fwd cast | fwd speedup | fwd+bwd fp16 | fwd+bwd cast | bwd speedup |
+|---|---|---|---|---|---|---|
+| 1x64x56x56, 64 | 0.158 ms | 0.112 ms | **1.41x** | 0.478 ms | 0.596 ms | 0.80x |
+| 8x64x56x56, 64 | 0.687 ms | 0.289 ms | **2.37x** | 1.562 ms | 1.532 ms | 1.02x |
+| 8x256x14x14, 256 | 1.013 ms | 0.239 ms | **4.25x** | 1.706 ms | 0.900 ms | **1.90x** |
+| 2x256x64x64, 256 | 2.187 ms | 0.861 ms | **2.54x** | 4.490 ms | 3.471 ms | **1.29x** |
+| 1x320x64x64, 320 | 1.573 ms | 0.690 ms | **2.28x** | 3.173 ms | 2.707 ms | **1.17x** |
+| UNet block 1x256x32x32 | 0.430 ms | 0.250 ms | **1.72x** | - | - | - |
+| UNet block 2x320x64x64 | 3.259 ms | 1.419 ms | **2.30x** | - | - | - |
+
+Forward wins on 5/5 shapes (1.4-4.3x), forward+backward on 4/5 (up to 1.9x);
+the smallest shape is conversion-bound for training (0.80x). Gradient error vs
+the fp32 reference is 2e-8..7e-4 (fp16 accumulation level). `bench/conv_fp16.py`
+reproduces the table.
+
+Caveats: fp32 copies of the conv weights cost memory; the win is shape-dependent
+(conversion cost for tiny convs); only 3x3 stride-1/dilation-1/group-1 is
+eligible, everything else uses the regular path.
