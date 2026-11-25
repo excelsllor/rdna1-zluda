@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..72a327b8f49031576a84036bdc1ab7a8092c156a
+index 0000000000000000000000000000000000000000..10aa987fab59b67fe585042a9c0fe5763b2e33ea
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,513 @@
+@@ -0,0 +1,521 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,14 @@ index 0000000000000000000000000000000000000000..72a327b8f49031576a84036bdc1ab7a8
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - reusable graph decoder:** added `zluda_ops/graph_decode.py`
++  (`GraphDecoder`: StaticCache prefill + CApture of one decode step + replay,
++  token/position buffers updated outside the graph). Replay-only decode:
++  **8.01 ms/tok (124.8 tok/s) at 256 ctx**, 87.6 tok/s at 1k, 72.8 at 2k; full
++  generation with token readback 119 tok/s. Eager PyTorch 25-27 tok/s, llama.cpp
++  Vulkan ~238 tok/s. lm_head matvec 151936x896: rocBLAS 9.73 ms vs Triton GEMV
++  0.86 ms (11x). The self-loop graph variant (token update inside the graph) is
++  not usable on ZLUDA (~1 tok/s, repeated tokens). docs/CUDA_GRAPHS_ZLUDA.md.
 +- **2026-11-25 - bf16 emulation works on ZLUDA:** with in-place parameter
 +  conversion (bf16 storage -> fp32 compute) the ZLUDA process runs bf16-emul at
 +  **5488 tok/s prefill / 29.6 tok/s decode / 2073 MB**, beating both native ZLUDA
@@ -10005,10 +10013,10 @@ index 0000000000000000000000000000000000000000..365e46afce180406afc4089e6629536a
 \ No newline at end of file
 diff --git a/docs/CUDA_GRAPHS_ZLUDA.md b/docs/CUDA_GRAPHS_ZLUDA.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..88359dc413585e6b6f888ee9705b7116b88686ca
+index 0000000000000000000000000000000000000000..2a6adcece6ca143824ffe0c981961c93c94d95d4
 --- /dev/null
 +++ b/docs/CUDA_GRAPHS_ZLUDA.md
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,178 @@
 +# CUDA graphs under ZLUDA on gfx1010
 +
 +Status 2026-11-25: **working for PyTorch `torch.cuda.CUDAGraph`** after adding
@@ -10159,6 +10167,34 @@ index 0000000000000000000000000000000000000000..88359dc413585e6b6f888ee9705b7116
 +(39.9 vs 34.0 ms/token) because each Triton launch costs more CPU per call; the
 +graph replay removes that overhead entirely. This is why graphs are the right
 +delivery mechanism for the GEMV path.
++
++## Reusable GraphDecoder module
++
++`zluda_ops/graph_decode.py` provides `GraphDecoder(model, prompt_ids,
++max_new_tokens)`: it prefills with `StaticCache`, captures one decode step on a
++side stream (after `import zluda_ops.auto` so the Triton GEMV/FA kernels are in
++place) and replays it. The static token and cache-position buffers are updated
++**outside** the graph between replays, which is both correct (logits equal the
++eager path bit-for-bit in controlled tests) and fast:
++
++| measurement | result |
++|---|---|
++| replay-only decode, 256 ctx | 8.01 ms/tok -> **124.8 tok/s** |
++| full generation (token readback each step), 256 ctx | 119.0 tok/s |
++| replay-only decode, 1024 ctx | ~11.4 ms/tok -> 87.6 tok/s |
++| replay-only decode, 2048 ctx | ~13.7 ms/tok -> 72.8 tok/s |
++| eager PyTorch decode (reference) | 25-27 tok/s |
++| llama.cpp Vulkan decode (reference) | 238 tok/s @2k |
++
++The self-loop variant (argmax + token copy + position increment captured inside
++the graph so that one replay advances a full token) is **not usable on ZLUDA**:
++it degraded to ~1 tok/s and repeated tokens, indicating a graph-buffer
++dependency/serialization problem in the HIP graph launch path. Keep the updates
++outside the graph.
++
++`lm_head` (151936x896 matvec) is the largest single decode op: rocBLAS 9.73 ms
++vs Triton GEMV 0.86 ms (11x), which is why the GEMV path is essential for
++decode on this card.
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
@@ -14960,10 +14996,10 @@ index 0000000000000000000000000000000000000000..5fda83cacf51be4522bcf4f35f32d058
 +}
 diff --git a/zluda_ops/__init__.py b/zluda_ops/__init__.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a3bc59bd3e14dabc2136a40237a49c10099066bb
+index 0000000000000000000000000000000000000000..a6c16c402b227657444e5c1dfdab2d9fec2c5ca1
 --- /dev/null
 +++ b/zluda_ops/__init__.py
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,10 @@
 +from . import bf16
 +from . import fp16acc
 +from . import fused
@@ -14973,6 +15009,7 @@ index 0000000000000000000000000000000000000000..a3bc59bd3e14dabc2136a40237a49c10
 +from .flash_decode import flash_decode_attn
 +
 +__all__ = ["bf16", "fp16acc", "mha", "FlashAttention", "TritonFlashAttention", "attention", "flash_attn_func", "flash_attn_varlen_func", "scaled_dot_product_attention", "flash_decode_attn"]
++from . import graph_decode  # noqa: F401
 diff --git a/zluda_ops/auto.py b/zluda_ops/auto.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..e60bafdb03fdaf102256762ff296a5fc9a048b5d
@@ -16635,6 +16672,113 @@ index 0000000000000000000000000000000000000000..38dcde5db7c612e561976380b6f94108
 +                       HAS_BIAS=bias is not None, PROD_F16=not accurate,
 +                       num_warps=warps, num_stages=1)
 +    return y
+diff --git a/zluda_ops/graph_decode.py b/zluda_ops/graph_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..44e51bfd7719bcd5984972df769c05b100308759
+--- /dev/null
++++ b/zluda_ops/graph_decode.py
+@@ -0,0 +1,101 @@
++"""CUDA-graph decode helper for ZLUDA (Qwen-like HF causal LMs).
++
++The decode step of a HF causal LM is a fixed sequence of ~240 small ops; on
++ZLUDA it is bound by CPU dispatch and small-GEMV inefficiency. When
++`zluda_ops.auto` is installed, `F.linear` uses the Triton GEMV kernels and
++`F.scaled_dot_product_attention` uses Triton FA/flash-decoding, which removes
++cuBLAS/cuDNN from the step and makes it graph-capture safe. This class captures
++one decode step with `torch.cuda.CUDAGraph` and replays it, updating the static
++token and cache-position buffers outside the graph (the self-loop variant that
++updates them inside the graph is much slower and not correct on ZLUDA).
++
++Requirements:
++  * `import zluda_ops.auto` before creating the decoder (patches F.linear/F.sdpa)
++  * fixed maximum sequence length (`StaticCache`)
++  * the model must be in eval() and fp16 on CUDA
++
++Usage:
++    import zluda_ops.auto  # noqa: F401  (installs the kernels)
++    dec = GraphDecoder(model, prompt_ids, max_new_tokens=64)
++    tokens = dec.generate(64)          # Python list of token ids
++    print(dec.tokens_per_second)       # graph-replay decode throughput
++"""
++
++import time
++
++import torch
++
++
++class GraphDecoder:
++    def __init__(self, model, prompt_ids, max_new_tokens=64, dtype=torch.float16):
++        from transformers.cache_utils import StaticCache
++
++        self.model = model
++        self.dtype = dtype
++        self.prompt_len = int(prompt_ids.shape[1])
++        self.max_new = int(max_new_tokens)
++        max_len = self.prompt_len + self.max_new + 8
++        self.cache = StaticCache(config=model.config, max_batch_size=1,
++                                 max_cache_len=max_len, device=prompt_ids.device,
++                                 dtype=dtype)
++        pos = torch.arange(self.prompt_len, device=prompt_ids.device,
++                           dtype=torch.long)
++        with torch.no_grad():
++            out = model(input_ids=prompt_ids, past_key_values=self.cache,
++                        cache_position=pos, use_cache=True, logits_to_keep=1)
++        self.static_tok = out.logits[:, -1:].argmax(-1).clone()
++        self.static_pos = torch.tensor([self.prompt_len],
++                                       device=prompt_ids.device, dtype=torch.long)
++        self._capture()
++        self.tokens_per_second = None
++
++    def _step(self):
++        with torch.no_grad():
++            return self.model(input_ids=self.static_tok,
++                              past_key_values=self.cache,
++                              cache_position=self.static_pos,
++                              use_cache=True, logits_to_keep=1)
++
++    def _capture(self):
++        side = torch.cuda.Stream()
++        with torch.cuda.stream(side):
++            self._step()  # warmup on the capture stream
++        torch.cuda.synchronize()
++        self.graph = torch.cuda.CUDAGraph()
++        with torch.cuda.stream(side):
++            with torch.cuda.graph(self.graph):
++                self.graph_out = self._step()
++        torch.cuda.synchronize()
++        self.graph.replay()
++        torch.cuda.synchronize()
++
++    def generate(self, max_new_tokens=None):
++        n = int(max_new_tokens or self.max_new)
++        out = []
++        t0 = time.perf_counter()
++        for i in range(n):
++            self.graph.replay()
++            nxt = self.graph_out.logits[:, -1:].argmax(-1)
++            tok = int(nxt)  # D2H sync
++            out.append(tok)
++            self.static_tok.copy_(nxt)
++            self.static_pos.fill_(self.prompt_len + i + 1)
++        torch.cuda.synchronize()
++        self.tokens_per_second = n / (time.perf_counter() - t0)
++        return out
++
++    def replay_benchmark(self, steps=None):
++        """Replay without reading tokens (pure throughput of the graph step)."""
++        n = int(steps or self.max_new)
++        self.graph.replay()
++        torch.cuda.synchronize()
++        t0 = time.perf_counter()
++        for _ in range(n):
++            self.graph.replay()
++        torch.cuda.synchronize()
++        ms = (time.perf_counter() - t0) / n * 1000
++        self.tokens_per_second = 1000 / ms
++        return ms
++
++
++__all__ = ["GraphDecoder"]
 diff --git a/zluda_ops/mha.py b/zluda_ops/mha.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..dfc22e22129ff9afe19212172aa216f784449bb5
