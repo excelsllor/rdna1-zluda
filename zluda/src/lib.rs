@@ -24,6 +24,9 @@ macro_rules! unimplemented {
             #[allow(improper_ctypes_definitions)]
             #[allow(unused_variables)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
+                if std::env::var_os("ZLUDA_DEBUG_UNIMPLEMENTED").is_some() {
+                    eprintln!("zluda: UNIMPLEMENTED CUDA API called: {}", stringify!($fn_name));
+                }
                 Err(r#impl::unimplemented())
             }
         )*
@@ -146,6 +149,7 @@ cuda_macros::cuda_function_declarations!(
             cuGraphExecDestroy,
             cuGraphExecUpdate_v2,
             cuGraphGetNodes,
+            cuGraphInstantiate,
             cuGraphInstantiateWithFlags,
             cuGraphLaunch,
             cuInit,
@@ -209,11 +213,13 @@ cuda_macros::cuda_function_declarations!(
             cuPointerGetAttributes,
             cuProfilerStart,
             cuProfilerStop,
+            cuStreamBeginCapture,
             cuStreamBeginCapture_v2,
             cuStreamCreate,
             cuStreamCreateWithPriority,
             cuStreamDestroy_v2,
             cuStreamEndCapture,
+            cuStreamGetCaptureInfo,
             cuStreamGetCaptureInfo_v2,
             cuStreamGetCaptureInfo_v3,
             cuStreamIsCapturing,
