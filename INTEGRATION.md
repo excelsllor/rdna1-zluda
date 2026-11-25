@@ -153,3 +153,44 @@ enables it.
 5. Re-tune Tensile for fp32 8.8–9.2 TF and HH 14–16 TF; evaluate int8
    quantization (Stage 3).
 6. Keep `ZLUDA_OPS_DISABLE=1` as the rollback switch for any regression.
+
+## Ecosystem shims: flash_attn and xformers (no CUDA build required)
+
+Real `flash-attn` and `xformers` wheels cannot be used on this stack (they need
+nvcc/CUTLASS sm80+ kernels, and RDNA1 has no matrix cores). The repo ships API
+shims backed by the Triton kernels instead:
+
+```bat
+venv\Scripts\python.exe tools\install_ecosystem.py
+venv\Scripts\python.exe -c "import flash_attn, xformers; print(flash_attn.__version__, xformers.__version__)"
+```
+
+- `integrations/flash_attn`: `flash_attn_func`, `flash_attn_varlen_func`,
+  `FlashAttnFunc`, `flash_attn.bert_padding.unpad_input/pad_input`, version
+  string. Layout is (B, S, H, D) like the real package. The Triton FA /
+  flash-decoding path is used when supported (fp16, head_dim 64, causal,
+  sequence divisible by 128); otherwise it falls back to math SDPA.
+- `integrations/xformers`: `xformers.ops.memory_efficient_attention`,
+  `memory_efficient_attention_forward`, `AttentionBias`,
+  `LowerTriangularMask`, `TensorBias`, `BlockDiagonalMask`, `fmha` aliases.
+  (B, S, H, D) tensors, additive biases and causal markers are mapped to the
+  Triton path with a math-SDPA fallback.
+- The installer writes `zluda_ecosystem.pth` into the venv site-packages (adds
+  the repo root and `integrations/` to sys.path). Remove it or run the installer
+  with `--uninstall` to roll back.
+
+Limitations: no real CUDA flash-attention kernels (no matrix cores on RDNA1),
+no xformers CUTLASS kernels, no block-sparse/attention-bias kernels beyond the
+math fallback. `transformers` can detect the shim via `is_flash_attn_2_available`
+and will exercise the Triton path for supported shapes.
+
+### llama.cpp on ZLUDA (blocked - do not run with GPU offload)
+
+With the launch-attribute patch (`zluda/src/impl/driver.rs`) llama.cpp's CUDA
+backend loads under ZLUDA and runs at `-ngl 0` (CPU: pp16 124 tok/s, tg2 17.4)
+and `-ngl 1 -fa 0` with the F16 GGUF (pp8 415.6, tg1 61.5). Increasing the
+offloaded layers causes launch failures or **hard AMD driver crashes that
+require a reboot**. The cause is ZLUDA's execution/JIT of llama.cpp's CUDA
+kernel set, not the launch API; a same-engine Vulkan-vs-ZLUDA comparison stays
+blocked. Details and the ready matrix runner: ENGINE_COMPARISON.md and
+bench/llamacpp_zluda_matrix.ps1.

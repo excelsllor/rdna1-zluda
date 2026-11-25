@@ -177,3 +177,31 @@ Tooling / methodology:
 3. Fused int8 GEMV + tiled int4 prefill; exact GPTQ/AWQ loading.
 4. Long-context decode tuning (flash-decoding split count, KV layout).
 5. Same-engine comparison once ZLUDA supports the llama.cpp launch API.
+
+### llama.cpp addendum (2026-11-25, final verdict)
+
+After the ZLUDA launch-attribute patch, llama.cpp's CUDA backend runs only in a
+narrow, unusable configuration:
+
+- `-ngl 0` (CPU compute through the CUDA backend): works (pp16 124 tok/s,
+  tg2 17.4 tok/s).
+- `-ngl 1 -fa 0` with the F16 GGUF: works (pp8 415.6 tok/s, tg1 61.5 tok/s).
+- Increasing the number of offloaded layers (`-ngl 2..99`) either fails with
+  `CUDA error: unspecified launch failure` / `operation not supported` or
+  **hard-crashes the AMD driver** (the machine has to be rebooted; this happened
+  several times). The Q4_K_M model (K-quant dequant/MMQ kernels) hangs even
+  with `-ngl 1`.
+- Workarounds have no effect: `GGML_CUDA_PDL=0`, `GGML_CUDA_DISABLE_GRAPHS=1`,
+  `GGML_CUDA_NO_PINNED=1`, `GGML_CUDA_DISABLE_FUSION=1`,
+  `GGML_CUDA_FORCE_MMQ=1`.
+
+**Verdict:** running llama.cpp with GPU offload through ZLUDA is not viable on
+this machine today; it is a ZLUDA runtime/compiler problem (llama.cpp's kernel
+set + launch/graph model vs. ZLUDA's PTX JIT and HIP launch path), not a
+llama.cpp binary issue. The patched launch-attribute support
+(`zluda/src/impl/driver.rs`, `cudaLaunchKernelEx`/PDL attributes accepted,
+kernels serialized) is kept because it is a general ZLUDA improvement. A
+legitimate same-engine Vulkan-vs-ZLUDA comparison is therefore still not
+available; `bench/llamacpp_zluda_matrix.ps1` is ready for when the ZLUDA side
+can run llama.cpp kernels. **Warning: do not run llama.cpp with ngl>1 through
+ZLUDA unless a reboot is acceptable - the driver can hang hard.**

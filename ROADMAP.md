@@ -248,6 +248,24 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - ecosystem shims:** added `integrations/flash_attn` and
+  `integrations/xformers` shims (flash_attn_func/varlen_func/bert_padding,
+  xformers.ops.memory_efficient_attention + bias types) backed by the Triton FA
+  and flash-decoding kernels with a math-SDPA fallback, installable with
+  `tools/install_ecosystem.py` (venv `.pth`). CPU API/fallback tests pass
+  (flash_attn err 4e-7, xformers ops finite); GPU smoke tests of the shims are
+  the next safe step. llama.cpp remains blocked (driver hard-crash with
+  offloaded layers) and is documented in INTEGRATION/ENGINE_COMPARISON.
+- **2026-11-25 - llama.cpp verdict:** after the launch-attribute patch ZLUDA can
+  run llama.cpp only at `-ngl 0` (CPU: pp16 124/tg2 17.4) or `-ngl 1 -fa 0`
+  (F16: pp8 415.6/tg1 61.5). Scaling GPU offload fails with launch errors or
+  hard-crashes the AMD driver (reboot required); Q4_K_M hangs at ngl=1. This is
+  a ZLUDA runtime/compiler limitation (llama.cpp kernel set + PTX JIT), not a
+  llama.cpp binary bug, so a same-engine Vulkan-vs-ZLUDA comparison stays
+  blocked. The launch-attribute patch is kept as a general improvement; the
+  matrix runner is ready for when ZLUDA can execute llama.cpp kernels. Next
+  ecosystem work continues with safe paths (torch.compile/SDPA/ComfyUI and API
+  shims for flash_attn/xformers backed by the Triton kernels).
 - **2026-11-25 - llama.cpp under ZLUDA (patch attempt):** ZLUDA's
   `launch_kernel_ex` rejected PDL launch attributes; patched
   `zluda/src/impl/driver.rs` to accept launch-time attributes (serialized
