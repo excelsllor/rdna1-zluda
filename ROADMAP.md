@@ -248,6 +248,19 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - llama.cpp under ZLUDA WORKS (custom PTX build), same-engine
+  Vulkan comparison:** built llama.cpp locally with portable CUDA 12.4.1
+  (nvcc 12.4.131, VS 2022) and `-DCMAKE_CUDA_ARCHITECTURES=86-virtual`
+  (PTX only - the official SASS-only builds have no code for sm_86 and cannot
+  run on ZLUDA). Result: `-ngl 99` full GPU offload, stable driver, F16 GGUF
+  works; FA=1 (mma.sync) and Q4_K_M (MMQ) still fail/hang on ZLUDA. Same-engine
+  measurement (Qwen2.5-0.5B F16, fa=0): ZLUDA prefill 6144/3294/732 tok/s and
+  decode 184.2/184.6/183.9 tok/s at 2k/8k/32k vs Vulkan (Ollama) 6258/4179 and
+  212.3/172.7 tok/s at 2k/8k (F16 clamped to 8192 on Vulkan). ZLUDA is within
+  -2% prefill at 2k, -21% at 8k, decode -13%/+7% at 2k/8k, and can run 32k
+  context where Vulkan clamps. Full report:
+  docs/LLAMACPP_VULKAN_VS_ZLUDA.md; recipe: docs/LLAMACPP_ZLUDA_BUILD.md;
+  raw data: bench/results/llamacpp_zluda_vs_vulkan.json.
 - **2026-11-25 - ecosystem shims:** added `integrations/flash_attn` and
   `integrations/xformers` shims (flash_attn_func/varlen_func/bert_padding,
   xformers.ops.memory_efficient_attention + bias types) backed by the Triton FA

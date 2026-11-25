@@ -205,3 +205,14 @@ legitimate same-engine Vulkan-vs-ZLUDA comparison is therefore still not
 available; `bench/llamacpp_zluda_matrix.ps1` is ready for when the ZLUDA side
 can run llama.cpp kernels. **Warning: do not run llama.cpp with ngl>1 through
 ZLUDA unless a reboot is acceptable - the driver can hang hard.**
+
+### Corrected llama.cpp root cause (2026-11-25)
+
+The earlier "async-copy pipeline" hypothesis was wrong. Scanning the official
+Windows CUDA builds (b12721, b9802, b6000) shows `ggml-cuda.dll` contains only
+SASS cubins for `sm_50/61/70/75/80` and **no PTX at all**, while ZLUDA can only
+execute PTX. llama.cpp therefore reports
+`CUDA kernel ... has no device code compatible with CUDA arch 86`; with many
+offloaded layers the driver can even hard-crash. The fix is a local llama.cpp
+build with `-DCMAKE_CUDA_ARCHITECTURES=86-virtual` (PTX-only compute_86); recipe
+and verified toolchain: docs/LLAMACPP_ZLUDA_BUILD.md.

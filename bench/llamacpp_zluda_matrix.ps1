@@ -10,13 +10,15 @@ param(
     [string]$Models = "q4,f16",
     [int]$Predict = 32,
     [string]$Fa = "1,0",
-    [int]$Reps = 3
+    [int]$Reps = 3,
+    [string]$BinDir = "G:\zluda\tools\llamacpp-cuda\build",
+    [string]$CudartDir = "G:\zluda\tools\llamacpp-cuda\cudart"
 )
 
 $ErrorActionPreference = "Continue"
 $repo = "G:\zluda"
-$exe = Join-Path $repo "tools\llamacpp-cuda\build\llama-bench.exe"
-$cudart = Join-Path $repo "tools\llamacpp-cuda\cudart"
+$exe = Join-Path $BinDir "llama-bench.exe"
+$cudart = $CudartDir
 $gguf = Join-Path $repo "models\qwen05-gguf"
 $modelFiles = @{
     q4  = Join-Path $gguf "qwen2.5-0.5b-instruct-q4_k_m.gguf"
