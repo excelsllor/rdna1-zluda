@@ -1049,10 +1049,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7400e2696efefc3f8bc923c2d7b630c066f1ac3e
+index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bbf0765371
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,792 @@
+@@ -0,0 +1,824 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1845,12 +1845,44 @@ index 0000000000000000000000000000000000000000..7400e2696efefc3f8bc923c2d7b630c0
 +  from a verified idle-GPU window. During this session a concurrent external
 +  benchmark had to be stopped and the GPU/driver recovered before the final
 +  measurement — benchmarks must not share the GPU with other jobs.
++
++## P1-3 extension: prefill dequant-GEMM and tile decision (2026-11-25)
++
++`quant.int4_matmul` adds a fused int4-dequant GEMM (nibbles unpacked and scaled
++inside each `tl.dot` tile, weights never materialised as fp16) for prefill
++(M=32..256). `quant.int4_prefill_linear` is the dequantize-once reference path.
++Measured at N=K=4096 fp16, VRAM 85% (warmed, shuffled rounds):
++
++| M | fused int4 GEMM | dequant-once + GEMM | fp16 weights (roofline) | fused vs dequant | fused vs fp16 |
++|---|---|---|---|---|---|
++| 32 | 0.614 ms | 2.667 ms | 0.445 ms | **4.3x** | 0.72x |
++| 64 | 0.616 ms | 2.846 ms | 0.618 ms | **4.6x** | 1.00x |
++| 128 | 1.161 ms | 3.070 ms | 0.873 ms | **2.6x** | 0.75x |
++| 256 | 2.059 ms | 3.788 ms | 1.563 ms | **1.8x** | 0.76x |
++| M=1 (decode) | fused GEMV 0.069 ms | 2.525 ms | 0.312 ms | **37x** | **4.6x** |
++
++Errors vs the float32 reference are 2-4e-4. Conclusions:
++
++- **Decode** stays on the fused int4 GEMV: 4.6x faster than fp16 weights and
++  37x faster than dequantize-per-call.
++- **Prefill**: fused int4 GEMM is the best option when the weights must stay
++  int4 (4x less VRAM): it is at parity with cached fp16 weights at M=64 and
++  25-30% slower at M=128-256 (the dequant ALU cost is no longer hidden).
++  Dequantizing per call into fp16 and then GEMM is 1.8-4.6x slower and is only
++  a reference. Serving a model with a fp16 weight cache is faster but loses the
++  int4 memory saving — the trade-off is now measured.
++- **Tiled multi-row int4 GEMV** (measured in the P1-3 ablation) was ~6% faster
++  than the tuned kernel in one process, which is inside the run-to-run variance
++  (±15-30% because GPU clocks cannot be fixed), so it is **not adopted**; the
++  simpler M=1 kernel is kept.
++
++`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..27581eaa88c88a1ff471661823c9c94018a4c217
+index 0000000000000000000000000000000000000000..b71c090bcb8614c2e4e3f403c6449321c079294f
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,387 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1888,7 +1920,7 @@ index 0000000000000000000000000000000000000000..27581eaa88c88a1ff471661823c9c940
 +| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **CLOSED** | decode (LLM inference) | medium | M16 176 GB/s (39%), M32 83 (19%); target 70-80% unreachable with split-K/tl.dot/packed-fp16 (all measured worse); rocBLAS fp32 M=32 fallback kept |
 +| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **DONE** | training + inference | medium | masks/dropout/window in Triton; varlen uses per-sequence Triton (fused packed kernel open) |
 +| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **DONE** | 3.2–4.5x decode vs math at 1k–4k, rel err <5e-4 | medium | `zluda_ops/flash_decode.py` + auto dispatch |
-+| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **PARTIAL** | 4x/2x compression (7B: 3.5/7 GB), fused int4 GEMV tuned to **1.92x** vs fp16 decode (M=1); hypotheses H1/H3/H2 ablated; 70-80% bandwidth not reachable with this structure; GPTQ/AWQ exact loading + prefill GEMM open | high | GEMV/GEMM |
++| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **PARTIAL** | 4x/2x compression (7B: 3.5/7 GB); decode fused GEMV **1.92x** vs fp16 / 4.6x vs fp16-weight GEMM at M=1; fused prefill GEMM at parity with cached fp16 at M=64, 0.75x at M=128-256 (int4 memory kept); dequant-per-call 1.8-4.6x slower; GPTQ/AWQ exact loading open | high | GEMV/GEMM |
 +| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 +| **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 +| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **DONE** | RMSNorm 8.2x fwd / 6.1x bwd, softmax 18.5x, RoPE 5.1-8.8x, SwiGLU 1.2-1.5x vs torch eager; chunked CE -28% peak memory but slower than torch | medium | Triton |
@@ -1912,7 +1944,7 @@ index 0000000000000000000000000000000000000000..27581eaa88c88a1ff471661823c9c940
 +| 0 — Foundation | **PARTIAL** | roofline/regression done; clocks/power blocked |
 +| 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
 +| 2 — Attention | **PARTIAL** | masks/dropout/window in Triton, varlen per-sequence, flash-decoding done; fused decode/backward integration open |
-+| 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (`zluda_ops/quant.py`); exact GPTQ/AWQ loading and prefill GEMM open; no int8 compute |
++| 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (decode) and fused dequant-GEMM (prefill) in `zluda_ops/quant.py`; exact GPTQ/AWQ loading open; no int8 compute |
 +| 4 — Fused kernels | **PARTIAL** | Triton RMSNorm/RoPE/SwiGLU/GeGLU/softmax/AdamW implemented and faster (`zluda_ops/fused.py`); LayerNorm fwd-only win (training slower); chunked CE memory-only; sampling open |
 +| 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 +| 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
@@ -2101,6 +2133,14 @@ index 0000000000000000000000000000000000000000..27581eaa88c88a1ff471661823c9c940
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - P1-3 prefill extension:** added `quant.int4_matmul` (fused
++  dequant-GEMM, weights never materialised as fp16) and
++  `quant.int4_prefill_linear` (dequant-once reference). At N=K=4096 the fused
++  GEMM is 1.8-4.6x faster than dequantize-per-call and 1.00-0.75x of cached
++  fp16 weights (parity at M=64, 25-30% slower at M=128-256) while keeping the
++  4x memory saving; decode remains 4.6x faster than fp16 weights. Tiled int4
++  GEMV (+6%, inside clock variance) is not adopted. `bench/quant_prefill.py`
++  reproduces the table.
 +- **2026-11-25 - fused kernels extension:** added exact-erf GeGLU fwd+bwd,
 +  LayerNorm fwd+bwd and an in-place fused AdamW to `zluda_ops/fused.py`. Clean
 +  measurements: RMSNorm 9.4x fwd / 2.95x fwd+bwd, softmax 2.3x, RoPE 10.9x/8.3x,
@@ -5165,6 +5205,142 @@ index 0000000000000000000000000000000000000000..dba4a3698ee0c636aecbb1efbc707e9d
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/bench/quant_prefill.py b/bench/quant_prefill.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8bbea1dbd82c7c0817496dcaa778c1107ed805f7
+--- /dev/null
++++ b/bench/quant_prefill.py
+@@ -0,0 +1,130 @@
++"""Prefill comparison: fused int4 dequant-GEMM vs dequant-once + GEMM.
++
++Decode (M<=16) is memory-bound on the int4 weights and the fused GEMV wins.
++Prefill (M=32..256) is compute-bound, so the question is whether dequantising
++weights on the fly inside a GEMM tile beats dequantising the weight matrix once
++(extra 2 bytes/weight traffic) and running a regular fp16 GEMM. This script
++answers that, and verifies correctness against a float32 reference.
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\quant_prefill.py --quick
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\quant_prefill.py
++"""
++
++import argparse
++import random
++import sys
++import time
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from zluda_ops import quant
++from bench.common import save_report
++
++
++def timed_shuffled(fns, warm_seconds=1.5, rounds=5, iters=8):
++    t0 = time.perf_counter()
++    while time.perf_counter() - t0 < warm_seconds:
++        for fn in fns.values():
++            fn()
++        torch.cuda.synchronize()
++    rng = random.Random(11)
++    samples = {name: [] for name in fns}
++    for _ in range(rounds):
++        order = list(fns)
++        rng.shuffle(order)
++        for name in order:
++            fn = fns[name]
++            for _ in range(2):
++                fn()
++            torch.cuda.synchronize()
++            t = time.perf_counter()
++            for _ in range(iters):
++                fn()
++            torch.cuda.synchronize()
++            samples[name].append((time.perf_counter() - t) / iters * 1000)
++    return {name: sorted(v)[len(v) // 2] for name, v in samples.items()}
++
++
++def case(m, n=4096, k=4096, group=64, device="cuda", dtype=torch.float16):
++    torch.manual_seed(0)
++    w = torch.randn(n, k, device=device, dtype=dtype) * 0.02
++    x = torch.randn(m, k, device=device, dtype=dtype) * 0.1
++    bias = torch.randn(n, device=device, dtype=dtype) * 0.02
++    packed, scales = quant.quantize_int4(w, group)
++    w_deq = quant.dequantize_int4(packed, scales, (n, k), group)
++
++    fused_out = quant.int4_matmul(x, packed, scales, bias, group)
++    deq_out = quant.int4_prefill_linear(x, packed, scales, bias, group)
++    ref = x.float() @ w_deq.float().t() + bias.float()
++    fused_err = (fused_out.float() - ref).abs().max().item()
++    deq_err = (deq_out.float() - ref).abs().max().item()
++
++    fns = {
++        "fused_int4_gemm": lambda: quant.int4_matmul(x, packed, scales, bias, group),
++        "dequant_once_gemm": lambda: quant.int4_prefill_linear(x, packed, scales, bias, group),
++        "fp16_weights_gemm": lambda: F.linear(x, w, bias),
++    }
++    ms = timed_shuffled(fns)
++    best = min(ms.values())
++    print(f"M={m:3d} N=K={n}: fused {ms['fused_int4_gemm']:7.3f} ms | "
++          f"dequant-once {ms['dequant_once_gemm']:7.3f} ms | "
++          f"fp16-roofline {ms['fp16_weights_gemm']:7.3f} ms | errors "
++          f"{fused_err:.4f}/{deq_err:.4f}", flush=True)
++    return {
++        "m": m, "n": n, "k": k,
++        "fused_ms": ms["fused_int4_gemm"],
++        "dequant_once_ms": ms["dequant_once_gemm"],
++        "fp16_roofline_ms": ms["fp16_weights_gemm"],
++        "fused_err": fused_err, "dequant_err": deq_err,
++        "fused_vs_dequant": ms["dequant_once_gemm"] / ms["fused_int4_gemm"],
++        "fused_vs_fp16": ms["fp16_weights_gemm"] / ms["fused_int4_gemm"],
++        "dequant_vs_fp16": ms["fp16_weights_gemm"] / ms["dequant_once_gemm"],
++    }
++
++
++def decode_reference(device="cuda"):
++    """Show the decode side for contrast: fused GEMV vs dequant-once at M=1."""
++    torch.manual_seed(0)
++    n = k = 4096
++    group = 64
++    w = torch.randn(n, k, device=device, dtype=torch.float16) * 0.02
++    x = torch.randn(1, k, device=device, dtype=torch.float16) * 0.1
++    bias = torch.randn(n, device=device, dtype=torch.float16) * 0.02
++    packed, scales = quant.quantize_int4(w, group)
++    fns = {
++        "fused_gemv": lambda: quant.int4_linear(x, packed, scales, bias, group),
++        "dequant_once": lambda: quant.int4_prefill_linear(x, packed, scales, bias, group),
++        "fp16_roofline": lambda: F.linear(x, w, bias),
++    }
++    ms = timed_shuffled(fns, rounds=4)
++    print(f"M=1 (decode): fused GEMV {ms['fused_gemv']:.4f} ms | dequant-once "
++          f"{ms['dequant_once']:.3f} ms | fp16 {ms['fp16_roofline']:.3f} ms", flush=True)
++    return {k: v for k, v in ms.items()}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--quick", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    args = parser.parse_args()
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    print(f"VRAM fraction {args.vram_fraction}", flush=True)
++    if args.quick:
++        sizes, nk = [32, 64], 1024
++    else:
++        sizes, nk = [32, 64, 128, 256], 4096
++    rows = [case(m, nk, nk) for m in sizes]
++    decode = decode_reference()
++    save_report("quant_prefill", {"rows": rows, "decode": decode})
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/regression.py b/bench/regression.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..23d7a589bcba6d7f28e1fb3a64a98624e77c6688
@@ -7175,10 +7351,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..53ea3251df6e668bb98635e08442c86ca3622d30
+index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb991c82c47
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,364 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -7468,6 +7644,7 @@ index 0000000000000000000000000000000000000000..53ea3251df6e668bb98635e08442c86c
 +run-zluda.cmd venv\Scripts\python.exe bench\miopen_db.py
 +run-zluda.cmd venv\Scripts\python.exe bench\flash_decode.py --quick
 +run-zluda.cmd venv\Scripts\python.exe bench\quant.py --quick
++run-zluda.cmd venv\Scripts\python.exe bench\quant_prefill.py --quick
 +run-zluda.cmd venv\Scripts\python.exe bench\fused.py --quick
 +```
 +
@@ -12903,10 +13080,10 @@ index 0000000000000000000000000000000000000000..dfc22e22129ff9afe19212172aa216f7
 +__all__ = ["install", "uninstall", "installed"]
 diff --git a/zluda_ops/quant.py b/zluda_ops/quant.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d728acb352e3abd669626f5a21266873a0841aff
+index 0000000000000000000000000000000000000000..a8f7f57a3c001e84b432123fde4a571455bc2dd0
 --- /dev/null
 +++ b/zluda_ops/quant.py
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,282 @@
 +"""Weight-only quantization: int4/int8 groupwise storage with fused dequant.
 +
 +Storage format (GPTQ/AWQ compatible in spirit):
@@ -13113,7 +13290,79 @@ index 0000000000000000000000000000000000000000..d728acb352e3abd669626f5a21266873
 +    return torch.nn.functional.linear(x, w, bias)
 +
 +
++
++
++@triton.jit
++def _int4_gemm_kernel(X, Wq, SC, B, Y, M, N, K,
++                      GROUP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
++                      BK: tl.constexpr, HAS_BIAS: tl.constexpr):
++    """Prefill path: dequantize int4 weights on the fly inside a GEMM tile."""
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    offs_m = pid_m * BM + tl.arange(0, BM)
++    offs_n = pid_n * BN + tl.arange(0, BN)
++    offs_k = tl.arange(0, BK)
++    acc = tl.zeros((BM, BN), tl.float32)
++    ngroups = K // GROUP
++    ngrp_bk: tl.constexpr = BK // GROUP
++    for k0 in range(0, K, BK):
++        x = tl.load(X + offs_m[:, None] * K + (k0 + offs_k)[None, :],
++                    mask=offs_m[:, None] < M, other=0.0)
++        offs_b = k0 // 2 + tl.arange(0, BK // 2)
++        packed = tl.load(Wq + offs_n[:, None] * (K // 2) + offs_b[None, :],
++                         mask=offs_n[:, None] < N, other=0).to(tl.int32)
++        lo = ((packed & 0xF) ^ 8) - 8
++        hi = (((packed >> 4) & 0xF) ^ 8) - 8
++        sc_g = tl.load(SC + offs_n[:, None] * ngroups
++                       + (k0 // GROUP + tl.arange(0, ngrp_bk))[None, :],
++                       mask=offs_n[:, None] < N, other=0.0)
++        sf = tl.reshape(
++            tl.broadcast_to(sc_g[:, :, None], (BN, ngrp_bk, GROUP // 2)),
++            (BN, BK // 2),
++        ).to(tl.float16)
++        wlo = lo.to(tl.float16) * sf
++        whi = hi.to(tl.float16) * sf
++        # interleave even/odd nibbles back into K order: (BN, BK/2, 2) -> (BN, BK)
++        w = tl.reshape(tl.join(wlo, whi), (BN, BK))
++        acc = tl.dot(x, tl.trans(w), acc)
++    if HAS_BIAS:
++        b = tl.load(B + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
++        acc += b[None, :]
++    out = Y + offs_m[:, None] * N + offs_n[None, :]
++    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    tl.store(out, acc.to(Y.dtype.element_ty), mask=mask)
++
++
++def int4_matmul(x, packed, scales, bias=None, group_size=64,
++                block_m=64, block_n=64, block_k=64):
++    """Fused int4-dequant + GEMM for prefill (any M). Returns fp16 or None."""
++    if not x.is_cuda or x.dtype != torch.float16 or not x.is_contiguous():
++        return None
++    if packed.dtype != torch.uint8 or scales.dtype != torch.float16:
++        return None
++    m, k = x.shape
++    n = packed.shape[0]
++    if k != packed.shape[1] * 2:
++        return None
++    if k % group_size or block_k % group_size or k % block_k:
++        return None
++    y = torch.empty(m, n, device=x.device, dtype=torch.float16)
++    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
++    _int4_gemm_kernel[grid](
++        x, packed, scales, bias if bias is not None else y, y, m, n, k,
++        GROUP=group_size, BM=block_m, BN=block_n, BK=block_k,
++        HAS_BIAS=bias is not None, num_warps=4, num_stages=1,
++    )
++    return y
++
++
++def int4_prefill_linear(x, packed, scales, bias=None, group_size=64):
++    """Prefill reference path: dequantize once, then a regular fp16 GEMM."""
++    n, k = packed.shape[0], packed.shape[1] * 2
++    w = dequantize_int4(packed, scales, (n, k), group_size)
++    return torch.nn.functional.linear(x, w, bias)
++
 +__all__ = [
 +    "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
-+    "int4_linear", "linspace_reference", "CONFIGS",
++    "int4_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 +]
