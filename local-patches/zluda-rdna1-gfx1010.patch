@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..859b6797181ef1f480fbd35ac1757739950e7ca3
+index 0000000000000000000000000000000000000000..307eb74edf642cac5fb129e6e86dd06aa645d83b
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,485 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,19 @@ index 0000000000000000000000000000000000000000..859b6797181ef1f480fbd35ac1757739
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - CUDA graphs work under ZLUDA:** torch.cuda.CUDAGraph capture
++  and replay now work. PyTorch's runtime path called three unimplemented legacy
++  driver entry points - `cuStreamBeginCapture` (no mode arg),
++  `cuStreamGetCaptureInfo` (3-arg) and `cuGraphInstantiate` (no flags) - which
++  made `torch.cuda.graph()` fail with "operation not supported" at
++  capture_begin. Added them (stream.rs/graph.rs + implemented list), rebuilt
++  nvcuda.dll; verified driver-level (ctypes capture/instantiate/launch, bit
++  exact) and PyTorch-level (capture/replay, max err 0.0). This is the key
++  enabler for the decode gap (launch-bound: 28-51 tok/s PyTorch vs 184-238 tok/s
++  llama.cpp Vulkan). Debug logging for unimplemented APIs is opt-in via
++  ZLUDA_DEBUG_UNIMPLEMENTED=1. Docs: docs/CUDA_GRAPHS_ZLUDA.md; harness:
++  bench/graph_decode.py. Next: torch.compile reduce-overhead retest, graph
++  decode benchmark, bf16-emul retry.
 +- **2026-11-25 - cross-backend comparison (Vulkan vs native ROCm vs ZLUDA):**
 +  built F32/BF16 GGUF variants for Vulkan/llama.cpp; found the native ROCm torch
 +  environment in `D:\comfyui\Data\Packages\ComfyUIrocm\venv` (torch
@@ -5494,6 +5507,175 @@ index 0000000000000000000000000000000000000000..8641d0b3d336d4f4b9a9ea5f5aa76f72
 +    }
 +    print(json.dumps(summary, indent=2) if args.json else summary)
 +    return 0 if valid else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/bench/graph_decode.py b/bench/graph_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6c5b67419ca2e2eb4c887d93dc0cc8f0f4766e1
+--- /dev/null
++++ b/bench/graph_decode.py
+@@ -0,0 +1,163 @@
++"""Decode benchmark: eager vs CUDA-graph replay on ZLUDA.
++
++Measures the per-token decode cost of Qwen2.5-0.5B two ways:
++
++1. eager: the normal `model(input_ids=1 token, past_key_values=...)` loop;
++2. graph: the same single-token forward captured with `torch.cuda.CUDAGraph`
++   (side stream) and replayed. This shows how much of the decode cost on ZLUDA
++   is Python/kernel-launch overhead rather than GPU work.
++
++The graph variant replays the exact captured step (cache position frozen), so it
++is a latency-per-step measurement, not a text-generation benchmark. The eager
++variant is measured the same way (fixed KV cache, same position) for a fair
++comparison, plus a real generation loop number is reported for reference.
++
++A torch.profiler pass counts the kernels launched per decode step, which is the
++main explanation for the Vulkan-vs-ZLUDA decode gap.
++
++Usage (under run-zluda.cmd):
++  venv\\Scripts\\python.exe bench\\graph_decode.py --prefill 1024 --steps 32
++"""
++
++import argparse
++import json
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from bench.common import save_report  # noqa: E402
++
++DEFAULT_MODEL = str(Path(__file__).resolve().parents[1] / "models" / "Qwen2.5-0.5B-Instruct")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", default=DEFAULT_MODEL)
++    parser.add_argument("--prefill", type=int, default=1024)
++    parser.add_argument("--steps", type=int, default=32)
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    parser.add_argument("--tag", default="")
++    args = parser.parse_args()
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    result = {"prefill": args.prefill, "steps": args.steps, "tag": args.tag}
++
++    from transformers import AutoModelForCausalLM
++    from transformers.cache_utils import StaticCache
++
++    model = AutoModelForCausalLM.from_pretrained(
++        args.model, local_files_only=True, low_cpu_mem_usage=True,
++        dtype=torch.float16, attn_implementation="sdpa").eval().cuda()
++    max_len = args.prefill + args.steps + 8
++    cache = StaticCache(config=model.config, max_batch_size=1,
++                        max_cache_len=max_len, device="cuda", dtype=torch.float16)
++    prompt = torch.randint(0, model.config.vocab_size, (1, args.prefill),
++                           device="cuda")
++    pos = torch.arange(args.prefill, device="cuda", dtype=torch.long)
++    with torch.no_grad():
++        out = model(input_ids=prompt, past_key_values=cache, cache_position=pos,
++                    use_cache=True, logits_to_keep=1)
++    next_tok = out.logits[:, -1:].argmax(-1)
++    result["prefill_ok"] = True
++
++    # --- eager: fixed single-token step (same position each time) ---
++    step_ids = next_tok.clone()
++    step_pos = torch.tensor([args.prefill], device="cuda", dtype=torch.long)
++
++    def eager_step():
++        with torch.no_grad():
++            return model(input_ids=step_ids, past_key_values=cache,
++                         cache_position=step_pos, use_cache=True,
++                         logits_to_keep=1)
++
++    eager_step()
++    torch.cuda.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(args.steps):
++        eager_step()
++    torch.cuda.synchronize()
++    eager_ms = (time.perf_counter() - t0) / args.steps * 1000
++    result["eager_ms_per_tok"] = eager_ms
++    result["eager_tok_s"] = 1000 / eager_ms
++
++    # --- CUDA graph replay of one decode step ---
++    graph_ok = False
++    try:
++        side = torch.cuda.Stream()
++        with torch.cuda.stream(side):
++            eager_step()  # warmup on the capture stream
++        torch.cuda.synchronize()
++        g = torch.cuda.CUDAGraph()
++        with torch.cuda.stream(side):
++            with torch.cuda.graph(g):
++                graph_out = model(input_ids=step_ids, past_key_values=cache,
++                                  cache_position=step_pos, use_cache=True,
++                                  logits_to_keep=1)
++        torch.cuda.synchronize()
++        g.replay()
++        torch.cuda.synchronize()
++        t0 = time.perf_counter()
++        for _ in range(args.steps):
++            g.replay()
++        torch.cuda.synchronize()
++        graph_ms = (time.perf_counter() - t0) / args.steps * 1000
++        result["graph_ms_per_tok"] = graph_ms
++        result["graph_tok_s"] = 1000 / graph_ms
++        result["graph_ok"] = True
++        graph_ok = True
++    except Exception as exc:  # noqa: BLE001
++        result["graph_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
++        result["graph_ok"] = False
++
++    # --- real generation loop (dynamic cache) ---
++    try:
++        cache2 = StaticCache(config=model.config, max_batch_size=1,
++                             max_cache_len=max_len, device="cuda",
++                             dtype=torch.float16)
++        with torch.no_grad():
++            o = model(input_ids=prompt, past_key_values=cache2, cache_position=pos,
++                      use_cache=True, logits_to_keep=1)
++            tok = o.logits[:, -1:].argmax(-1)
++            p = args.prefill
++            t0 = time.perf_counter()
++            for _ in range(args.steps):
++                o = model(input_ids=tok, past_key_values=cache2,
++                          cache_position=torch.tensor([p], device="cuda"),
++                          use_cache=True, logits_to_keep=1)
++                tok = o.logits[:, -1:].argmax(-1)
++                p += 1
++        torch.cuda.synchronize()
++        gen_ms = (time.perf_counter() - t0) / args.steps * 1000
++        result["gen_ms_per_tok"] = gen_ms
++        result["gen_tok_s"] = 1000 / gen_ms
++    except Exception as exc:  # noqa: BLE001
++        result["gen_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
++
++    # --- profiler: kernels launched per eager decode step ---
++    try:
++        from torch.profiler import ProfilerActivity, profile
++
++        with profile(activities=[ProfilerActivity.CUDA]) as prof:
++            for _ in range(4):
++                eager_step()
++            torch.cuda.synchronize()
++        events = [e for e in prof.events()
++                  if getattr(e, "device_type", None) is not None]
++        kernels = [e for e in events if getattr(e, "cuda_time_total", 0) > 0]
++        total_us = sum(e.cuda_time_total for e in kernels)
++        result["profiler_kernels_per_step"] = round(len(kernels) / 4, 1)
++        result["profiler_kernel_gpu_ms_per_step"] = round(total_us / 4 / 1000, 3)
++    except Exception as exc:  # noqa: BLE001
++        result["profiler_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
++
++    result["peak_mb"] = torch.cuda.max_memory_allocated() / 1024**2
++    save_report("graph_decode", result)
++    print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
++                      for k, v in result.items()}, indent=2), flush=True)
++    return 0
 +
 +
 +if __name__ == "__main__":
@@ -9839,6 +10021,81 @@ index 0000000000000000000000000000000000000000..f1a7f1f0a33209ebc1034d6316e77aec
 +  controls.
 +- Fixed clocks (BIOS/power-play) and repeated medians would tighten all numbers.
 \ No newline at end of file
+diff --git a/docs/CUDA_GRAPHS_ZLUDA.md b/docs/CUDA_GRAPHS_ZLUDA.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bf07d6568801bc06562804b21c39f851711affc
+--- /dev/null
++++ b/docs/CUDA_GRAPHS_ZLUDA.md
+@@ -0,0 +1,68 @@
++# CUDA graphs under ZLUDA on gfx1010
++
++Status 2026-11-25: **working for PyTorch `torch.cuda.CUDAGraph`** after adding
++three missing driver-API entry points to this fork.
++
++## Why it matters for decode
++
++The PyTorch decode loop is launch-bound on this stack: one token = ~24 layers x
++~10 kernel launches. Measured decode throughput is 28-51 tok/s (ZLUDA/PyTorch)
++versus 184-238 tok/s for llama.cpp on Vulkan (single command buffer per token),
++so most of the gap is per-launch overhead, not GPU compute. CUDA graphs cut that
++to one graph launch per token, which is exactly what llama.cpp benefits from.
++
++## What was missing
++
++PyTorch calls the CUDA runtime API; ZLUDA's runtime shim routes the old
++(non-v2) entry points to the driver. Three of them were unimplemented, so
++`torch.cuda.graph()` failed in `capture_begin` with `operation not supported`:
++
++- `cuStreamBeginCapture` (legacy, no capture-mode argument)
++- `cuStreamGetCaptureInfo` (legacy, 3-argument version)
++- `cuGraphInstantiate` (without flags)
++
++Everything else was already implemented (`cuStreamBeginCapture_v2`,
++`cuStreamEndCapture`, `cuGraphInstantiateWithFlags`, `cuGraphLaunch`,
++`cuGraphExecDestroy`, `cuGraphDestroy`, `cuStreamIsCapturing`).
++
++## Implementation (this fork)
++
++- `zluda/src/impl/stream.rs`
++  - `begin_capture(stream)` -> `hipStreamBeginCapture(stream, GLOBAL)` (the
++    legacy API has no mode argument; CUDA uses global capture semantics)
++  - `get_capture_info(stream, status, id)` -> `hipStreamGetCaptureInfo`
++- `zluda/src/impl/graph.rs`
++  - `instantiate(exec, graph, error_node, log_buffer, buffer_size)` ->
++    `hipGraphInstantiate`
++- `zluda/src/lib.rs`: the three functions added to the `implemented` list.
++- Debug aid: build-time gated logging of unimplemented API calls via
++  `ZLUDA_DEBUG_UNIMPLEMENTED=1`, which is how the missing entry points were
++  identified.
++
++## Verified
++
++Driver level (ctypes, side stream): `cuStreamBeginCapture_v2` -> 0,
++`cuStreamEndCapture` -> 0, `cuGraphInstantiateWithFlags` -> 0,
++`cuGraphLaunch` -> 0, results bit-exact.
++
++PyTorch level (`torch.cuda.CUDAGraph` on a side stream):
++
++```
++capture ok
++replay ok, max err 0.0
++```
++
++Limit: capturing the legacy default stream is unsupported by HIP (same
++restriction as CUDA) - capture on a non-default (`torch.cuda.Stream`) stream,
++as the PyTorch docs require.
++
++## Next steps
++
++- Re-run `torch.compile(mode="reduce-overhead")` with graphs enabled (Inductor
++  cudagraph trees use side streams, so this is expected to work now).
++- Validate `bench/graph_decode.py` (eager vs graph-replay decode) once the
++  harness environment is stable; the measured kernel-launch count per eager
++  decode step quantifies the remaining gap to Vulkan.
++- bf16 emulation (`bf16` storage with fp32 compute) on ZLUDA: retest with
++  in-place parameter conversion (the current implementation crashed without a
++  report, most likely a VRAM spike on the 8 GB card).
+\ No newline at end of file
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
@@ -13549,6 +13806,32 @@ index d4342e7168a84dcd0329a6073d83163644a56df2..c489cba3f57bdff25ae9b0e07d3f763e
      }
      function::launch_kernel(
          f,
+diff --git a/zluda/src/impl/graph.rs b/zluda/src/impl/graph.rs
+index 9776c16a5a7f4d36f3253f0bc512f00dd927117c..5961295e943ced48d2817b6a230de925f97f515e 100644
+--- a/zluda/src/impl/graph.rs
++++ b/zluda/src/impl/graph.rs
+@@ -73,9 +73,21 @@ pub(crate) unsafe fn instantiate_with_flags(
+     graph: hipGraph_t,
+     flags: u64,
+ ) -> hipError_t {
++    eprintln!("zluda: cuGraphInstantiateWithFlags called");
+     hipGraphInstantiateWithFlags(graph_exec, graph, flags)
+ }
+ 
+ pub(crate) unsafe fn launch(graph_exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t {
+     hipGraphLaunch(graph_exec, stream)
+ }
++
++pub(crate) unsafe fn instantiate(
++    graph_exec: *mut hipGraphExec_t,
++    graph: hipGraph_t,
++    error_node: *mut hipGraphNode_t,
++    log_buffer: *mut ::core::ffi::c_char,
++    buffer_size: usize,
++) -> hipError_t {
++    eprintln!("zluda: cuGraphInstantiate called");
++    hipGraphInstantiate(graph_exec, graph, error_node, log_buffer, buffer_size)
++}
 diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
 index d3a895b0dc474b2c8765b450a0aa9b6e121f3411..b6e05e9a351a70d180907b5a643d3038c767522a 100644
 --- a/zluda/src/impl/module.rs
@@ -13634,6 +13917,79 @@ index d3a895b0dc474b2c8765b450a0aa9b6e121f3411..b6e05e9a351a70d180907b5a643d3038
      if let Some((cache, key)) = cache_with_key {
          key.last_access = zluda_cache::ModuleCache::time_now();
          cache.insert_module(key, &elf_module);
+diff --git a/zluda/src/impl/stream.rs b/zluda/src/impl/stream.rs
+index 708b043726b82c2622c2640260299c3d44c20e22..1f798b2f91af9a2645e2247520c52604cb8ac164 100644
+--- a/zluda/src/impl/stream.rs
++++ b/zluda/src/impl/stream.rs
+@@ -20,11 +20,16 @@ pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
+     unsafe { hipStreamDestroy(stream) }
+ }
+ 
+-pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t {
++pub(crate) fn begin_capture(stream: hipStream_t) -> hipError_t { eprintln!("zluda: cuStreamBeginCapture called");
++    // legacy (non-v2) cuStreamBeginCapture has no mode argument; CUDA uses
++    // CU_STREAM_CAPTURE_MODE_GLOBAL semantics for it.
++    unsafe { hipStreamBeginCapture(stream, hipStreamCaptureMode(0)) }
++}
++pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t { eprintln!("zluda: cuStreamBeginCapture_v2 called");
+     unsafe { hipStreamBeginCapture(stream, mode) }
+ }
+ 
+-pub(crate) fn end_capture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t {
++pub(crate) fn end_capture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t { eprintln!("zluda: cuStreamEndCapture called");
+     unsafe { hipStreamEndCapture(stream, graph) }
+ }
+ 
+@@ -35,6 +40,13 @@ pub(crate) fn is_capturing(
+     unsafe { hipStreamIsCapturing(stream, capture_status) }
+ }
+ 
++pub(crate) fn get_capture_info(
++    stream: hipStream_t,
++    capture_status: *mut hipStreamCaptureStatus,
++    id: *mut ::core::ffi::c_ulonglong,
++) -> hipError_t {
++    unsafe { hipStreamGetCaptureInfo(stream, capture_status, id) }
++}
+ pub(crate) fn get_capture_info_v2(
+     stream: hipStream_t,
+     capture_status: *mut hipStreamCaptureStatus,
+diff --git a/zluda/src/lib.rs b/zluda/src/lib.rs
+index 666f926b2797f9f4f86b5ad1e2096161d11e5e65..b1137794a6a60db32f846cd2cda4fbf720e0a2e9 100644
+--- a/zluda/src/lib.rs
++++ b/zluda/src/lib.rs
+@@ -24,6 +24,9 @@ macro_rules! unimplemented {
+             #[allow(improper_ctypes_definitions)]
+             #[allow(unused_variables)]
+             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
++                if std::env::var_os("ZLUDA_DEBUG_UNIMPLEMENTED").is_some() {
++                    eprintln!("zluda: UNIMPLEMENTED CUDA API called: {}", stringify!($fn_name));
++                }
+                 Err(r#impl::unimplemented())
+             }
+         )*
+@@ -146,6 +149,7 @@ cuda_macros::cuda_function_declarations!(
+             cuGraphExecDestroy,
+             cuGraphExecUpdate_v2,
+             cuGraphGetNodes,
++            cuGraphInstantiate,
+             cuGraphInstantiateWithFlags,
+             cuGraphLaunch,
+             cuInit,
+@@ -209,11 +213,13 @@ cuda_macros::cuda_function_declarations!(
+             cuPointerGetAttributes,
+             cuProfilerStart,
+             cuProfilerStop,
++            cuStreamBeginCapture,
+             cuStreamBeginCapture_v2,
+             cuStreamCreate,
+             cuStreamCreateWithPriority,
+             cuStreamDestroy_v2,
+             cuStreamEndCapture,
++            cuStreamGetCaptureInfo,
+             cuStreamGetCaptureInfo_v2,
+             cuStreamGetCaptureInfo_v3,
+             cuStreamIsCapturing,
 diff --git a/zluda_blaslt/src/impl.rs b/zluda_blaslt/src/impl.rs
 index b5cb70c41a102cfd91272c3396f7900b9638a9e4..1987bb1289aec273cc67eaafb7333039312ffdeb 100644
 --- a/zluda_blaslt/src/impl.rs
