@@ -772,7 +772,7 @@ index 0000000000000000000000000000000000000000..3fc22424edf7544fc2270ecbac3097ca
 +- GPU clock/power telemetry on Windows.
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..9844de10064d3354c0f69d37069c1eb52b9c6838
+index 0000000000000000000000000000000000000000..414a480ae353406d5bd6bf192b692b38da9a28f2
 --- /dev/null
 +++ b/INTEGRATION.md
 @@ -0,0 +1,152 @@
@@ -884,10 +884,10 @@ index 0000000000000000000000000000000000000000..9844de10064d3354c0f69d37069c1eb5
 +back to math SDPA. `flash_attn_func` supports sliding
 +`window_size`; `flash_attn_varlen_func` accepts packed q/k/v and
 +`cu_seqlens`. Dropout also runs in the Triton kernels (inverted dropout, same
-+mask regenerated in backward). Sliding window and varlen currently use the
-+correct math fallback (not the Triton kernel); Triton window/varlen kernels are
-+open. A 1-layer TransformerEncoder compiles in ~1 s; the full 8-layer
-+model is skipped because compile takes ~30 min even on a T4.
++mask regenerated in backward), and the sliding window is arithmetic in the
++kernel (no dense mask). Varlen dispatches per sequence through Triton; a fused
++packed varlen kernel is open. A 1-layer TransformerEncoder compiles in ~1 s;
++the full 8-layer model is skipped because compile takes ~30 min even on a T4.
 +
 +## Training with HH (experimental)
 +
@@ -1046,10 +1046,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..6f49963e7510894d71446154cddfb2db361a7da9
+index 0000000000000000000000000000000000000000..4aa2581762e3e1e8da3774276a16fce4e8aaba06
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,483 @@
+@@ -0,0 +1,508 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1533,12 +1533,37 @@ index 0000000000000000000000000000000000000000..6f49963e7510894d71446154cddfb2db
 +| determinism | same seed identical, different seed differs |
 +| gradients | finite, mean abs comparable to no-dropout |
 +| s=1024 causal, p=0.1 | **1.04 ms vs 1.97 ms math = 1.90x** |
++
++## P0-3 Triton sliding window and varlen (2026-11-25)
++
++The sliding window is now arithmetic inside the Triton fwd+bwd kernels: block
++iteration starts at `max(0, block_start - left)` aligned down to BLOCK_N and
++skips blocks beyond the right bound; per-element window bounds are applied
++without allocating a dense mask. A dense-mask fallback remains only for
++unsupported shapes.
++
++| case (s=512, B1 H8 D64 fp16) | fwd err | grad err |
++|---|---|---|
++| causal window (32,0) | 2.0e-3 | 2.0e-3 |
++| causal window (64,0) | 2.0e-3 | 2.9e-3 |
++| non-causal window (16,16) | 1.0e-3 | 2.0e-3 |
++| non-causal window (64,32) | 4.9e-4 | 1.1e-3 |
++| varlen [128,256,384] causal window (64,0) | 1.0e-3 | 3.9e-3 |
++
++Speed (s=1024): window (128,0) causal **0.26 ms vs 1.87 ms** math with dense
++mask (7.1x); non-causal window (64,0) 0.26 vs 1.85 ms (7.15x).
++
++`flash_attn_varlen_func` now dispatches per sequence through the Triton kernel
++without dense masks; a fused packed-varlen kernel is still open. The backward
++preprocess kernel assumes a contiguous (B,H,N,D) layout, so the Triton path now
++makes inputs contiguous (a no-op for normal calls) — this also fixes varlen
++gradients through transposed views.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..4ffcd0da3ddee2c8f41c05e8fd1b41e26de77957
+index 0000000000000000000000000000000000000000..94a0e2f9f67285dd4737ec2c7adaaa54db3e3a90
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,310 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1574,7 +1599,7 @@ index 0000000000000000000000000000000000000000..4ffcd0da3ddee2c8f41c05e8fd1b41e2
 +| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
 +| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 +| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
-+| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks+dropout done; window/varlen still math fallback |
++| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **DONE** | training + inference | medium | masks/dropout/window in Triton; varlen uses per-sequence Triton (fused packed kernel open) |
 +| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
 +| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
 +| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
@@ -1757,6 +1782,17 @@ index 0000000000000000000000000000000000000000..4ffcd0da3ddee2c8f41c05e8fd1b41e2
 +  rows). `bench/fa_mask.py`: fwd err ≤1e-3, grad err ≤4e-3; masked causal
 +  s=1024 is 1.22 ms vs 2.04 ms math (1.67x). Dropout/window/varlen remain math
 +  fallbacks.
++- **2026-11-25 - P0-2b (dropout):** inverted dropout runs in the Triton fwd+bwd
++  kernels with the Philox mask regenerated from (head, query, key) offsets;
++  unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
++  s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
++- **2026-11-25 - P0-3 (window/varlen):** sliding window is implemented
++  arithmetically in the Triton fwd+bwd kernels (block-range skipping, no dense
++  mask; `lo` aligned down to `BLOCK_N` before advancing block pointers).
++  `flash_attn_varlen_func` dispatches per sequence through Triton with no dense
++  masks. `bench/fa_window.py`: fwd/grad err ≤2e-3 (window) and ≤4e-3 (varlen
++  window); s=1024 window (128,0) is 0.26 ms vs 1.87 ms math (7.1x). A fused
++  packed varlen kernel remains open.
 +- **2026-11-25 - repository maintenance:** portable launchers (repository-
 +  relative paths, `vswhere`, `ZLUDA_HIP_PATH`), documented ComfyUI launchers,
 +  `gpu_reset.ps1`, ComfyUI freeze file, patch export/validation tooling
@@ -1783,7 +1819,8 @@ index 0000000000000000000000000000000000000000..4ffcd0da3ddee2c8f41c05e8fd1b41e2
 +| FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
 +| FA masks | **DONE** | bool/additive 2D/3D/4D broadcast masks, causal+mask, fwd+bwd in Triton; fwd err ≤1e-3, grad err ≤4e-3; masked causal 1024 is 1.67x math |
 +| FA dropout | **DONE** | inverted dropout in Triton fwd+bwd, unbiased (z<1), deterministic per seed, fwd+bwd errors unchanged; causal 1024 1.90x math |
-+| FA window / varlen | **FUNCTIONAL FALLBACK** | correct math; Triton kernels open |
++| FA window | **DONE** | arithmetic sliding window in fwd+bwd, block-range skipping, no dense mask; fwd/grad err ≤2e-3; s=1024 window(128,0) 0.26 ms vs 1.87 ms math (7.1x) |
++| FA varlen | **DONE (per-sequence)** | packed q/k/v + `cu_seqlens` dispatch, Triton per sequence without dense masks (window/grad err ≤4e-3); a fused packed varlen kernel remains open |
 +| Flash-decoding | **OPEN** | |
 +| bf16 native / emulation | **DONE (emulation)** | 4.42 native / 7.92 emulated TF |
 +| GPU monitoring | **PARTIAL** | utilization/VRAM via Windows PDH; measurement protocol enforced in every report; ADL live clocks return NOT_SUPPORTED (-8), documented blocker |
@@ -1796,7 +1833,7 @@ index 0000000000000000000000000000000000000000..4ffcd0da3ddee2c8f41c05e8fd1b41e2
 +|---|---|---|---|
 +| 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | >=10% vs implicit GEMM or document "not beneficial" |
 +| 2 | Triton dropout for FA | P0 | **CLOSED 2026-11-25**: masks and inverted dropout run in Triton fwd+bwd; window/varlen remain (row 3) |
-+| 3 | Triton sliding-window + varlen FA | P0 | correctness vs math; no dense mask allocation |
++| 3 | Triton sliding-window + varlen FA | P0 | **CLOSED 2026-11-25**: window arithmetic in kernel (7.1x @1024), varlen per-sequence Triton; fused packed varlen kernel still open |
 +| 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
 +| 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
 +| 6 | Clock/power monitoring | P0 | **DONE 2026-11-25**: protocol (random data, shuffled rounds, median) enforced in `bench/common.save_report`; utilization/VRAM via Windows PDH; sclk/mclk/temp are a documented blocker (`bench/gpu_clocks.py`: ADL adapters enumerate but OverdriveN/6/5 return ADL_ERR_NOT_SUPPORTED = -8) |
@@ -2519,6 +2556,168 @@ index 0000000000000000000000000000000000000000..5c7a80406a8ac8371e490dda58daa5b2
 +        benches.append(bench_case(1024, False))
 +    save_report("fa_mask", {"checks": rows, "benches": benches, "s": args.s})
 +    worst = max(max(r["fwd_err"], r["grad_err"]) for r in rows)
++    print(f"worst error {worst:.5f}", flush=True)
++    return 0 if worst < 2e-2 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/bench/fa_window.py b/bench/fa_window.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..185778479c142ca2935308e35300471a1a18fe86
+--- /dev/null
++++ b/bench/fa_window.py
+@@ -0,0 +1,156 @@
++"""Validate Triton sliding-window attention and varlen dispatch.
++
++The Triton kernel implements the sliding window arithmetically (no dense mask);
++the math reference uses an explicit keep-mask.
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\fa_window.py --s 256
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\fa_window.py --s 512 --bench
++"""
++
++import argparse
++import sys
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from torch.nn.attention import SDPBackend, sdpa_kernel
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from zluda_ops import flash_attn_func, flash_attn_varlen_func
++from bench.common import bench_median, save_report
++
++
++def allowed_mask(sq, sk, causal, left, right, device):
++    qi = torch.arange(sq, device=device)[:, None]
++    ki = torch.arange(sk, device=device)[None, :]
++    di = qi - ki
++    allowed = torch.ones((sq, sk), dtype=torch.bool, device=device)
++    if causal:
++        allowed &= di >= 0
++    if left is not None:
++        allowed &= di <= left
++    if right is not None:
++        allowed &= di >= -right
++    return allowed
++
++
++def math_ref(q, k, v, allowed, dropout_p=0.0):
++    with sdpa_kernel(SDPBackend.MATH):
++        return F.scaled_dot_product_attention(
++            q, k, v, attn_mask=allowed, dropout_p=dropout_p, is_causal=False
++        )
++
++
++def check_window(s, causal, left, right, device="cuda"):
++    torch.manual_seed(0)
++    q = torch.randn(1, 8, s, 64, device=device, dtype=torch.float16, requires_grad=True)
++    k = torch.randn(1, 8, s, 64, device=device, dtype=torch.float16, requires_grad=True)
++    v = torch.randn(1, 8, s, 64, device=device, dtype=torch.float16, requires_grad=True)
++    do = torch.randn_like(q)
++    out = flash_attn_func(q, k, v, causal=causal, window_size=(left, right))
++    torch.cuda.synchronize()
++    ref = math_ref(q, k, v, allowed_mask(s, s, causal, left, right, device))
++    ferr = (out.float() - ref.float()).abs().max().item()
++    out.backward(do)
++    g1 = [t.grad.clone() for t in (q, k, v)]
++    for t in (q, k, v):
++        t.grad = None
++    ref.backward(do)
++    gerr = max((a - b.grad).abs().max().item() for a, b in zip(g1, (q, k, v)))
++    for t in (q, k, v):
++        t.grad = None
++    print(
++        f"window causal={int(causal)} ({left},{right}) s={s}: "
++        f"fwd err {ferr:.5f} grad err {gerr:.5f}",
++        flush=True,
++    )
++    return {"s": s, "causal": causal, "left": left, "right": right,
++            "fwd_err": ferr, "grad_err": gerr}
++
++
++def check_varlen(device="cuda"):
++    torch.manual_seed(0)
++    lens = [128, 256, 384]
++    total = sum(lens)
++    h, d = 8, 64
++    q = torch.randn(total, h, d, device=device, dtype=torch.float16, requires_grad=True)
++    k = torch.randn(total, h, d, device=device, dtype=torch.float16, requires_grad=True)
++    v = torch.randn(total, h, d, device=device, dtype=torch.float16, requires_grad=True)
++    cu = torch.tensor([0] + list(torch.cumsum(torch.tensor(lens), 0).tolist()),
++                      device=device, dtype=torch.int32)
++    do = torch.randn_like(q)
++    left = 64
++    out = flash_attn_varlen_func(q, k, v, cu, cu, causal=True,
++                                 window_size=(left, 0), max_seqlen_q=max(lens),
++                                 max_seqlen_k=max(lens))
++    torch.cuda.synchronize()
++    refs = []
++    starts = [0] + torch.cumsum(torch.tensor(lens), 0).tolist()
++    for i, n in enumerate(lens):
++        a, b = int(starts[i]), int(starts[i + 1])
++        qi = q[a:b].transpose(0, 1).unsqueeze(0)
++        ki = k[a:b].transpose(0, 1).unsqueeze(0)
++        vi = v[a:b].transpose(0, 1).unsqueeze(0)
++        refs.append(math_ref(qi, ki, vi, allowed_mask(n, n, True, left, 0, device))[0])
++    ref = torch.cat([r.transpose(0, 1) for r in refs], dim=0)
++    ferr = (out.float() - ref.float()).abs().max().item()
++    out.backward(do)
++    g1 = [t.grad.clone() for t in (q, k, v)]
++    for t in (q, k, v):
++        t.grad = None
++    ref.backward(do)
++    gerr = max((a - b.grad).abs().max().item() for a, b in zip(g1, (q, k, v)))
++    print(f"varlen window ({left},0) lens={lens}: fwd err {ferr:.5f} grad err {gerr:.5f}",
++          flush=True)
++    return {"lens": lens, "fwd_err": ferr, "grad_err": gerr}
++
++
++def bench_case(s, left, causal=True, device="cuda"):
++    torch.manual_seed(0)
++    q = torch.randn(1, 8, s, 64, device=device, dtype=torch.float16)
++    k = torch.randn(1, 8, s, 64, device=device, dtype=torch.float16)
++    v = torch.randn(1, 8, s, 64, device=device, dtype=torch.float16)
++    triton_ms = bench_median(
++        lambda: flash_attn_func(q, k, v, causal=causal, window_size=(left, 0)),
++        rounds=3, iters=3,
++    )
++    mask = allowed_mask(s, s, causal, left, 0, device)
++    math_ms = bench_median(lambda: math_ref(q, k, v, mask), rounds=3, iters=3)
++    print(f"bench s={s} window=({left},0) causal={int(causal)}: triton {triton_ms:.2f} ms "
++          f"math(mask) {math_ms:.2f} ms ({math_ms / triton_ms:.2f}x)", flush=True)
++    return {"s": s, "left": left, "causal": causal, "triton_ms": triton_ms,
++            "math_ms": math_ms, "speedup": math_ms / triton_ms}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--s", type=int, default=256)
++    parser.add_argument("--bench", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    args = parser.parse_args()
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    print(f"VRAM fraction {args.vram_fraction}", flush=True)
++
++    checks = [
++        check_window(args.s, True, 32, 0),
++        check_window(args.s, True, 64, 0),
++        check_window(args.s, False, 16, 16),
++        check_window(args.s, False, 64, 32),
++    ]
++    varlen = check_varlen()
++    benches = []
++    if args.bench:
++        benches.append(bench_case(1024, 128))
++        benches.append(bench_case(1024, 64, causal=False))
++    save_report("fa_window", {"checks": checks, "varlen": varlen, "benches": benches})
++    worst = max(max(r["fwd_err"], r["grad_err"]) for r in checks + [varlen])
 +    print(f"worst error {worst:.5f}", flush=True)
 +    return 0 if worst < 2e-2 else 1
 +
@@ -5318,10 +5517,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..346b985375bb556f8c3fbc40cd9b1ee307aeb341
+index 0000000000000000000000000000000000000000..8163a0594169582d41f7784d5a4dab8d82b38240
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,356 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -5603,6 +5802,8 @@ index 0000000000000000000000000000000000000000..346b985375bb556f8c3fbc40cd9b1ee3
 +run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
 +venv\Scripts\python.exe bench\gpu_clocks.py --seconds 3
 +run-zluda.cmd venv\Scripts\python.exe bench\fa_mask.py --s 512 --bench
++run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench
++run-zluda.cmd venv\Scripts\python.exe bench\fa_window.py --s 512 --bench
 +```
 +
 +Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -5676,7 +5877,6 @@ index 0000000000000000000000000000000000000000..346b985375bb556f8c3fbc40cd9b1ee3
 +enabled (`torch._C._set_cublas_allow_fp16_accumulation(True)`); HPA/SS lines
 +are intentionally not included. Use random data for measurements: zeros,
 +ones and uninitialized buffers are not representative.
-+run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench
 diff --git a/docs/comfy-freeze.txt b/docs/comfy-freeze.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..6c3369aaf97348f7df7750daccdd46200301148e
@@ -9471,10 +9671,10 @@ index 0000000000000000000000000000000000000000..8db2e10b78e555c4ce5243c81ed38707
 +__all__ = ["matmul", "linear"]
 diff --git a/zluda_ops/flash_attention.py b/zluda_ops/flash_attention.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a8a56ec9c
+index 0000000000000000000000000000000000000000..60cf1391f4b9ca868c737e6cf7268579911335b3
 --- /dev/null
 +++ b/zluda_ops/flash_attention.py
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,648 @@
 +import math
 +
 +import torch
@@ -9495,14 +9695,22 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +                    N_CTX: tl.constexpr,
 +                    Mask, mask_stride_m, mask_stride_n,
 +                    MASK_TYPE: tl.constexpr,
-+                    dropout_p, seed, off_hz, DROPOUT: tl.constexpr):
++                    dropout_p, seed, off_hz, wl, wr,
++                    DROPOUT: tl.constexpr, WINDOW: tl.constexpr):
 +    if STAGE == 1:
 +        lo, hi = 0, start_m * BLOCK_M
++        if WINDOW:
++            lo = tl.maximum(0, start_m * BLOCK_M - wl)
++            lo = (lo // BLOCK_N) * BLOCK_N
 +    elif STAGE == 2:
 +        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
 +        lo = tl.multiple_of(lo, BLOCK_M)
 +    else:
 +        lo, hi = 0, N_CTX
++        if WINDOW:
++            lo = tl.maximum(0, start_m * BLOCK_M - wl)
++            lo = (lo // BLOCK_N) * BLOCK_N
++            hi = tl.minimum(N_CTX, (start_m + 1) * BLOCK_M + wr)
 +    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
 +    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
 +    for start_n in range(lo, hi, BLOCK_N):
@@ -9524,6 +9732,10 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        if STAGE == 2:
 +            cmask = offs_m[:, None] >= (start_n + offs_n[None, :])
 +            qk = tl.where(cmask, qk, -1.0e6)
++        if WINDOW:
++            # Sliding window as arithmetic bounds: no dense mask allocation.
++            di = offs_m[:, None] - (start_n + offs_n[None, :])
++            qk = tl.where((di <= wl) & (di >= -wr), qk, -1.0e6)
 +        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 +        qk -= m_ij[:, None]
 +        p = tl.math.exp2(qk)
@@ -9560,13 +9772,14 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +              stride_oz, stride_oh, stride_om, stride_on,
 +              Z, H, N_CTX,
 +              Mask, mask_stride_z, mask_stride_h, mask_stride_m, mask_stride_n,
-+              dropout_p, seed,
++              dropout_p, seed, window_left, window_right,
 +              HEAD_DIM: tl.constexpr,
 +              BLOCK_M: tl.constexpr,
 +              BLOCK_N: tl.constexpr,
 +              STAGE: tl.constexpr,
 +              MASK_TYPE: tl.constexpr,
-+              DROPOUT: tl.constexpr):
++              DROPOUT: tl.constexpr,
++              WINDOW: tl.constexpr):
 +    tl.static_assert(BLOCK_N <= HEAD_DIM)
 +    start_m = tl.program_id(0)
 +    off_hz = tl.program_id(1)
@@ -9600,13 +9813,15 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +                                        start_m, qk_scale, BLOCK_M, HEAD_DIM, BLOCK_N,
 +                                        4 - STAGE, offs_m, offs_n, N_CTX,
 +                                        Mask, mask_stride_m, mask_stride_n, MASK_TYPE,
-+                                        dropout_p, seed, off_hz, DROPOUT)
++                                        dropout_p, seed, off_hz, window_left, window_right,
++                                        DROPOUT, WINDOW)
 +    if STAGE & 2:
 +        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
 +                                        start_m, qk_scale, BLOCK_M, HEAD_DIM, BLOCK_N,
 +                                        2, offs_m, offs_n, N_CTX,
 +                                        Mask, mask_stride_m, mask_stride_n, MASK_TYPE,
-+                                        dropout_p, seed, off_hz, DROPOUT)
++                                        dropout_p, seed, off_hz, window_left, window_right,
++                                        DROPOUT, WINDOW)
 +    m_i += tl.math.log2(l_i)
 +    acc = acc / l_i[:, None]
 +    m_ptrs = M + off_hz * N_CTX + offs_m
@@ -9632,8 +9847,8 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +                   BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr, HEAD_DIM: tl.constexpr,
 +                   start_n, start_m, num_steps,
 +                   Mask, mask_stride_m, mask_stride_n,
-+                   MASK_TYPE: tl.constexpr, dropout_p, seed, bhid,
-+                   DROPOUT: tl.constexpr, MASK: tl.constexpr):
++                   MASK_TYPE: tl.constexpr, dropout_p, seed, bhid, wl, wr,
++                   DROPOUT: tl.constexpr, WINDOW: tl.constexpr, MASK: tl.constexpr):
 +    offs_m = start_m + tl.arange(0, BLOCK_M1)
 +    offs_n = start_n + tl.arange(0, BLOCK_N1)
 +    offs_k = tl.arange(0, HEAD_DIM)
@@ -9659,6 +9874,9 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        if MASK:
 +            mask = (offs_m[None, :] >= offs_n[:, None])
 +            pT = tl.where(mask, pT, 0.0)
++        if WINDOW:
++            di = offs_m[None, :] - offs_n[:, None]
++            pT = tl.where((di <= wl) & (di >= -wr), pT, 0.0)
 +        if DROPOUT:
 +            offs = (offs_m[None, :] * N_CTX + offs_n[:, None]
 +                    + bhid * 7919).to(tl.int32)
@@ -9684,8 +9902,8 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +                 BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr, HEAD_DIM: tl.constexpr,
 +                 start_m, start_n, num_steps,
 +                 Mask, mask_stride_m, mask_stride_n,
-+                 MASK_TYPE: tl.constexpr, dropout_p, seed, bhid,
-+                 DROPOUT: tl.constexpr, MASK: tl.constexpr):
++                 MASK_TYPE: tl.constexpr, dropout_p, seed, bhid, wl, wr,
++                 DROPOUT: tl.constexpr, WINDOW: tl.constexpr, MASK: tl.constexpr):
 +    offs_m = start_m + tl.arange(0, BLOCK_M2)
 +    offs_n = start_n + tl.arange(0, BLOCK_N2)
 +    offs_k = tl.arange(0, HEAD_DIM)
@@ -9713,6 +9931,9 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        if MASK:
 +            mask = (offs_m[:, None] >= offs_n_blk[None, :])
 +            p = tl.where(mask, p, 0.0)
++        if WINDOW:
++            di = offs_m[:, None] - offs_n_blk[None, :]
++            p = tl.where((di <= wl) & (di >= -wr), p, 0.0)
 +        if DROPOUT:
 +            offs = (offs_m[:, None] * N_CTX + offs_n_blk[None, :]
 +                    + bhid * 7919).to(tl.int32)
@@ -9732,12 +9953,12 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +def _attn_bwd(Q, K, V, sm_scale, DO, DQ, DK, DV, M, D,
 +              stride_z, stride_h, stride_tok, stride_d, H, N_CTX,
 +              Mask, mask_stride_z, mask_stride_h, mask_stride_m, mask_stride_n,
-+              dropout_p, seed,
++              dropout_p, seed, window_left, window_right,
 +              BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr,
 +              BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr,
 +              BLK_SLICE_FACTOR: tl.constexpr, HEAD_DIM: tl.constexpr,
 +              CAUSAL: tl.constexpr, MASK_TYPE: tl.constexpr,
-+              DROPOUT: tl.constexpr):
++              DROPOUT: tl.constexpr, WINDOW: tl.constexpr):
 +    LN2: tl.constexpr = 0.6931471824645996
 +    bhid = tl.program_id(2)
 +    off_chz = (bhid * N_CTX).to(tl.int64)
@@ -9769,19 +9990,19 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
 +                                stride_tok, stride_d, H, N_CTX,
 +                                MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,
-+                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=True)
++                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=True)
 +        start_m += num_steps * MASK_BLOCK_M1
 +        num_steps = (N_CTX - start_m) // BLOCK_M1
 +        dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
 +                                stride_tok, stride_d, H, N_CTX,
 +                                BLOCK_M1, BLOCK_N1, HEAD_DIM,
-+                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
++                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
 +    else:
 +        num_steps = N_CTX // BLOCK_M1
 +        dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
 +                                stride_tok, stride_d, H, N_CTX,
 +                                BLOCK_M1, BLOCK_N1, HEAD_DIM,
-+                                start_n, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
++                                start_n, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
 +    dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
 +    tl.store(dv_ptrs, dv)
 +    dk *= sm_scale
@@ -9801,17 +10022,17 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        num_steps = BLOCK_M2 // MASK_BLOCK_N2
 +        dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
 +                          BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,
-+                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=True)
++                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=True)
 +        end_n -= num_steps * MASK_BLOCK_N2
 +        num_steps = end_n // BLOCK_N2
 +        dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
 +                          BLOCK_M2, BLOCK_N2, HEAD_DIM,
-+                          start_m, end_n - num_steps * BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
++                          start_m, end_n - num_steps * BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
 +    else:
 +        num_steps = N_CTX // BLOCK_N2
 +        dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
 +                          BLOCK_M2, BLOCK_N2, HEAD_DIM,
-+                          start_m, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, DROPOUT, MASK=False)
++                          start_m, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, dropout_p, seed, bhid, window_left, window_right, DROPOUT, WINDOW, MASK=False)
 +    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
 +    dq *= LN2
 +    tl.store(dq_ptrs, dq)
@@ -9820,7 +10041,7 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +class TritonFlashAttention(torch.autograd.Function):
 +    @staticmethod
 +    def forward(ctx, q, k, v, causal, sm_scale, attn_mask, mask_type, mask_strides,
-+                dropout_p):
++                dropout_p, window_left, window_right):
 +        head_dim = q.shape[-1]
 +        o = torch.empty_like(q)
 +        stage = 3 if causal else 1
@@ -9828,6 +10049,9 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        grid = (triton.cdiv(q.shape[2], 64), q.shape[0] * q.shape[1], 1)
 +        mz, mh, mm, mn = mask_strides
 +        mask_arg = attn_mask if attn_mask is not None else q
++        window = window_left is not None or window_right is not None
++        wl = window_left if window_left is not None else 1 << 30
++        wr = window_right if window_right is not None else 1 << 30
 +        dropout = dropout_p > 0.0
 +        if dropout:
 +            seed = (int(_DROPOUT_SEED_OVERRIDE) if _DROPOUT_SEED_OVERRIDE is not None
@@ -9842,9 +10066,9 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
 +            q.shape[0], q.shape[1], q.shape[2],
 +            mask_arg, mz, mh, mm, mn,
-+            dropout_p, seed,
++            dropout_p, seed, wl, wr,
 +            HEAD_DIM=head_dim, BLOCK_M=64, BLOCK_N=64, STAGE=stage,
-+            MASK_TYPE=mask_type, DROPOUT=dropout,
++            MASK_TYPE=mask_type, DROPOUT=dropout, WINDOW=window,
 +            num_warps=4, num_stages=1,
 +        )
 +        ctx.save_for_backward(q, k, v, o, lse)
@@ -9855,6 +10079,8 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        ctx.mask_strides = mask_strides
 +        ctx.dropout_p = dropout_p
 +        ctx.dropout_seed = seed
++        ctx.window_left = window_left
++        ctx.window_right = window_right
 +        return o
 +
 +    @staticmethod
@@ -9877,20 +10103,23 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        grid = (n_ctx // block_n1, 1, batch * n_head)
 +        mz, mh, mm, mn = ctx.mask_strides
 +        mask_arg = ctx.attn_mask if ctx.attn_mask is not None else q
++        window = ctx.window_left is not None or ctx.window_right is not None
++        wl = ctx.window_left if ctx.window_left is not None else 1 << 30
++        wr = ctx.window_right if ctx.window_right is not None else 1 << 30
 +        _attn_bwd[grid](
 +            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
 +            lse, delta,
 +            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
 +            n_head, n_ctx,
 +            mask_arg, mz, mh, mm, mn,
-+            ctx.dropout_p, ctx.dropout_seed,
++            ctx.dropout_p, ctx.dropout_seed, wl, wr,
 +            BLOCK_M1=block_m1, BLOCK_N1=block_n1,
 +            BLOCK_M2=block_m2, BLOCK_N2=block_n2,
 +            BLK_SLICE_FACTOR=2, HEAD_DIM=q.shape[-1], CAUSAL=ctx.causal,
-+            MASK_TYPE=ctx.mask_type, DROPOUT=ctx.dropout_p > 0.0,
++            MASK_TYPE=ctx.mask_type, DROPOUT=ctx.dropout_p > 0.0, WINDOW=window,
 +            num_warps=8, num_stages=1,
 +        )
-+        return dq, dk, dv, None, None, None, None, None, None
++        return dq, dk, dv, None, None, None, None, None, None, None, None
 +
 +
 +def _unsupported(q, k, v, attn_mask, dropout_p):
@@ -9961,40 +10190,68 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +
 +
 +def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
-+                                 is_causal=False, scale=None, enable_gqa=False):
++                                 is_causal=False, scale=None, enable_gqa=False,
++                                 window_left=None, window_right=None):
 +    q, k, v = query, key, value
 +    if scale is None:
 +        scale = 1.0 / math.sqrt(q.shape[-1])
 +    if _unsupported(q, k, v, attn_mask, dropout_p):
-+        return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
++        return _fallback_math(q, k, v, attn_mask, dropout_p, is_causal, scale,
++                              enable_gqa, window_left, window_right)
 +    try:
 +        mask, mask_type, mask_strides = _prepare_attn_mask(attn_mask, q, k)
 +    except (ValueError, TypeError):
-+        return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
++        return _fallback_math(q, k, v, attn_mask, dropout_p, is_causal, scale,
++                              enable_gqa, window_left, window_right)
 +    if k.shape[1] != q.shape[1]:
 +        if q.shape[1] % k.shape[1] != 0:
 +            raise ValueError("query heads must be a multiple of key/value heads")
 +        groups = q.shape[1] // k.shape[1]
 +        k = k.repeat_interleave(groups, dim=1)
 +        v = v.repeat_interleave(groups, dim=1)
++    # The backward preprocess kernel assumes a contiguous (B, H, N, D) layout;
++    # this is a no-op for the usual case and makes transposed views (varlen)
++    # correct.
++    q = q.contiguous()
++    k = k.contiguous()
++    v = v.contiguous()
 +    return TritonFlashAttention.apply(
 +        q, k, v, bool(is_causal), float(scale), mask, mask_type, mask_strides,
-+        float(dropout_p),
++        float(dropout_p), window_left, window_right,
 +    )
 +
 +
-+def _window_mask(sq, sk, causal, window_size, device):
++def _window_allowed(sq, sk, causal, window_left, window_right, device):
++    """Dense keep-mask for the math fallback only (Triton uses arithmetic)."""
 +    qi = torch.arange(sq, device=device)[:, None]
 +    ki = torch.arange(sk, device=device)[None, :]
 +    allowed = torch.ones((sq, sk), dtype=torch.bool, device=device)
++    di = qi - ki
 +    if causal:
-+        allowed &= qi >= ki
-+    left, right = window_size
-+    if left >= 0:
-+        allowed &= (qi - ki) <= left
-+    if right >= 0:
-+        allowed &= (ki - qi) <= right
-+    return ~allowed
++        allowed &= di >= 0
++    if window_left is not None:
++        allowed &= di <= window_left
++    if window_right is not None:
++        allowed &= di >= -window_right
++    return allowed
++
++
++def _fallback_math(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa,
++                   window_left, window_right):
++    if window_left is not None or window_right is not None:
++        allowed = _window_allowed(q.shape[2], k.shape[2], is_causal,
++                                  window_left, window_right, q.device)
++        if attn_mask is None:
++            attn_mask = allowed
++        elif attn_mask.dtype == torch.bool:
++            attn_mask = attn_mask & allowed
++        else:
++            attn_mask = attn_mask + torch.where(
++                allowed, torch.zeros((), device=q.device, dtype=attn_mask.dtype),
++                torch.full((), -1.0e9, device=q.device, dtype=attn_mask.dtype),
++            )
++        is_causal = False
++    return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
 +
 +
 +def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
@@ -10003,9 +10260,12 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +    if softcap != 0.0 or alibi_slopes is not None or return_attn_probs:
 +        raise NotImplementedError("softcap, alibi and attention probabilities are not implemented")
 +    if window_size != (-1, -1):
-+        mask = _window_mask(q.shape[2], k.shape[2], causal, window_size, q.device)
++        left, right = window_size
 +        return scaled_dot_product_attention(
-+            q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False, scale=softmax_scale,
++            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal,
++            scale=softmax_scale,
++            window_left=left if left >= 0 else None,
++            window_right=right if right >= 0 else None,
 +        )
 +    return scaled_dot_product_attention(
 +        q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale,
@@ -10032,12 +10292,13 @@ index 0000000000000000000000000000000000000000..d43dccd6e1a0ed268580f8707d3d265a
 +        qi = q[qa:qb].transpose(0, 1).unsqueeze(0)
 +        ki = k[ka:kb].transpose(0, 1).unsqueeze(0)
 +        vi = v[ka:kb].transpose(0, 1).unsqueeze(0)
-+        mask = None
-+        if window_size != (-1, -1):
-+            mask = _window_mask(qi.shape[2], ki.shape[2], causal, window_size, q.device)
++        left, right = window_size
++        wl = left if left >= 0 else None
++        wr = right if right >= 0 else None
 +        oi = scaled_dot_product_attention(
-+            qi, ki, vi, attn_mask=mask, dropout_p=dropout_p,
-+            is_causal=(causal and mask is None), scale=softmax_scale,
++            qi, ki, vi, attn_mask=None, dropout_p=dropout_p,
++            is_causal=causal, scale=softmax_scale,
++            window_left=wl, window_right=wr,
 +        )
 +        outs.append(oi[0].transpose(0, 1))
 +    return torch.cat(outs, dim=0)
