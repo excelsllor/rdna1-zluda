@@ -248,6 +248,18 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - graph-replayed decode works (zLUDA):** found and fixed the
+  decode GEMV dispatch bug in `zluda_ops.auto` (decode F.linear gets (1,1,D)
+  tensors, so the 2-D-only Triton GEMV path never triggered - 0 calls, rocBLAS
+  silently used). With the flatten fix a decode step makes ~170 Triton GEMV
+  calls and no cuBLAS, which makes the whole step graph-capture safe:
+  torch.cuda.CUDAGraph capture/replay now works. Measured (Qwen2.5-0.5B fp16,
+  StaticCache, bench/graph_decode.py): eager 25.1/26.7 tok/s vs **graph-replay
+  87.6 tok/s @1k and 72.8 tok/s @2k** (3.5x / 2.7x). llama.cpp on Vulkan is
+  ~238 tok/s @2k, so PyTorch/ZLUDA is now within 2-3x instead of 8x. Remaining:
+  tune Triton GEMV for the exact decode shapes (lm_head 151936x896), support
+  position updates with the graph in a real generation loop, flash-decoding
+  tuning. Details: docs/CUDA_GRAPHS_ZLUDA.md.
 - **2026-11-25 - decode/CUDA-graphs follow-up:** measured the decode gap
   components: launches cost only ~2 us (240 launches ~0.5 ms/token), while
   rocBLAS GEMV costs 24.7-251 us per matvec (down_proj 1x896x4864 = 251 us vs
