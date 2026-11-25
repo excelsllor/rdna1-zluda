@@ -116,7 +116,7 @@ def load_model(path, dtype, attn):
 def measure_prefill(model, input_ids, warmup=2, iters=3):
     def run():
         with torch.no_grad():
-            return model(input_ids=input_ids, use_cache=True)
+            return model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
     for _ in range(warmup):
         run()
     torch.cuda.synchronize()
@@ -126,13 +126,14 @@ def measure_prefill(model, input_ids, warmup=2, iters=3):
 
 def measure_decode(model, input_ids, steps, warmup=1):
     with torch.no_grad():
-        out = model(input_ids=input_ids, use_cache=True)
+        out = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
     past = out.past_key_values
     next_tok = out.logits[:, -1:].argmax(-1)
 
     def step():
         nonlocal past, next_tok
-        out2 = model(input_ids=next_tok, past_key_values=past, use_cache=True)
+        out2 = model(input_ids=next_tok, past_key_values=past, use_cache=True,
+                     logits_to_keep=1)
         past = out2.past_key_values
         next_tok = out2.logits[:, -1:].argmax(-1)
 
@@ -174,6 +175,9 @@ def main():
     parser.add_argument("--group", type=int, default=64)
     parser.add_argument("--fp16acc", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--compile-mode", default="default")
+    parser.add_argument("--compile-fullgraph", action="store_true")
+    parser.add_argument("--compile-dynamic", action="store_true")
     parser.add_argument("--prefill", type=int, default=512)
     parser.add_argument("--decode", type=int, default=16)
     parser.add_argument("--train", action="store_true")
@@ -210,7 +214,8 @@ def main():
             quant_mb = None
         if args.compile:
             t0 = time.perf_counter()
-            model = torch.compile(model, dynamic=False)
+            model = torch.compile(model, dynamic=args.compile_dynamic, mode=args.compile_mode,
+                                   fullgraph=args.compile_fullgraph)
             compile_s = time.perf_counter() - t0
             print(f"torch.compile setup {compile_s:.1f} s", flush=True)
         else:
@@ -239,6 +244,11 @@ def main():
             "decode_tok_s": 1000 / decode_ms,
             "train_step_ms": train_ms,
         }
+        try:
+            import zluda_ops.auto as _auto_dbg
+            result["dispatch"] = dict(_auto_dbg._DISPATCH_STATS)
+        except Exception:
+            pass
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                           for k, v in result.items()}, indent=2), flush=True)
         save_report("model_bench", result)

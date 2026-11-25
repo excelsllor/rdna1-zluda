@@ -248,6 +248,23 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - engine comparison, final pass:** Vulkan (Ollama, 100% GPU)
+  Q4_K_M: 4531/2741/946 tok/s prefill and 150.8/135.2/104.8 tok/s decode at
+  2k/8k/32k; F16 clamped to 8192 context by Ollama on 8 GB. ZLUDA/PyTorch fp16:
+  4525 tok/s prefill at 1k (on par), **7774 with fp16 accumulation** (+70%),
+  6449-6733 with torch.compile (peak 1031 MB); long context 3275/2076/1199 tok/s
+  prefill at 8k/16k/32k and 12.6/6.7/6.2 tok/s decode. **Decode is 4-8x (17x at
+  32k) slower than Vulkan** - the main remaining gap (per-token launch
+  overhead, no CUDA graphs, math attention fallback; our flash-decoding gives
+  +22%). torch.compile is unusable for decode here (recompiles per token;
+  CUDA-graph capture unsupported by ZLUDA). Quantization: steady fp16 950 MB ->
+  int4 519 MB (1.85x) but prefill slower; int8 dequant-once cache doubles
+  active memory -> fused int8 kernel needed. llama.cpp CUDA under ZLUDA is
+  blocked in both current (cudaLaunchKernelEx/PDL) and pre-PDL builds;
+  bitsandbytes is excluded (substitute Triton 8-bit AdamW: 4.6x faster step,
+  3.94x smaller state). Explicit RMSNorm/SwiGLU fusion patch gives only 1.01x.
+  Full report with the "what else can be implemented" analysis:
+  ENGINE_COMPARISON.md.
 - **2026-11-25 - engine comparison (Vulkan vs ZLUDA), first pass:** Ollama
   Vulkan runs Qwen2.5-0.5B 100% on GPU (Q4_K_M: 4531 tok/s prefill and 150.8
   tok/s decode at 2k context, 946/104.8 at 32k; F16 is clamped to 8192 context).

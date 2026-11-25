@@ -12,6 +12,8 @@ from . import gemv as _gemv
 from . import mha as _mha
 
 _orig_linear = None
+
+_DISPATCH_STATS = {"fa": 0, "decode": 0, "math": 0}
 _orig_sdpa = None
 
 _BF16_LIMIT = int(os.environ.get("ZLUDA_AUTO_BF16_MAX_MB", "64")) * 1024 * 1024
@@ -60,6 +62,7 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
             and query.is_cuda and query.dtype == torch.float16
             and query.shape[-1] == 64 and query.shape[2] % 128 == 0):
         try:
+            _DISPATCH_STATS["fa"] += 1
             return _fa.scaled_dot_product_attention(
                 query, key, value, attn_mask=None, dropout_p=0.0,
                 is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
@@ -80,11 +83,13 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
             and key.shape[2] % 128 == 0
             and not _needs_grad(query, key, value)):
         try:
+            _DISPATCH_STATS["decode"] += 1
             return _flash_decode.flash_decode_attn(
                 query, key, value, causal=bool(is_causal)
             )
         except Exception:
             pass
+    _DISPATCH_STATS["math"] += 1
     with sdpa_kernel(SDPBackend.MATH):
         return _orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                           is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
