@@ -726,3 +726,32 @@ reproduces the table.
 Caveats: fp32 copies of the conv weights cost memory; the win is shape-dependent
 (conversion cost for tiny convs); only 3x3 stride-1/dilation-1/group-1 is
 eligible, everything else uses the regular path.
+
+## MIOpen find-db and solver investigation (2026-11-25)
+
+Follow-up to the conv audit: does gfx1010 need a MIOpen perf-db, and are the
+auto-selected solvers suboptimal?
+
+Findings (`bench/miopen_db.py`):
+
+- The shared MIOpen DLL contains no gfx1010 strings, i.e. no system find-db for
+  this architecture ships with the ROCm 10.1 user space
+  (`gfx1010_20.HIP.fdb.txt` is absent, matching the earlier warning).
+- A **user find-db works and is auto-populated**: `~/.miopen/db/...ufdb.txt` and
+  `~/.miopen/cache/...ukdb` files exist for gfx1010 and their mtime advances
+  after new shapes run. Per-shape find cost on a warm cache is ~4.5 ms.
+- The ~1.2-1.3 s spent on the very first convolution in a fresh process is
+  MIOpen kernel-db/context initialisation (a dummy 8x8x8 conv absorbs it), not
+  a solver search; it cannot be removed with a perf-db, only amortised by
+  keeping the process alive.
+- `MIOPEN_FIND_MODE=FAST` (heuristic only) gives identical steady-state times
+  on the SD/ResNet shapes tested (e.g. 0.210 vs 0.213 ms at 1x64x56x56).
+- `MIOPEN_FIND_ENFORCE=SEARCH` (forced exhaustive search) costs 45-124 ms extra
+  on the first call and finds the same solution: steady state is unchanged
+  (2.14 vs 2.22 ms at 2x256x64x64). The cached solution is already the fastest.
+
+Conclusion: no system perf-db work is needed for gfx1010; the auto-selected
+solver is optimal for the measured shapes, the user find-db is already in use,
+and the cold-start cost is process initialisation. The remaining conv win is
+the dtype/solver split handled by the cast-to-fp32 workaround (previous
+section), and possibly the missing channels_last path (measured unusable).
