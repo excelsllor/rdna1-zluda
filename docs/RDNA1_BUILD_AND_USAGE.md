@@ -145,10 +145,12 @@ set PATH=<repo>\target\release;%HIP_PATH%\bin;%PATH%
 <repo>\target\release\zluda.exe -- %*
 ```
 
-Every variable is only set when it is not already defined, so a different HIP
-installation or cache location can be selected in the environment before the
-launcher runs. The Visual Studio environment is located with `vswhere` (set `VS`
-to override) and is optional at run time.
+Every variable is only set when it is not already defined, so a different cache
+location can be selected in the environment before the launcher runs. The HIP
+runtime always comes from the repository (`<repo>\hip`); set `ZLUDA_HIP_PATH`
+before calling the launcher to use another installation (a stale system-wide
+`HIP_PATH` is intentionally ignored). The Visual Studio environment is located
+with `vswhere` (set `VS` to override) and is optional at run time.
 
 Important:
 
@@ -274,6 +276,7 @@ run-zluda.cmd venv\Scripts\python.exe bench\flash_pack.py
 run-zluda-auto.cmd venv\Scripts\python.exe smoke\auto_test.py
 run-zluda.cmd venv\Scripts\python.exe bench\fp16_ux.py
 run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
+run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.
