@@ -39,7 +39,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 | **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 | **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **DONE** | RMSNorm 8.2x fwd / 6.1x bwd, softmax 18.5x, RoPE 5.1-8.8x, SwiGLU 1.2-1.5x vs torch eager; chunked CE -28% peak memory but slower than torch | medium | Triton |
-| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | result: MIOpen lowers 3x3 to GEMM (`GemmFwdRest`), no Winograd/implicit-GEMM selected; channels_last unusable; fp16 2-4x slower than fp32; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
+| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | fp16 anomaly root-caused: MIOpen picks Winograd (`ConvBinWinogradRxSf2x3g1`) only for fp32, fp16 gets GEMM (`GemmFwdRest`). Workaround `zluda_ops/conv.py`: cast-to-fp32 Winograd conv, **1.4-4.3x fwd / up to 1.9x fwd+bwd**, opt-in `ZLUDA_CONV_FP32=1`; channels_last unusable; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
 | **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **OPEN** | high if SD is a target | medium-high | measure first |
 | **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | **PARTIAL** | +5–15% | medium | measured, not fused/auto |
 | **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | **OPEN** | +5–20% on kernels | low-medium | benchmarks |
@@ -220,6 +220,15 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   kernels with the Philox mask regenerated from (head, query, key) offsets;
   unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
   s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
+- **2026-11-25 - P1-1 follow-up (fp16 conv):** MIOpen logs prove the dtype
+  split — fp32 3x3 uses the Winograd solver `ConvBinWinogradRxSf2x3g1`, fp16
+  falls back to `GemmFwdRest` (GEMM). Implemented `zluda_ops/conv.py`
+  (cast-to-fp32 Winograd path, gradients flow through the casts) and an opt-in
+  `F.conv2d` patch in `zluda_ops.auto` behind `ZLUDA_CONV_FP32=1`. Measured with
+  the warmed/shuffled protocol: **1.41-4.25x forward** on 5/5 SD/ResNet shapes,
+  **1.02-1.90x forward+backward** on 4/5 (the smallest shape is
+  conversion-bound), UNet blocks 1.72x/2.30x, gradient error 2e-8..7e-4.
+  `bench/conv_fp16.py` reproduces it.
 - **2026-11-25 - P1-5 (fused kernels):** `zluda_ops/fused.py` adds Triton
   RMSNorm (fwd+bwd), RoPE rotate-half (fwd+bwd), SwiGLU (fwd+bwd), row softmax
   and a memory-saving chunked cross-entropy, with `bench/fused.py` comparing

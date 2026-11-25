@@ -63,6 +63,7 @@ Controls:
 | `ZLUDA_AUTO_BF16_MAX_MB` | 64 | max bf16 weight size for auto emulation; 0 disables |
 | `ZLUDA_MHA_SLOW=1` | off | force the slow math path for `nn.MultiheadAttention` |
 | `ZLUDA_FP16_ACC=1` | off | experimental HH fp16 accumulation for training |
+| ZLUDA_CONV_FP32=1 | off | run eligible fp16 3x3 convs through the fp32 Winograd path (1.4-4.3x forward); needs import zluda_ops.auto |
 | `ZLUDA_VRAM_FRACTION` | 0.85 | per-process VRAM fraction for `run-zluda-train.cmd` |
 
 Safety conditions:

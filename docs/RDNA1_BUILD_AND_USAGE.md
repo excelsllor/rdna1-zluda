@@ -283,6 +283,7 @@ run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench
 run-zluda.cmd venv\Scripts\python.exe bench\fa_window.py --s 512 --bench
 run-zluda.cmd venv\Scripts\python.exe bench\gemv_m32.py --n 4096 --k 4096 --mvec
 run-zluda.cmd venv\Scripts\python.exe bench\conv.py --quick
+run-zluda.cmd venv\Scripts\python.exe bench\conv_fp16.py --quick
 run-zluda.cmd venv\Scripts\python.exe bench\flash_decode.py --quick
 run-zluda.cmd venv\Scripts\python.exe bench\quant.py --quick
 run-zluda.cmd venv\Scripts\python.exe bench\fused.py --quick
