@@ -388,3 +388,31 @@ Raw index mapping on this build: `raw = -solution_index - 10`.
 SS remains ~8.16 TF and HPA ~7.19 TF; their P0-5 targets are not reached by
 the existing kernels. Measurements with zeros/ones/uninitialized buffers are
 inflated (SS up to ~9.1 TF) and are not representative of random model data.
+## P0-1 fp32 GEMM "gap" between direct rocBLAS and PyTorch (2026-11-25)
+
+Earlier notes claimed 9.2-9.6 TF from isolated `rocblas_sgemm`/`rocblas_gemm_ex`
+scripts versus 8.16 TF for `torch.matmul`. `bench/rocblas_gap.py` reproduces
+every variant in one warmed process (shuffled rounds, median of 5):
+
+| variant (4096^2 fp32, random data unless noted) | median | TF |
+|---|---|---|
+| `torch.mm(a, b)` | 16.79 ms | 8.19 |
+| `torch.mm(a, b, out=c)` | 16.80 ms | 8.18 |
+| direct `rocblas_sgemm`, torch buffers | 16.79 ms | 8.19 |
+| direct `rocblas_sgemm`, hipMalloc buffers | 16.80 ms | 8.18 |
+| direct `rocblas_sgemm`, **zeroed** hipMalloc buffers | **14.90 ms** | **9.23** |
+
+The direct call is bit-identical to `torch.mm` (max abs error 0). The only
+difference that matters is the data: zero/uninitialised buffers run ~12.8%
+faster because the GPU draws less power and holds higher clocks. The old
+raw-HIP scripts allocated `hipMalloc` buffers without initialising them, so
+their 9.2-9.6 TF numbers were power artifacts, not a software gap.
+
+Consequences:
+
+- fp32 4096^2 on random data is **8.16-8.20 TF = 84% of the 9.754 TF peak**;
+  this is the practical ceiling of the shipped Tensile kernels. The 8.8-9.2 TF
+  target is withdrawn.
+- Every benchmark must use random data and median timing; report format is in
+  `bench/common.py` and `bench/results/rocblas_gap-*.json`.
+- HPA behaves the same way: 6.94 TF random versus ~7.19 TF on zeroed data.

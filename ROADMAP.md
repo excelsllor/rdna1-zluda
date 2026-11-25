@@ -14,6 +14,11 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
   hardware. Memory 448 GB/s, 8 GB VRAM, PCIe 4.0 x16 (~25 GB/s host link).
 - Runtime: ROCm 10.1 user space (HIP 7.16, MIOpen) + rocBLAS 7.1.1 with tuned
   gfx1010 Tensile libraries. PyTorch `2.7.1+cu118` (PTX path), Triton 3.3.1.
+- Benchmarks must use random data and median timing: zeros, ones and
+  uninitialised buffers raise the measured GEMM rate by ~12% (fp32 4096:
+  8.19 TF random vs 9.23 TF zeros) through power/clock effects, not through a
+  software path. Verified by `bench/rocblas_gap.py`; the old 9.2–9.6 TF
+  readings came from uninitialised `hipMalloc` buffers.
 - ZLUDA compiles device code with `-wavefrontsize64,+cumode` (wave32 + CU mode).
 - Known limitations: PyTorch SDPA flash/memory-efficient kernels are not
   available on gfx1010 (no MFMA); `cuXXX` performance libraries are mapped to
@@ -26,7 +31,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 |---|---|---|---|---|---|
 | **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** | basis for all decisions | low | clocks/power blocked |
 | **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
-| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **PARTIAL** | HH achieved; SS/HPA open | medium | rocBLAS 7.1.1; toolchain for new kernels |
+| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 | **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
 | **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks/dropout/window/varlen are math fallback |
 | **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
@@ -197,6 +202,18 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   non-causal fwd+bwd work; GQA works. Masks/dropout/sliding/varlen are
   functional via math fallback but not yet Triton-accelerated. Flash-decoding
   remains open.
+- **2026-11-25 - repository maintenance:** portable launchers (repository-
+  relative paths, `vswhere`, `ZLUDA_HIP_PATH`), documented ComfyUI launchers,
+  `gpu_reset.ps1`, ComfyUI freeze file, patch export/validation tooling
+  (`tools/export_patch.ps1`, `tools/check_patch.ps1`, pre-push hook), regenerated
+  UTF-8/LF patch, `smoke/local/` for machine-specific scripts.
+- **2026-11-25 - P0-1 closed (fp32 GEMM "gap"):** `bench/rocblas_gap.py` runs
+  `torch.mm`, direct `rocblas_sgemm` on torch/hipMalloc buffers and a zeroed
+  control in one warmed process with shuffled rounds. Random data: all paths
+  8.18–8.19 TF (median). Zeroed buffers: **9.23 TF (+12.8%)** — an artifact
+  caused by lower power draw/higher clocks. The old 9.2–9.6 TF readings came
+  from uninitialised `hipMalloc` buffers in raw-HIP scripts; there is no
+  ZLUDA/torch gap, and the 8.8–9.2 TF SS target is withdrawn.
 
 ## P0 status (2026-11-24)
 
@@ -205,7 +222,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | Training stability / MHA crash | **DONE (eager)** | slow-path MHA; full compile skipped |
 | fp16 accumulation UX | **DONE** | opt-in context, warnings, accuracy table; default off |
 | Tensile HH | **DONE** | existing 110 kernels; 16.73/17.94 TF with override |
-| Tensile SS/HPA | **OPEN** | 8.16/7.19 TF; no new `.dat/.co` kernels |
+| Tensile SS/HPA | **CLOSED** | 8.16/6.94 TF on random data = practical ceiling (84% of peak); old 9.2/7.2 TF numbers were zero-data artifacts; 325/302 solutions enumerated, default already best |
 | GEMV M1-8 / auto M<=32 | **DONE** | ~2x rocBLAS; inference only |
 | GEMV M16-32 target | **PARTIAL** | 155/78 GB/s; target 70-80% not met |
 | FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
@@ -224,14 +241,17 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | 2 | Triton masks/dropout for FA | P0 | match math fallback within 1e-3, faster at 1k+ |
 | 3 | Triton sliding-window + varlen FA | P0 | correctness vs math; no dense mask allocation |
 | 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
-| 5 | SS/HPA Tensile decision | P0 | new `.dat/.co` only if toolchain available; otherwise close as blocked |
+| 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
 | 6 | Clock/power monitoring | P0 | sclk/mclk/temp available or documented blocked |
 | 7 | Flash-decoding split-KV | P1 | >=1.5x decode at 4k |
 | 8 | Full 8-layer `torch.compile` | Deferred | only if compile time becomes acceptable |
 
 ## Definition of done (metrics)
-- fp32 GEMM 8.16→**8.8–9.2 TF**; HPA 6.94→**7.5–8**; HH target met via override (**16.73/17.94**); bf16 native 4.42→6–7, bf16 emulation **7.92**.
-  bf16 4.42→**6–7**.
+- fp32 GEMM 8.16 TF = **84% of theoretical peak**, on random data this is the
+  practical ceiling for the shipped Tensile kernels; HPA 6.94 TF = bounded by
+  the fp32 rate (`v_fma_mix`); HH target met via override (**16.73/17.94 TF**);
+  bf16 native 4.42→6–7 open (needs new Tensile code objects), bf16 emulation
+  **7.92 TF** reaches its target.
 - int4 weight-only decode (dequant-to-fp16): ≥**70–80%** of 448 GB/s;
   7B int4 decode target **35–60 tok/s** (theoretical ~100).
 - No int8 GEMM/TOPS target: gfx1010 has no int8 dot/tensor units; int8 is
