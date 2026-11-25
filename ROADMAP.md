@@ -248,6 +248,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - reusable graph decoder:** added `zluda_ops/graph_decode.py`
+  (`GraphDecoder`: StaticCache prefill + CApture of one decode step + replay,
+  token/position buffers updated outside the graph). Replay-only decode:
+  **8.01 ms/tok (124.8 tok/s) at 256 ctx**, 87.6 tok/s at 1k, 72.8 at 2k; full
+  generation with token readback 119 tok/s. Eager PyTorch 25-27 tok/s, llama.cpp
+  Vulkan ~238 tok/s. lm_head matvec 151936x896: rocBLAS 9.73 ms vs Triton GEMV
+  0.86 ms (11x). The self-loop graph variant (token update inside the graph) is
+  not usable on ZLUDA (~1 tok/s, repeated tokens). docs/CUDA_GRAPHS_ZLUDA.md.
 - **2026-11-25 - bf16 emulation works on ZLUDA:** with in-place parameter
   conversion (bf16 storage -> fp32 compute) the ZLUDA process runs bf16-emul at
   **5488 tok/s prefill / 29.6 tok/s decode / 2073 MB**, beating both native ZLUDA

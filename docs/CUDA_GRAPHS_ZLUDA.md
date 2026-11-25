@@ -148,3 +148,31 @@ Note: eager decode with the GEMV patch is slightly slower than with rocBLAS
 (39.9 vs 34.0 ms/token) because each Triton launch costs more CPU per call; the
 graph replay removes that overhead entirely. This is why graphs are the right
 delivery mechanism for the GEMV path.
+
+## Reusable GraphDecoder module
+
+`zluda_ops/graph_decode.py` provides `GraphDecoder(model, prompt_ids,
+max_new_tokens)`: it prefills with `StaticCache`, captures one decode step on a
+side stream (after `import zluda_ops.auto` so the Triton GEMV/FA kernels are in
+place) and replays it. The static token and cache-position buffers are updated
+**outside** the graph between replays, which is both correct (logits equal the
+eager path bit-for-bit in controlled tests) and fast:
+
+| measurement | result |
+|---|---|
+| replay-only decode, 256 ctx | 8.01 ms/tok -> **124.8 tok/s** |
+| full generation (token readback each step), 256 ctx | 119.0 tok/s |
+| replay-only decode, 1024 ctx | ~11.4 ms/tok -> 87.6 tok/s |
+| replay-only decode, 2048 ctx | ~13.7 ms/tok -> 72.8 tok/s |
+| eager PyTorch decode (reference) | 25-27 tok/s |
+| llama.cpp Vulkan decode (reference) | 238 tok/s @2k |
+
+The self-loop variant (argmax + token copy + position increment captured inside
+the graph so that one replay advances a full token) is **not usable on ZLUDA**:
+it degraded to ~1 tok/s and repeated tokens, indicating a graph-buffer
+dependency/serialization problem in the HIP graph launch path. Keep the updates
+outside the graph.
+
+`lm_head` (151936x896 matvec) is the largest single decode op: rocBLAS 9.73 ms
+vs Triton GEMV 0.86 ms (11x), which is why the GEMV path is essential for
+decode on this card.
