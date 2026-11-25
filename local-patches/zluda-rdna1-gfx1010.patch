@@ -631,10 +631,10 @@ index 70295034ea49a3c52e4055c83411b71a92cd8635..00000000000000000000000000000000
 -    secrets: inherit
 \ No newline at end of file
 diff --git a/.gitignore b/.gitignore
-index 0749ad9edbf77d9343230a23373d840d97afab2e..ee227c4838a2ad8f20817c84b99ef504820dee1b 100644
+index 0749ad9edbf77d9343230a23373d840d97afab2e..d49ba8d8adeeb38705515a09b7dfbecebcebc287 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -6,3 +6,29 @@ Cargo.lock
+@@ -6,3 +6,30 @@ Cargo.lock
  
  ptx/lib/zluda_ptx_impl.ll
  ptx/lib/zluda_ptx_impl_constrained.ll
@@ -664,6 +664,7 @@ index 0749ad9edbf77d9343230a23373d840d97afab2e..ee227c4838a2ad8f20817c84b99ef504
 +# Local model files and downloaded engine binaries (not part of the fork)
 +models/
 +tools/llamacpp-cuda/
++tools/llamacpp-cuda-old/
 diff --git a/BEFORE_AFTER.md b/BEFORE_AFTER.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312343ded85
