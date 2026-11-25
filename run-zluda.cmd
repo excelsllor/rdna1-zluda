@@ -15,7 +15,8 @@ if exist "%VSWHERE%" for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -pr
 if not defined VS if exist "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools" set "VS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
 if defined VS if exist "%VS%\VC\Auxiliary\Build\vcvars64.bat" call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
 
-if not defined HIP_PATH set "HIP_PATH=%ROOT%\hip"
+if defined ZLUDA_HIP_PATH (set "HIP_PATH=%ZLUDA_HIP_PATH%") else (set "HIP_PATH=%ROOT%\hip")
+if not exist "%HIP_PATH%\bin\amdhip64_7.dll" echo [run-zluda] warning: amdhip64_7.dll not found under "%HIP_PATH%\bin"
 if not defined HIP_VISIBLE_DEVICES set "HIP_VISIBLE_DEVICES=0"
 if not defined ZLUDA_CC set "ZLUDA_CC=8.6"
 if not defined TRITON_PTXAS_PATH set "TRITON_PTXAS_PATH=%ROOT%\target\release\ptxas.exe"
