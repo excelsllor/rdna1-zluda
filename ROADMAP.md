@@ -248,6 +248,19 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - CUDA graphs work under ZLUDA:** torch.cuda.CUDAGraph capture
+  and replay now work. PyTorch's runtime path called three unimplemented legacy
+  driver entry points - `cuStreamBeginCapture` (no mode arg),
+  `cuStreamGetCaptureInfo` (3-arg) and `cuGraphInstantiate` (no flags) - which
+  made `torch.cuda.graph()` fail with "operation not supported" at
+  capture_begin. Added them (stream.rs/graph.rs + implemented list), rebuilt
+  nvcuda.dll; verified driver-level (ctypes capture/instantiate/launch, bit
+  exact) and PyTorch-level (capture/replay, max err 0.0). This is the key
+  enabler for the decode gap (launch-bound: 28-51 tok/s PyTorch vs 184-238 tok/s
+  llama.cpp Vulkan). Debug logging for unimplemented APIs is opt-in via
+  ZLUDA_DEBUG_UNIMPLEMENTED=1. Docs: docs/CUDA_GRAPHS_ZLUDA.md; harness:
+  bench/graph_decode.py. Next: torch.compile reduce-overhead retest, graph
+  decode benchmark, bf16-emul retry.
 - **2026-11-25 - cross-backend comparison (Vulkan vs native ROCm vs ZLUDA):**
   built F32/BF16 GGUF variants for Vulkan/llama.cpp; found the native ROCm torch
   environment in `D:\comfyui\Data\Packages\ComfyUIrocm\venv` (torch
