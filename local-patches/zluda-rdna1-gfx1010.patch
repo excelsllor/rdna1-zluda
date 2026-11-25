@@ -631,10 +631,10 @@ index 70295034ea49a3c52e4055c83411b71a92cd8635..00000000000000000000000000000000
 -    secrets: inherit
 \ No newline at end of file
 diff --git a/.gitignore b/.gitignore
-index 0749ad9edbf77d9343230a23373d840d97afab2e..40bc14045042e540082ffd446092593b4d62661b 100644
+index 0749ad9edbf77d9343230a23373d840d97afab2e..ee227c4838a2ad8f20817c84b99ef504820dee1b 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -6,3 +6,25 @@ Cargo.lock
+@@ -6,3 +6,29 @@ Cargo.lock
  
  ptx/lib/zluda_ptx_impl.ll
  ptx/lib/zluda_ptx_impl_constrained.ll
@@ -660,6 +660,10 @@ index 0749ad9edbf77d9343230a23373d840d97afab2e..40bc14045042e540082ffd446092593b
 +# Machine-specific experiment scripts (hardcoded local paths) and scratch data.
 +smoke/local/
 +/hh_*.pt
++
++# Local model files and downloaded engine binaries (not part of the fork)
++models/
++tools/llamacpp-cuda/
 diff --git a/BEFORE_AFTER.md b/BEFORE_AFTER.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312343ded85
@@ -770,6 +774,64 @@ index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312
 +- Non-causal Triton FA backward; sliding window, varlen, softcap, dropout.
 +- Fused activation/residual epilogues; int8 (Stage 3).
 +- GPU clock/power telemetry on Windows.
+diff --git a/ENGINE_COMPARISON.md b/ENGINE_COMPARISON.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8bc9a6935398da8dbfd448af5733727b70ca027
+--- /dev/null
++++ b/ENGINE_COMPARISON.md
+@@ -0,0 +1,51 @@
++# Engine comparison: Vulkan (Ollama) vs ZLUDA (PyTorch/Triton) on gfx1010
++
++Status: in progress (2026-11-25). GPU: RX 5700 XT (gfx1010, 8 GB).
++Model: Qwen2.5-0.5B-Instruct (same weights in GGUF for Ollama and safetensors
++for PyTorch).
++
++## Setups
++
++- **Vulkan**: Ollama 0.40.18, llama.cpp Vulkan backend, GGUF models imported
++  with `num_ctx` up to 32768. `OLLAMA_FLASH_ATTENTION=1`,
++  `OLLAMA_KV_CACHE_TYPE=q8_0` (configurable through `bench/ollama_config.ps1`),
++  100% GPU offload confirmed by `ollama ps`.
++- **ZLUDA**: fork engine (this repo) with PyTorch 2.7.1+cu118, Triton 3.3.1,
++  ROCm 10.1 user space + tuned rocBLAS 7.1.1, launcher `run-zluda.cmd`.
++  Harness: `bench/model_bench.py` (fp32/fp16/bf16 x fp16-accum x math/Triton-FA
++  x torch.compile x int8/int4 quantization).
++- **llama.cpp CUDA under ZLUDA (blocked)**: the Windows CUDA build
++  (b12721, CUDA 12.4) loads under ZLUDA, sees the RX 5700 XT (8176 MiB,
++  compute 8.6), but kernel launch fails with `CUDA error: operation not
++  supported` at `cudaLaunchKernelEx` (programmatic dependent launch, PDL).
++  Disabling PDL via `GGML_CUDA_PDL=0` did not produce a usable run (hang).
++  Conclusion: the same-engine (llama.cpp) Vulkan-vs-ZLUDA comparison is not
++  currently possible; the ZLUDA side uses the PyTorch/Triton stack instead.
++- **bitsandbytes (excluded)**: 0.50.2 imports and ships ROCm libraries, but its
++  ops fail on ZLUDA (`named symbol not found` in its nvcc-built kernels, both
++  default and `BNB_BACKEND=rocm`). Substitute implemented in this repo:
++  `zluda_ops/optim8bit.py` (Triton blockwise-int8 AdamW).
++
++## First results (Vulkan/Ollama, Q4_K_M and F16 GGUF, FA=1, KV=q8_0)
++
++| model | context | prompt tokens | prefill tok/s | decode tok/s |
++|---|---|---|---|---|
++| Q4_K_M | 2048 | 1850 | 4474 | 151.4 |
++| Q4_K_M | 32768 | 29150 | 943.8 | 105.4 |
++| F16 | 2048 | 1850 | 3760.8 | 133.3 |
++| F16 | 32768 | 4098 (*) | 3838.7 | 129.4 |
++
++(*) F16 run reported `context_length=8192` in `ollama ps` and truncated the
++prompt to ~4k tokens, i.e. Ollama clamped the context for the F16 model on this
++8 GB card. Investigating (likely a VRAM-aware clamp; Q4_K_M kept 32k).
++
++## Notes
++
++- Vulkan equivalents of the PyTorch flags: no fp32/bf16 model execution (GGUF
++  tensors are F16/Q4_K_M...), no `torch.compile`, no `fp16accum`; flash
++  attention is a llama.cpp flag (`OLLAMA_FLASH_ATTENTION`), KV cache type is
++  `OLLAMA_KV_CACHE_TYPE` (f16/f32/q8_0).
++- All numbers are single-run medians of the Ollama API durations; GPU clocks
++  cannot be fixed on this card, so +/-15-30% run-to-run variance applies.
++- The ZLUDA-side measurement matrix and the final analysis (problems, missed
++  optimizations) are still to be filled in.
+\ No newline at end of file
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..75de5ac2e36413b013712767267abc2ae54b7e64
@@ -2448,10 +2510,10 @@ index 0000000000000000000000000000000000000000..ee209b7f3947190c45bd443cf5034d21
 +    print("sdpa math: FAIL", type(e).__name__, str(e)[:200])
 diff --git a/bench/common.py b/bench/common.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1704cc0bcbf893c77f90f5aabc2d9092ea48101a
+index 0000000000000000000000000000000000000000..b6ac8df897adde532649b2004ccc380795046e9c
 --- /dev/null
 +++ b/bench/common.py
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,111 @@
 +import json
 +import os
 +import time
@@ -2490,20 +2552,26 @@ index 0000000000000000000000000000000000000000..1704cc0bcbf893c77f90f5aabc2d9092
 +
 +
 +def gpu_info():
-+    props = torch.cuda.get_device_properties(0)
 +    info = {
-+        "device": torch.cuda.get_device_name(0),
 +        "torch": torch.__version__,
 +        "cuda": torch.version.cuda,
 +        "hip": getattr(torch.version, "hip", None),
-+        "multi_processor_count": props.multi_processor_count,
-+        "total_memory_gb": round(props.total_memory / 1024**3, 2),
-+        "l2_cache_mb": round(getattr(props, "L2_cache_size", 0) / 1024**2, 2),
-+        "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
-+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
 +        "hip_path": os.environ.get("HIP_PATH"),
 +        "zluda_cc": os.environ.get("ZLUDA_CC"),
 +    }
++    try:
++        props = torch.cuda.get_device_properties(0)
++        info.update({
++            "device": torch.cuda.get_device_name(0),
++            "multi_processor_count": props.multi_processor_count,
++            "total_memory_gb": round(props.total_memory / 1024**3, 2),
++            "l2_cache_mb": round(getattr(props, "L2_cache_size", 0) / 1024**2, 2),
++        })
++    except Exception as exc:  # plain python without ZLUDA injection
++        info["device"] = None
++        info["device_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
++    info["allow_tf32"] = torch.backends.cuda.matmul.allow_tf32
++    info["float32_matmul_precision"] = torch.get_float32_matmul_precision()
 +    try:
 +        import triton
 +
@@ -4979,6 +5047,256 @@ index 0000000000000000000000000000000000000000..a05eacddf9b6a886f544ebf224221770
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/bench/model_bench.py b/bench/model_bench.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8c27e3412a8f8f7670ad45c5672ef62498d91df
+--- /dev/null
++++ b/bench/model_bench.py
+@@ -0,0 +1,244 @@
++"""Benchmark a Hugging Face causal LM on the ZLUDA/PyTorch/Triton engine.
++
++Measures prefill and decode throughput, peak memory and a training step for a
++model on gfx1010, across the configurations that matter for this card:
++
++  * dtype: fp16 / bf16 / fp32
++  * fp16 accumulation on/off (cublas HH kernels)
++  * attention: math SDPA (ZLUDA cannot use PyTorch flash/mem-efficient on
++    gfx1010) vs the Triton flash-attention path from zluda_ops
++  * torch.compile on/off
++  * weight quantization: none / int8 / int4 (zluda_ops.quant; int4 uses the
++    fused dequant kernels, int8 uses a cached dequantized copy)
++
++bitsandbytes is not used: its prebuilt CUDA kernels fail on ZLUDA
++(`named symbol not found`).
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\model_bench.py --quick
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\model_bench.py --dtype fp16 --prefill 1024 --decode 32
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\model_bench.py --dtype bf16 --fp16acc
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\model_bench.py --quant int4 --attn triton
++"""
++
++import argparse
++import json
++import sys
++import time
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from torch.nn.attention import SDPBackend, sdpa_kernel
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from bench.common import bench_median, save_report
++
++DEFAULT_MODEL = str(Path(__file__).resolve().parents[1] / "models" / "Qwen2.5-0.5B-Instruct")
++
++
++def patch_attention(mode):
++    """Return an unpatch callable. mode: 'math' | 'triton' | 'default'."""
++    orig = F.scaled_dot_product_attention
++    if mode == "math":
++        def math_sdpa(*args, **kwargs):
++            with sdpa_kernel(SDPBackend.MATH):
++                return orig(*args, **kwargs)
++        F.scaled_dot_product_attention = math_sdpa
++    elif mode == "triton":
++        from zluda_ops import flash_attention
++        F.scaled_dot_product_attention = flash_attention.scaled_dot_product_attention
++    return lambda: setattr(F, "scaled_dot_product_attention", orig)
++
++
++class QuantLinear(torch.nn.Module):
++    """nn.Linear replacement with int4/int8 weight-only storage."""
++
++    def __init__(self, linear, bits=4, group=64):
++        super().__init__()
++        self.bits = bits
++        self.group = group
++        self.in_features = linear.in_features
++        self.out_features = linear.out_features
++        w = linear.weight.detach()
++        self.bias = None if linear.bias is None else torch.nn.Parameter(
++            linear.bias.detach().clone())
++        from zluda_ops import quant as q
++        if bits == 4:
++            self.packed, self.scales = q.quantize_int4(w, group)
++            self._q = q
++        elif bits == 8:
++            self.int8, self.scales = q.quantize_int8(w, 128)
++            self._cached_fp16 = None
++            self._q = q
++        else:
++            raise ValueError("bits must be 4 or 8")
++
++    def forward(self, x):
++        shape = x.shape
++        x2 = x.reshape(-1, shape[-1])
++        if self.bits == 4:
++            y = self._q.int4_linear(x2, self.packed, self.scales, self.bias, self.group)
++            if y is None:
++                y = self._q.int4_matmul(x2, self.packed, self.scales, self.bias, self.group)
++        else:
++            if self._cached_fp16 is None:
++                self._cached_fp16 = self._q.dequantize_int8(
++                    self.int8, self.scales,
++                    (self.out_features, self.in_features), 128)
++            y = F.linear(x2, self._cached_fp16, self.bias)
++        return y.reshape(*shape[:-1], self.out_features)
++
++
++def quantize_model(model, bits, group=64):
++    count = 0
++    for name, child in list(model.named_children()):
++        if isinstance(child, torch.nn.Linear):
++            setattr(model, name, QuantLinear(child.to(torch.float16), bits, group))
++            count += 1
++        else:
++            count += quantize_model(child, bits, group)
++    return count
++
++
++def load_model(path, dtype, attn):
++    from transformers import AutoModelForCausalLM, AutoTokenizer
++    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
++    kwargs = dict(local_files_only=True, low_cpu_mem_usage=True)
++    if dtype is not None:
++        kwargs["torch_dtype"] = dtype
++    kwargs["attn_implementation"] = "eager" if attn == "math" else "sdpa"
++    model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
++    model.eval()
++    return tokenizer, model
++
++
++def measure_prefill(model, input_ids, warmup=2, iters=3):
++    def run():
++        with torch.no_grad():
++            return model(input_ids=input_ids, use_cache=True)
++    for _ in range(warmup):
++        run()
++    torch.cuda.synchronize()
++    ms = bench_median(run, rounds=iters, iters=1)
++    return ms
++
++
++def measure_decode(model, input_ids, steps, warmup=1):
++    with torch.no_grad():
++        out = model(input_ids=input_ids, use_cache=True)
++    past = out.past_key_values
++    next_tok = out.logits[:, -1:].argmax(-1)
++
++    def step():
++        nonlocal past, next_tok
++        out2 = model(input_ids=next_tok, past_key_values=past, use_cache=True)
++        past = out2.past_key_values
++        next_tok = out2.logits[:, -1:].argmax(-1)
++
++    with torch.no_grad():
++        for _ in range(warmup):
++            step()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    with torch.no_grad():
++        for _ in range(steps):
++            step()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t) / steps * 1000
++
++
++def measure_train_step(model, input_ids, warmup=1, iters=2):
++    model.train()
++    labels = input_ids.clone()
++
++    def step():
++        out = model(input_ids=input_ids, labels=labels)
++        out.loss.backward()
++        model.zero_grad(set_to_none=True)
++        return out.loss
++
++    step()
++    torch.cuda.synchronize()
++    ms = bench_median(step, rounds=iters, iters=1)
++    model.eval()
++    return ms
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", default=DEFAULT_MODEL)
++    parser.add_argument("--dtype", default="fp16", choices=["fp16", "bf16", "fp32"])
++    parser.add_argument("--attn", default="math", choices=["math", "triton", "default"])
++    parser.add_argument("--quant", default="none", choices=["none", "int8", "int4"])
++    parser.add_argument("--group", type=int, default=64)
++    parser.add_argument("--fp16acc", action="store_true")
++    parser.add_argument("--compile", action="store_true")
++    parser.add_argument("--prefill", type=int, default=512)
++    parser.add_argument("--decode", type=int, default=16)
++    parser.add_argument("--train", action="store_true")
++    parser.add_argument("--quick", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    parser.add_argument("--tag", default="")
++    args = parser.parse_args()
++    if args.quick:
++        args.prefill = min(args.prefill, 128)
++        args.decode = min(args.decode, 4)
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    torch.cuda.reset_peak_memory_stats()
++    dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
++    print(f"VRAM fraction {args.vram_fraction} | dtype={args.dtype} attn={args.attn} "
++          f"quant={args.quant} fp16acc={args.fp16acc} compile={args.compile}", flush=True)
++
++    unpatch = patch_attention(args.attn)
++    try:
++        if args.fp16acc:
++            torch._C._set_cublas_allow_fp16_accumulation(True)
++        tokenizer, model = load_model(args.model, dtypes[args.dtype], args.attn)
++        model = model.cuda()
++        load_mb = torch.cuda.max_memory_allocated() / 1024 ** 2
++        if args.quant != "none":
++            n = quantize_model(model, 4 if args.quant == "int4" else 8, args.group)
++            print(f"quantized {n} linear layers to {args.quant}", flush=True)
++            quant_mb = torch.cuda.max_memory_allocated() / 1024 ** 2
++        else:
++            quant_mb = None
++        if args.compile:
++            t0 = time.perf_counter()
++            model = torch.compile(model, dynamic=False)
++            compile_s = time.perf_counter() - t0
++            print(f"torch.compile setup {compile_s:.1f} s", flush=True)
++        else:
++            compile_s = None
++
++        text = "The quick brown fox jumps over the lazy dog. " * max(1, args.prefill // 10)
++        ids = tokenizer(text, return_tensors="pt", truncation=True,
++                        max_length=args.prefill).input_ids.cuda()
++        seq = ids.shape[1]
++        prefill_ms = measure_prefill(model, ids)
++        decode_ms = measure_decode(model, ids, args.decode)
++        peak_mb = torch.cuda.max_memory_allocated() / 1024 ** 2
++        train_ms = measure_train_step(model, ids) if args.train else None
++        result = {
++            "dtype": args.dtype, "attn": args.attn, "quant": args.quant,
++            "fp16acc": args.fp16acc, "compile": args.compile, "tag": args.tag,
++            "seq_len": seq, "load_mb": load_mb, "quant_mb": quant_mb,
++            "peak_mb": peak_mb, "compile_s": compile_s,
++            "prefill_ms": prefill_ms, "prefill_tok_s": seq / prefill_ms * 1000,
++            "decode_ms_per_tok": decode_ms,
++            "decode_tok_s": 1000 / decode_ms,
++            "train_step_ms": train_ms,
++        }
++        print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
++                          for k, v in result.items()}, indent=2), flush=True)
++        save_report("model_bench", result)
++    finally:
++        unpatch()
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/monitor.py b/bench/monitor.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..65b65d448bc12f5172552b5a607e8e4f9e98b783
@@ -5062,6 +5380,309 @@ index 0000000000000000000000000000000000000000..65b65d448bc12f5172552b5a607e8e4f
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/bench/ollama_bench.py b/bench/ollama_bench.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9eab998788bd59ac732277d81375d2858cf6573
+--- /dev/null
++++ b/bench/ollama_bench.py
+@@ -0,0 +1,118 @@
++"""Benchmark an Ollama model (Vulkan backend on gfx1010) over the HTTP API.
++
++Reports prefill (prompt eval) and decode (eval) throughput, load time and the
++GPU/CPU processor split chosen by Ollama. Designed to be compared against the
++same GGUF run on llama.cpp-CUDA through ZLUDA, and against the PyTorch/ZLUDA
++matrix (`bench/model_bench.py`).
++
++The Ollama server is started/restarted by `bench/ollama_config.ps1` when
++switching backend options (flash attention, KV cache type).
++
++Usage:
++  venv\\Scripts\\python.exe bench\\ollama_bench.py --model qwen05-bench --ctx 2048,8192,32768
++"""
++
++import argparse
++import json
++import sys
++import time
++import urllib.request
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from common import save_report
++
++HOST = "http://127.0.0.1:11434"
++
++
++def post(path, payload, timeout=3600):
++    req = urllib.request.Request(HOST + path, data=json.dumps(payload).encode(),
++                                 headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        return json.loads(r.read().decode())
++
++
++def get(path, timeout=120):
++    with urllib.request.urlopen(HOST + path, timeout=timeout) as r:
++        return json.loads(r.read().decode())
++
++
++def ps():
++    try:
++        return get("/api/ps").get("models", [])
++    except Exception as exc:  # noqa: BLE001
++        return [{"error": str(exc)}]
++
++
++def make_prompt(tokens_approx):
++    # ~4 characters per token for English text
++    sentence = "The quick brown fox jumps over the lazy dog. "
++    reps = max(1, tokens_approx * 4 // len(sentence))
++    return (sentence * reps)[: tokens_approx * 4]
++
++
++def bench_ctx(model, ctx_tokens, num_predict, timeout=3600):
++    prompt = make_prompt(ctx_tokens)
++    t0 = time.time()
++    res = post("/api/generate", {
++        "model": model,
++        "prompt": prompt,
++        "stream": False,
++        "options": {"num_ctx": ctx_tokens, "num_predict": num_predict,
++                    "temperature": 0.0},
++    }, timeout=timeout)
++    wall = time.time() - t0
++    ns = 1e9
++    pc = res.get("prompt_eval_count", 0)
++    pd = res.get("prompt_eval_duration", 0) / ns
++    ec = res.get("eval_count", 0)
++    ed = res.get("eval_duration", 0) / ns
++    ld = res.get("load_duration", 0) / ns
++    row = {
++        "requested_ctx": ctx_tokens,
++        "prompt_tokens": pc,
++        "prompt_ms": pd * 1000,
++        "prefill_tok_s": pc / pd if pd else None,
++        "eval_tokens": ec,
++        "decode_ms_per_tok": (ed / ec * 1000) if ec else None,
++        "decode_tok_s": (ec / ed) if ed else None,
++        "load_s": ld,
++        "wall_s": wall,
++    }
++    print(f"ctx={ctx_tokens:6d} prompt_tokens={pc:6d} prefill={row['prefill_tok_s'] or 0:8.1f} tok/s "
++          f"decode={row['decode_tok_s'] or 0:7.2f} tok/s load={ld:5.1f}s", flush=True)
++    return row
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", default="qwen05-q4")
++    parser.add_argument("--ctx", default="2048,8192,16384,32768")
++    parser.add_argument("--num-predict", type=int, default=32)
++    parser.add_argument("--unload", action="store_true")
++    parser.add_argument("--tag", default="")
++    args = parser.parse_args()
++    ctxs = [int(x) for x in args.ctx.split(",") if x]
++    print(f"model={args.model} ctx={ctxs} num_predict={args.num_predict}", flush=True)
++    models = ps()
++    print("ollama ps before:", json.dumps(models)[:400], flush=True)
++    rows = []
++    for ctx in ctxs:
++        rows.append(bench_ctx(args.model, ctx, args.num_predict))
++    if args.unload:
++        try:
++            post("/api/generate", {"model": args.model, "prompt": "", "keep_alive": 0},
++                 timeout=60)
++        except Exception:
++            pass
++    ps_after = ps()
++    print("ollama ps after:", json.dumps(ps_after)[:600], flush=True)
++    save_report("ollama_bench", {
++        "model": args.model, "tag": args.tag, "rows": rows,
++        "processor": ps_after, "num_predict": args.num_predict,
++    })
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/bench/ollama_config.ps1 b/bench/ollama_config.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae47a2741b0185e8bc378e7a87f47a1ca2fa9146
+--- /dev/null
++++ b/bench/ollama_config.ps1
+@@ -0,0 +1,24 @@
++# Restart the Ollama server with the requested Vulkan backend configuration.
++# Usage: powershell -File bench\ollama_config.ps1 -FlashAttention 1 -KvCacheType f16
++param(
++    [int]$FlashAttention = 1,
++    [string]$KvCacheType = "f16"
++)
++$ollama = "C:\Users\artyom\AppData\Local\Programs\Ollama\ollama.exe"
++Get-Process ollama,"ollama app" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
++Start-Sleep -Seconds 2
++$env:OLLAMA_FLASH_ATTENTION = "$FlashAttention"
++$env:OLLAMA_KV_CACHE_TYPE = $KvCacheType
++Start-Process -FilePath $ollama -ArgumentList "serve" -WindowStyle Hidden
++for ($i = 0; $i -lt 30; $i++) {
++    Start-Sleep -Milliseconds 500
++    try {
++        $r = Invoke-WebRequest -Uri "http://127.0.0.1:11434/api/tags" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
++        if ($r.StatusCode -eq 200) {
++            "ollama ready (FA=$FlashAttention KV=$KvCacheType)"
++            exit 0
++        }
++    } catch { }
++}
++"ollama did not become ready"
++exit 1
+\ No newline at end of file
+diff --git a/bench/optim8bit.py b/bench/optim8bit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc28e960b6702370273b29654817af616d406384
+--- /dev/null
++++ b/bench/optim8bit.py
+@@ -0,0 +1,142 @@
++"""Benchmark the Triton 8-bit AdamW (bitsandbytes substitute) on ZLUDA.
++
++bitsandbytes' CUDA kernels cannot run through ZLUDA on gfx1010, so
++`zluda_ops.optim8bit.AdamW8bit` implements the same idea with a Triton kernel:
++int8 moment estimates with per-block fp32 absmax scales.
++
++The script compares step time, optimizer-state memory and parameter parity
++against torch.optim.AdamW, and runs a short training loop with both.
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\optim8bit.py --quick
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\optim8bit.py
++"""
++
++import argparse
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from zluda_ops.optim8bit import AdamW8bit
++from bench.common import bench_median, save_report
++
++
++def step_case(num_params, device="cuda"):
++    torch.manual_seed(0)
++    p = torch.nn.Parameter(torch.randn(num_params, device=device) * 0.1)
++    grads = [torch.randn(num_params, device=device) * 0.01 for _ in range(4)]
++    p_t = torch.nn.Parameter(p.detach().clone())
++    opt_t = torch.optim.AdamW([p_t], lr=1e-3)
++    opt_8 = AdamW8bit([p], lr=1e-3)
++    idx = [0]
++
++    def torch_step():
++        p_t.grad = grads[idx[0] % len(grads)]
++        idx[0] += 1
++        opt_t.step()
++        opt_t.zero_grad()
++
++    def bit_step():
++        p.grad = grads[idx[0] % len(grads)]
++        idx[0] += 1
++        opt_8.step()
++
++    torch_step()
++    bit_step()
++    tm = bench_median(torch_step, rounds=3, iters=10)
++    bm = bench_median(bit_step, rounds=3, iters=10)
++    mem8 = opt_8.state_memory_bytes()
++    mem32 = opt_8.fp32_state_memory_bytes()
++    print(f"step {num_params} fp32 params: torch {tm:.3f} ms | 8-bit {bm:.3f} ms "
++          f"({tm / bm:.2f}x) | state mem {mem8 / 1e6:.2f} MB vs fp32 {mem32 / 1e6:.2f} MB "
++          f"({mem32 / mem8:.2f}x less)", flush=True)
++    return {"num_params": num_params, "torch_step_ms": tm, "bit_step_ms": bm,
++            "speedup": tm / bm, "state_mem_bytes": mem8,
++            "fp32_state_mem_bytes": mem32, "memory_ratio": mem32 / mem8}
++
++
++def parity_case(num_params=262144, steps=8, device="cuda"):
++    torch.manual_seed(0)
++    p0 = torch.randn(num_params, device=device) * 0.1
++    grads = [torch.randn(num_params, device=device) * 0.01 for _ in range(steps)]
++    p_t = torch.nn.Parameter(p0.clone())
++    p_b = torch.nn.Parameter(p0.clone())
++    opt_t = torch.optim.AdamW([p_t], lr=1e-3, weight_decay=0.01)
++    opt_b = AdamW8bit([p_b], lr=1e-3, weight_decay=0.01)
++    for g in grads:
++        p_t.grad = g.clone()
++        opt_t.step()
++        opt_t.zero_grad()
++        p_b.grad = g.clone()
++        opt_b.step()
++    diff = (p_t.detach() - p_b.detach()).abs()
++    rel = (diff.norm() / p_t.detach().norm()).item()
++    print(f"parity after {steps} steps: max abs {diff.max().item():.3e}, "
++          f"rel {rel:.2e}", flush=True)
++    return {"steps": steps, "max_abs_diff": diff.max().item(), "rel_diff": rel}
++
++
++def train_case(steps=20, device="cuda"):
++    torch.manual_seed(0)
++    x = torch.randn(256, 512, device=device)
++    y = torch.randn(256, 128, device=device)
++
++    def make():
++        model = torch.nn.Sequential(
++            torch.nn.Linear(512, 512), torch.nn.SiLU(),
++            torch.nn.Linear(512, 128),
++        ).to(device)
++        return model
++
++    def train(use_8bit):
++        model = make()
++        opt = (AdamW8bit(model.parameters(), lr=1e-3) if use_8bit
++               else torch.optim.AdamW(model.parameters(), lr=1e-3))
++        losses = []
++        t0 = time.perf_counter()
++        for _ in range(steps):
++            opt.zero_grad()
++            out = model(x)
++            loss = torch.nn.functional.mse_loss(out, y)
++            loss.backward()
++            opt.step()
++            losses.append(float(loss))
++        torch.cuda.synchronize()
++        return losses, (time.perf_counter() - t0) / steps * 1000
++
++    l32, ms32 = train(False)
++    l8, ms8 = train(True)
++    print(f"training {steps} steps: fp32 AdamW {ms32:.2f} ms/step, "
++          f"8-bit {ms8:.2f} ms/step ({ms32 / ms8:.2f}x) | final loss "
++          f"{l32[-1]:.4f} vs {l8[-1]:.4f}", flush=True)
++    return {"steps": steps, "fp32_ms_per_step": ms32, "bit_ms_per_step": ms8,
++            "speedup": ms32 / ms8, "final_loss_fp32": l32[-1],
++            "final_loss_8bit": l8[-1], "loss_curve_fp32": l32, "loss_curve_8bit": l8}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--quick", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    args = parser.parse_args()
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    print(f"VRAM fraction {args.vram_fraction}", flush=True)
++    num = 1024 * 1024 if args.quick else 4 * 1024 * 1024
++    report = {
++        "step": step_case(num),
++        "parity": parity_case(),
++        "train": train_case(steps=8 if args.quick else 20),
++    }
++    save_report("optim8bit", report)
++    print("done", flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/quant.py b/bench/quant.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..dba4a3698ee0c636aecbb1efbc707e9d9c3329e8
@@ -13078,6 +13699,144 @@ index 0000000000000000000000000000000000000000..dfc22e22129ff9afe19212172aa216f7
 +
 +
 +__all__ = ["install", "uninstall", "installed"]
+diff --git a/zluda_ops/optim8bit.py b/zluda_ops/optim8bit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5faed3f134a9c02463acf7ad3579e16b3186455c
+--- /dev/null
++++ b/zluda_ops/optim8bit.py
+@@ -0,0 +1,132 @@
++"""8-bit AdamW optimizer (bitsandbytes-style) implemented with Triton.
++
++bitsandbytes' prebuilt CUDA kernels cannot run through ZLUDA on gfx1010
++(`named symbol not found` in its nvcc-compiled ops), so this module provides an
++8-bit optimizer with the same idea: the first and second moment estimates are
++stored as int8 per block with an fp32 absmax scale per block, while parameters
++and gradients stay fp32. That cuts optimizer-state memory from 8 bytes to
++~2.03 bytes per parameter (int8 + int8 + 2 fp32 scales per block of 256).
++
++Usage:
++    opt = AdamW8bit(model.parameters(), lr=1e-4, weight_decay=0.01)
++    loss.backward()
++    opt.step()          # torch-style
++    opt.zero_grad()
++
++Supported: fp32 CUDA (ZLUDA) parameters. The bit-exactness of the fp32 AdamW
++trajectory is not preserved (states are quantized), as in bitsandbytes.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++BLOCK = 256
++
++
++@triton.jit
++def _adamw8bit_kernel(P, G, MQ, VQ, MABS, VABS, N, lr, b1, b2, bc1, bc2, eps,
++                      WD, BLOCK: tl.constexpr, HAS_WD: tl.constexpr):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < N
++    p = tl.load(P + offs, mask=mask, other=0.0).to(tl.float32)
++    g = tl.load(G + offs, mask=mask, other=0.0).to(tl.float32)
++    mq = tl.load(MQ + offs, mask=mask, other=0).to(tl.int32)
++    vq = tl.load(VQ + offs, mask=mask, other=0).to(tl.int32)
++    mabs = tl.load(MABS + pid)
++    vabs = tl.load(VABS + pid)
++    # dequantize states to fp32
++    m = mq.to(tl.float32) * (mabs / 127.0)
++    v = vq.to(tl.float32) * (vabs / 127.0)
++    # AdamW update in fp32
++    m = m * b1 + g * (1.0 - b1)
++    v = v * b2 + g * g * (1.0 - b2)
++    mhat = m / bc1
++    vhat = v / bc2
++    if HAS_WD:
++        p = p - lr * (mhat / (tl.sqrt(vhat) + eps) + WD * p)
++    else:
++        p = p - lr * (mhat / (tl.sqrt(vhat) + eps))
++    # requantize states to int8 with a per-block absmax
++    m_amax = tl.max(tl.abs(m))
++    v_amax = tl.max(tl.abs(v))
++    m_amax = tl.maximum(m_amax, 1e-12)
++    v_amax = tl.maximum(v_amax, 1e-12)
++    mq_new = tl.maximum(tl.minimum(tl.round(m / m_amax * 127.0), 127.0), -127.0)
++    vq_new = tl.maximum(tl.minimum(tl.round(v / v_amax * 127.0), 127.0), -127.0)
++    tl.store(P + offs, p.to(P.dtype.element_ty), mask=mask)
++    tl.store(MQ + offs, mq_new.to(tl.int8), mask=mask)
++    tl.store(VQ + offs, vq_new.to(tl.int8), mask=mask)
++    tl.store(MABS + pid, m_amax)
++    tl.store(VABS + pid, v_amax)
++
++
++class AdamW8bit:
++    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
++                 weight_decay=0.01):
++        self.params = [p for p in params if p.requires_grad]
++        self.lr = lr
++        self.beta1, self.beta2 = betas
++        self.eps = eps
++        self.weight_decay = weight_decay
++        self.step_num = 0
++        self.state = {}
++        self._total_elems = 0
++        for p in self.params:
++            data = p.data if p.data.is_cuda else p
++            flat = data.reshape(-1)
++            if flat.dtype != torch.float32 or not flat.is_cuda or not flat.is_contiguous():
++                raise NotImplementedError("AdamW8bit supports contiguous fp32 CUDA parameters")
++            n = flat.numel()
++            nblocks = (n + BLOCK - 1) // BLOCK
++            self.state[id(p)] = {
++                "mq": torch.zeros(n, device=flat.device, dtype=torch.int8),
++                "vq": torch.zeros(n, device=flat.device, dtype=torch.int8),
++                "mabs": torch.zeros(nblocks, device=flat.device, dtype=torch.float32),
++                "vabs": torch.zeros(nblocks, device=flat.device, dtype=torch.float32),
++            }
++            self._total_elems += n
++
++    @torch.no_grad()
++    def step(self, closure=None):
++        self.step_num += 1
++        bc1 = 1.0 - self.beta1 ** self.step_num
++        bc2 = 1.0 - self.beta2 ** self.step_num
++        for p in self.params:
++            if p.grad is None:
++                continue
++            g = p.grad
++            if g.dtype != torch.float32:
++                g = g.float()
++            if not g.is_contiguous():
++                g = g.contiguous()
++            flat_p = p.data.reshape(-1)
++            flat_g = g.reshape(-1)
++            st = self.state[id(p)]
++            n = flat_p.numel()
++            _adamw8bit_kernel[(triton.cdiv(n, BLOCK),)](
++                flat_p, flat_g, st["mq"], st["vq"], st["mabs"], st["vabs"], n,
++                float(self.lr), float(self.beta1), float(self.beta2),
++                float(bc1), float(bc2), float(self.eps), float(self.weight_decay),
++                BLOCK=BLOCK, HAS_WD=self.weight_decay > 0.0, num_warps=4,
++            )
++
++    def zero_grad(self, set_to_none=True):
++        for p in self.params:
++            if p.grad is not None:
++                if set_to_none:
++                    p.grad = None
++                else:
++                    p.grad.zero_()
++
++    def state_memory_bytes(self):
++        return sum(st["mq"].numel() + st["vq"].numel()
++                   + st["mabs"].numel() * 4 + st["vabs"].numel() * 4
++                   for st in self.state.values())
++
++    def fp32_state_memory_bytes(self):
++        return self._total_elems * 8
++
++
++__all__ = ["AdamW8bit"]
 diff --git a/zluda_ops/quant.py b/zluda_ops/quant.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..a8f7f57a3c001e84b432123fde4a571455bc2dd0
