@@ -2058,10 +2058,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..bfa46bdd730fb08c3c6d3228bda45abcd3e18fb6
+index 0000000000000000000000000000000000000000..5ca50337ed11d7acbc9ff077bf2b2a3f6024c214
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,427 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2312,6 +2312,18 @@ index 0000000000000000000000000000000000000000..bfa46bdd730fb08c3c6d3228bda45abc
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - llama.cpp under ZLUDA (patch attempt):** ZLUDA's
++  `launch_kernel_ex` rejected PDL launch attributes; patched
++  `zluda/src/impl/driver.rs` to accept launch-time attributes (serialized
++  execution is semantically correct) and rebuilt `nvcuda.dll`. llama.cpp (b12721,
++  CUDA 12.4) then loads under ZLUDA and sees the GPU; `-ngl 0` works through the
++  CUDA backend (pp16 124 tok/s, tg2 17.4), but `-ngl >= 1` hangs with every
++  workaround (graphs off, no pinned memory, no fusion, force-MMQ, PDL off) and
++  the pre-PDL build b9802 errors in `ggml-cuda.cu`. Blocker is now ZLUDA's
++  execution/JIT of llama.cpp's CUDA kernels (async-copy pipeline / cp.async),
++  not the launch API - requires extending the ptx/llvm_zluda support. Same-engine
++  Vulkan-vs-ZLUDA comparison stays blocked; the cross-engine table in
++  ENGINE_COMPARISON.md is labelled accordingly.
 +- **2026-11-25 - engine comparison, final pass:** Vulkan (Ollama, 100% GPU)
 +  Q4_K_M: 4531/2741/946 tok/s prefill and 150.8/135.2/104.8 tok/s decode at
 +  2k/8k/32k; F16 clamped to 8192 context by Ollama on 8 GB. ZLUDA/PyTorch fp16:
@@ -5006,6 +5018,62 @@ index 0000000000000000000000000000000000000000..8641d0b3d336d4f4b9a9ea5f5aa76f72
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/bench/llamacpp_zluda_matrix.ps1 b/bench/llamacpp_zluda_matrix.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..13cd57d977095b32bf239e1a98ff76e38984a73a
+--- /dev/null
++++ b/bench/llamacpp_zluda_matrix.ps1
+@@ -0,0 +1,50 @@
++# Run llama.cpp (same engine as Ollama) on the ZLUDA GPU and compare with the
++# Ollama Vulkan numbers. Requires the patched ZLUDA (cudaLaunchKernelEx/PDL) and
++# the CUDA llama.cpp build in tools/llamacpp-cuda (gitignored).
++#
++# Usage:
++#   powershell -File bench/llamacpp_zluda_matrix.ps1
++#   powershell -File bench/llamacpp_zluda_matrix.ps1 -Ctx 2048,8192 -Models q4
++param(
++    [string]$Ctx = "2048,8192,16384,32768",
++    [string]$Models = "q4,f16",
++    [int]$Predict = 32,
++    [string]$Fa = "1,0",
++    [int]$Reps = 3
++)
++
++$ErrorActionPreference = "Continue"
++$repo = "G:\zluda"
++$exe = Join-Path $repo "tools\llamacpp-cuda\build\llama-bench.exe"
++$cudart = Join-Path $repo "tools\llamacpp-cuda\cudart"
++$gguf = Join-Path $repo "models\qwen05-gguf"
++$modelFiles = @{
++    q4  = Join-Path $gguf "qwen2.5-0.5b-instruct-q4_k_m.gguf"
++    f16 = Join-Path $gguf "qwen2.5-0.5b-instruct-fp16.gguf"
++}
++$outDir = Join-Path $repo "bench\results"
++New-Item -ItemType Directory -Force $outDir | Out-Null
++
++$env:PATH = "$(Split-Path $exe);$cudart;$env:PATH"
++$env:GGML_CUDA_DISABLE_GRAPHS = "1"
++
++$rows = @()
++foreach ($faVal in ($Fa -split ",")) {
++    foreach ($which in ($Models -split ",")) {
++        $model = $modelFiles[$which]
++        if (-not (Test-Path $model)) { Write-Host "missing model $model"; continue }
++        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
++        $jsonOut = Join-Path $outDir "llamacpp_zluda_${which}_fa${faVal}-${stamp}.json"
++        $args = @("-m", $model, "-p", $Ctx, "-n", "$Predict", "-ngl", "99",
++                  "-fa", $faVal, "-r", "$Reps", "-o", "json")
++        Write-Host "=== llama.cpp/ZLUDA model=$which fa=$faVal ctx=$Ctx ==="
++        $sw = [System.Diagnostics.Stopwatch]::StartNew()
++        & (Join-Path $repo "run-zluda.cmd") $exe @args *> $jsonOut
++        $code = $LASTEXITCODE
++        Write-Host ("exit=$code wall=$([math]::Round($sw.Elapsed.TotalMinutes,1))min -> $jsonOut")
++        $rows += [pscustomobject]@{model = $which; fa = $faVal; exit = $code; file = $jsonOut}
++    }
++}
++$manifest = Join-Path $outDir ("llamacpp_zluda_manifest-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".json")
++$rows | ConvertTo-Json -Depth 3 | Set-Content -Path $manifest -Encoding utf8
++Write-Host "manifest: $manifest"
 diff --git a/bench/math_attn_fb.py b/bench/math_attn_fb.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..38066719d338393ad4d5cdd9d110d1032b38f823
@@ -11241,6 +11309,38 @@ index 0000000000000000000000000000000000000000..1bca6ba241284f5c32cd206618135ee5
 +
 +sys.argv = [str(script)] + sys.argv[2:]
 +runpy.run_path(str(script), run_name="__main__")
+diff --git a/zluda/src/impl/driver.rs b/zluda/src/impl/driver.rs
+index d4342e7168a84dcd0329a6073d83163644a56df2..c489cba3f57bdff25ae9b0e07d3f763e4f5157ce 100644
+--- a/zluda/src/impl/driver.rs
++++ b/zluda/src/impl/driver.rs
+@@ -732,12 +732,21 @@ pub(crate) unsafe fn launch_kernel_ex(
+     kernel_params: *mut *mut ::core::ffi::c_void,
+     extra: *mut *mut ::core::ffi::c_void,
+ ) -> CUresult {
+-    let attrs = std::slice::from_raw_parts(config.attrs, config.numAttrs as usize);
+-    if attrs.iter().any(|&attr| {
+-        !(attr.id == CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+-            && attr.value.programmaticStreamSerializationAllowed == 0)
+-    }) {
+-        return CUresult::ERROR_NOT_SUPPORTED;
++    // Launch-time attributes are hints. ZLUDA does not implement programmatic
++    // dependent launch (PDL) or the other optional attributes, but launching
++    // the kernels serialized is semantically correct, so accept them instead
++    // of returning ERROR_NOT_SUPPORTED (this is what lets llama.cpp's CUDA
++    // backend run under ZLUDA).
++    let attrs: &[cuda_types::cuda::CUlaunchAttribute] = if config.attrs.is_null() {
++        &[]
++    } else {
++        std::slice::from_raw_parts(config.attrs, config.numAttrs as usize)
++    };
++    for attr in attrs {
++        match attr.id {
++            CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION => {}
++            _ => eprintln!("zluda: ignoring unsupported launch attribute {:?}", attr.id),
++        }
+     }
+     function::launch_kernel(
+         f,
 diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
 index d3a895b0dc474b2c8765b450a0aa9b6e121f3411..b6e05e9a351a70d180907b5a643d3038c767522a 100644
 --- a/zluda/src/impl/module.rs
