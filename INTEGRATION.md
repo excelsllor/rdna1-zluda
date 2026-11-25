@@ -5,7 +5,9 @@
 - `torch.nn.functional.linear` → Triton GEMV for inference with M<=8, and
   bf16→fp32 emulation for small/medium bf16 weights.
 - `torch.nn.functional.scaled_dot_product_attention` → causal Triton flash
-  attention when the shape is supported.
+  attention when the shape is supported, and decode-shaped calls
+  (M<=16 query tokens, KV>=512, fp16, no mask/dropout/grad) to flash-decoding
+  (split-KV).
 
 Everything else falls back to the original PyTorch function. The patch is
 Python-level; code that caches `F.linear`/SDPA before installation, or runs

@@ -34,7 +34,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 | **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **CLOSED** | decode (LLM inference) | medium | M16 176 GB/s (39%), M32 83 (19%); target 70-80% unreachable with split-K/tl.dot/packed-fp16 (all measured worse); rocBLAS fp32 M=32 fallback kept |
 | **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **DONE** | training + inference | medium | masks/dropout/window in Triton; varlen uses per-sequence Triton (fused packed kernel open) |
-| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
+| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **DONE** | 3.2–4.5x decode vs math at 1k–4k, rel err <5e-4 | medium | `zluda_ops/flash_decode.py` + auto dispatch |
 | **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
 | **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 | **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
@@ -58,7 +58,7 @@ Status keys: **DONE**, **PARTIAL**, **OPEN**, **BLOCKED**, **REJECTED**, and **A
 |---|---|---|
 | 0 — Foundation | **PARTIAL** | roofline/regression done; clocks/power blocked |
 | 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
-| 2 — Attention | **PARTIAL** | causal/non-causal/GQA done; masks/dropout/window/varlen fallback; flash-decoding open |
+| 2 — Attention | **PARTIAL** | masks/dropout/window in Triton, varlen per-sequence, flash-decoding done; fused decode/backward integration open |
 | 3 — Quantization | **OPEN** | storage path not implemented; no int8 compute |
 | 4 — Fused kernels | **OPEN** | not started |
 | 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
@@ -220,6 +220,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   kernels with the Philox mask regenerated from (head, query, key) offsets;
   unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
   s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
+- **2026-11-25 - P1-2 (flash-decoding):** `zluda_ops/flash_decode.py`
+  splits the KV cache into up to 16 chunks per (batch, head), computes partial
+  (acc, m, l) and merges with the standard log-sum-exp formula. Decode shapes
+  (B1 H8 D64 fp16, M=1/4/8) match the float32 reference within 4.6e-4 relative;
+  speed vs math SDPA: 3.39x/3.33x/3.55x at N=1k/2k/4k for M=1, 4.50x for
+  M=8 causal at 4k, 1.86x at 2k. `zluda_ops.auto` now routes
+  `F.scaled_dot_product_attention` decode calls (M≤16, KV≥512, no grad/mask/
+  dropout) to flash-decoding (1.33x through the Python patch, 3.35x raw kernel).
 - **2026-11-25 - P1-1 (conv audit):** `bench/conv.py` measures ResNet/SD 3x3
   convolutions. MIOpen logs prove the selected solver is `GemmFwdRest`
   (`miopenConvolutionFwdAlgoGEMM`, find 0.1052 ms): 3x3 is lowered to a rocBLAS
@@ -271,7 +279,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | FA dropout | **DONE** | inverted dropout in Triton fwd+bwd, unbiased (z<1), deterministic per seed, fwd+bwd errors unchanged; causal 1024 1.90x math |
 | FA window | **DONE** | arithmetic sliding window in fwd+bwd, block-range skipping, no dense mask; fwd/grad err ≤2e-3; s=1024 window(128,0) 0.26 ms vs 1.87 ms math (7.1x) |
 | FA varlen | **DONE (per-sequence)** | packed q/k/v + `cu_seqlens` dispatch, Triton per sequence without dense masks (window/grad err ≤4e-3); a fused packed varlen kernel remains open |
-| Flash-decoding | **OPEN** | |
+| Flash-decoding | **DONE** | split-KV + LSE merge; 3.35x (M=1) / 4.50x (M=8 causal) decode at 4k vs math, rel err ≤4.6e-4; auto-dispatched from SDPA |
 | bf16 native / emulation | **DONE (emulation)** | 4.42 native / 7.92 emulated TF |
 | GPU monitoring | **PARTIAL** | utilization/VRAM via Windows PDH; measurement protocol enforced in every report; ADL live clocks return NOT_SUPPORTED (-8), documented blocker |
 | int8 compute | **IMPOSSIBLE** | storage/dequant only |
@@ -287,7 +295,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | 4 | GEMV M=16/32 tuning | P0 | **CLOSED 2026-11-25**: M16 176 GB/s (+13% via fp32-product config), M32 83; split-K/tl.dot (64-81) and packed-fp16 (31-50) measured worse; target 70-80% recorded as unreachable, rocBLAS fp32 M=32 kept as fallback |
 | 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
 | 6 | Clock/power monitoring | P0 | **DONE 2026-11-25**: protocol (random data, shuffled rounds, median) enforced in `bench/common.save_report`; utilization/VRAM via Windows PDH; sclk/mclk/temp are a documented blocker (`bench/gpu_clocks.py`: ADL adapters enumerate but OverdriveN/6/5 return ADL_ERR_NOT_SUPPORTED = -8) |
-| 7 | Flash-decoding split-KV | P1 | >=1.5x decode at 4k |
+| 7 | Flash-decoding split-KV | P1 | **CLOSED 2026-11-25**: 3.35x (M=1) and 4.50x (M=8 causal) at 4k vs math, rel err ≤4.6e-4; auto-dispatches SDPA decode via `zluda_ops.auto` |
 | 8 | Full 8-layer `torch.compile` | Deferred | only if compile time becomes acceptable |
 
 ## Definition of done (metrics)
