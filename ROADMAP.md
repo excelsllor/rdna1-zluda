@@ -60,7 +60,7 @@ Status keys: **DONE**, **PARTIAL**, **OPEN**, **BLOCKED**, **REJECTED**, and **A
 | 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
 | 2 — Attention | **PARTIAL** | masks/dropout/window in Triton, varlen per-sequence, flash-decoding done; fused decode/backward integration open |
 | 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (`zluda_ops/quant.py`); exact GPTQ/AWQ loading and prefill GEMM open; no int8 compute |
-| 4 — Fused kernels | **PARTIAL** | Triton RMSNorm/RoPE/SwiGLU/softmax implemented and faster (`zluda_ops/fused.py`); chunked CE is memory-only (slower); LayerNorm/GeGLU/AdamW/sampling open |
+| 4 — Fused kernels | **PARTIAL** | Triton RMSNorm/RoPE/SwiGLU/GeGLU/softmax/AdamW implemented and faster (`zluda_ops/fused.py`); LayerNorm fwd-only win (training slower); chunked CE memory-only; sampling open |
 | 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 | 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
 | 7 — Compiler/LLVM/Triton | **OPEN** | WGP/CU and autotune not started |
@@ -248,6 +248,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - fused kernels extension:** added exact-erf GeGLU fwd+bwd,
+  LayerNorm fwd+bwd and an in-place fused AdamW to `zluda_ops/fused.py`. Clean
+  measurements: RMSNorm 9.4x fwd / 2.95x fwd+bwd, softmax 2.3x, RoPE 10.9x/8.3x,
+  SwiGLU 1.5x, GeGLU 1.54x/1.49x, AdamW **3.4x** (param diff 3e-8), LayerNorm
+  forward 1.19x but training 0.53x (torch native LayerNorm wins because of the
+  atomic gradients), chunked CE memory -28% but slower. GPU benchmarks were
+  re-run in a verified idle window after a concurrent external job wedged the
+  driver; results in RESULTS_RDNA1.md.
 - **2026-11-25 - MIOpen find-db/solver:** no system find-db for gfx1010 is
   shipped, but the user find-db (`~/.miopen`) is populated automatically and used
   (~4.5 ms per new shape). The ~1.2 s first-convolution cost is process
