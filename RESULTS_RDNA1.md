@@ -790,3 +790,35 @@ Notes:
   from a verified idle-GPU window. During this session a concurrent external
   benchmark had to be stopped and the GPU/driver recovered before the final
   measurement — benchmarks must not share the GPU with other jobs.
+
+## P1-3 extension: prefill dequant-GEMM and tile decision (2026-11-25)
+
+`quant.int4_matmul` adds a fused int4-dequant GEMM (nibbles unpacked and scaled
+inside each `tl.dot` tile, weights never materialised as fp16) for prefill
+(M=32..256). `quant.int4_prefill_linear` is the dequantize-once reference path.
+Measured at N=K=4096 fp16, VRAM 85% (warmed, shuffled rounds):
+
+| M | fused int4 GEMM | dequant-once + GEMM | fp16 weights (roofline) | fused vs dequant | fused vs fp16 |
+|---|---|---|---|---|---|
+| 32 | 0.614 ms | 2.667 ms | 0.445 ms | **4.3x** | 0.72x |
+| 64 | 0.616 ms | 2.846 ms | 0.618 ms | **4.6x** | 1.00x |
+| 128 | 1.161 ms | 3.070 ms | 0.873 ms | **2.6x** | 0.75x |
+| 256 | 2.059 ms | 3.788 ms | 1.563 ms | **1.8x** | 0.76x |
+| M=1 (decode) | fused GEMV 0.069 ms | 2.525 ms | 0.312 ms | **37x** | **4.6x** |
+
+Errors vs the float32 reference are 2-4e-4. Conclusions:
+
+- **Decode** stays on the fused int4 GEMV: 4.6x faster than fp16 weights and
+  37x faster than dequantize-per-call.
+- **Prefill**: fused int4 GEMM is the best option when the weights must stay
+  int4 (4x less VRAM): it is at parity with cached fp16 weights at M=64 and
+  25-30% slower at M=128-256 (the dequant ALU cost is no longer hidden).
+  Dequantizing per call into fp16 and then GEMM is 1.8-4.6x slower and is only
+  a reference. Serving a model with a fp16 weight cache is faster but loses the
+  int4 memory saving — the trade-off is now measured.
+- **Tiled multi-row int4 GEMV** (measured in the P1-3 ablation) was ~6% faster
+  than the tuned kernel in one process, which is inside the run-to-run variance
+  (±15-30% because GPU clocks cannot be fixed), so it is **not adopted**; the
+  simpler M=1 kernel is kept.
+
+`bench/quant_prefill.py` reproduces the table.

@@ -287,6 +287,7 @@ run-zluda.cmd venv\Scripts\python.exe bench\conv_fp16.py --quick
 run-zluda.cmd venv\Scripts\python.exe bench\miopen_db.py
 run-zluda.cmd venv\Scripts\python.exe bench\flash_decode.py --quick
 run-zluda.cmd venv\Scripts\python.exe bench\quant.py --quick
+run-zluda.cmd venv\Scripts\python.exe bench\quant_prefill.py --quick
 run-zluda.cmd venv\Scripts\python.exe bench\fused.py --quick
 ```
 
