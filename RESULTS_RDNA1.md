@@ -633,3 +633,37 @@ paired x loads) took M=8 from 0.84 ms to 0.20 ms. Next steps: tiled/split-K int4
 GEMV, exact GPTQ/AWQ loading, and the prefill dequant-GEMM.
 
 `bench/quant.py` reproduces the error, correctness and speed tables.
+
+## P1-5 Fused transformer kernels (2026-11-25)
+
+`zluda_ops/fused.py` implements Triton kernels for the pointwise/rowwise ops
+that TorchInductor does not fuse well on RDNA1:
+
+* RMSNorm fwd+bwd (one-pass row kernel; weight gradient via atomic add);
+* LLaMA-style rotate-half RoPE fwd+bwd;
+* fused SiLU(gate)*up (SwiGLU) fwd+bwd;
+* row softmax;
+* chunked cross-entropy that never materialises the full (N, V) log-softmax.
+
+Measured against torch eager on RDNA1 (fp16, VRAM 85%):
+
+| op | shape | fused | torch eager | speedup |
+|---|---|---|---|---|
+| RMSNorm fwd | 8192x4096 | 0.52 ms | 4.29 ms | **8.2x** |
+| RMSNorm fwd+bwd | 8192x4096 | 7.25 ms | 44.4 ms | **6.1x** |
+| softmax | 8192x4096 | 1.27 ms | 23.5 ms | **18.5x** |
+| RoPE fwd | 1x32x2048x128 | 0.30 ms | 1.54 ms | **5.1x** |
+| RoPE fwd+bwd | 1x32x2048x128 | 0.47 ms | 4.13 ms | **8.8x** |
+| SwiGLU fwd | 8192x2048 | 0.54 ms | 0.66 ms | **1.2x** |
+| SwiGLU fwd+bwd | 8192x2048 | 1.11 ms | 1.71 ms | **1.5x** |
+| chunked CE | 4096x16384 | 38 ms / 736 MB | 16.5 ms / 1024 MB | 0.4x (memory **-28%**) |
+
+Numerical errors are at the fp16 accumulation level (RMSNorm 7.8e-3 forward on
+unit-scale rows; gradients agree with torch within fp16 tolerance). The torch
+baselines for RMSNorm/softmax are unfused fp32-upcast paths, which is exactly
+the gap these kernels target; TorchInductor (`torch.compile`) was not used as a
+baseline here because full-model compile is skipped on this stack (~30 min even
+on an NVIDIA T4). Chunked CE is kept as a memory-only option: it saves 28% peak
+memory at 4096x16384 but is slower than torch's fused CE.
+
+LayerNorm, GeGLU, fused AdamW/clip and GPU sampling remain open (see ROADMAP).
