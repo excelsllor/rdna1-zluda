@@ -194,3 +194,13 @@ require a reboot**. The cause is ZLUDA's execution/JIT of llama.cpp's CUDA
 kernel set, not the launch API; a same-engine Vulkan-vs-ZLUDA comparison stays
 blocked. Details and the ready matrix runner: ENGINE_COMPARISON.md and
 bench/llamacpp_zluda_matrix.ps1.
+
+### llama.cpp on ZLUDA: now works (F16, no flash attention)
+
+A local llama.cpp build with compute_86 PTX (`86-virtual`, CUDA 12.4.1 portable
+toolchain, VS 2022) runs under ZLUDA with full GPU offload (`-ngl 99`).
+Same-engine Vulkan-vs-ZLUDA numbers (Qwen2.5-0.5B F16, FA=0): ZLUDA 6144/3294
+tok/s prefill at 2k/8k and 184 tok/s decode vs Vulkan 6258/4179 and 212/173.
+llama.cpp FA (`mma.sync`) and Q4_K_M (MMQ) kernels are still unsupported by
+ZLUDA on RDNA1. See docs/LLAMACPP_VULKAN_VS_ZLUDA.md and
+docs/LLAMACPP_ZLUDA_BUILD.md; run risky tests through tools/gpu_watchdog.ps1.
