@@ -16,14 +16,12 @@ significant.
 | fp16 + fp16-accum | **7450** | **51.0** | 1123 | 3099 (*) | 19.9 (*) | 1146 |
 | fp32 | **5418** | **35.5** | 2073 | 1177 | 16.5 | 2096 |
 | bf16 native | **3450** | **11.1** | 1123 | 2845 | 10.6 | 1146 |
-| bf16 emulated (bf16 weights -> fp32 compute) | crash (**) | crash | - | 3812 | 26.0 | 2096 |
+| bf16 emulated (bf16 weights -> fp32 compute) | **5488** | **29.6** | 2073 | 3812 | 26.0 | 2096 |
 
 (*) The ROCm build ignores `torch._C._set_cublas_allow_fp16_accumulation`; fp16
 accumulation is a cuBLAS/HPA concept, so ROCm has no equivalent switch and Vulkan
 has no such concept at all (llama.cpp computes in the model tensor type).
-(**) ZLUDA bf16-emul process died without producing a report (most likely VRAM:
-an fp32 copy on top of the bf16 model), so it is not measured.
-
+The ZLUDA bf16-emul number is now measured too (5488 tok/s prefill, 29.6 decode,\r\n2073 MB) using in-place parameter conversion; the earlier "crash" was a harness\r\ninvocation without the ZLUDA launcher, not a GPU problem.\r\n
 ROCm bf16-emul is 1.34x faster than native bf16 on ROCm because it routes the
 GEMMs through the faster fp32 path; on ZLUDA the same trick needs more VRAM than
 the 85% cap allows on this 8 GB card.
