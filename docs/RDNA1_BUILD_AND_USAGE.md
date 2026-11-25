@@ -279,6 +279,8 @@ run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
 run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
 venv\Scripts\python.exe bench\gpu_clocks.py --seconds 3
 run-zluda.cmd venv\Scripts\python.exe bench\fa_mask.py --s 512 --bench
+run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench
+run-zluda.cmd venv\Scripts\python.exe bench\fa_window.py --s 512 --bench
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -352,4 +354,3 @@ roll back. It only matches when PyTorch fp16 accumulation is explicitly
 enabled (`torch._C._set_cublas_allow_fp16_accumulation(True)`); HPA/SS lines
 are intentionally not included. Use random data for measurements: zeros,
 ones and uninitialized buffers are not representative.
-run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench

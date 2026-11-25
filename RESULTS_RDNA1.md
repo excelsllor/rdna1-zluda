@@ -481,3 +481,28 @@ saved seed and per-(head, query, key) offsets, so no dropout mask is stored.
 | determinism | same seed identical, different seed differs |
 | gradients | finite, mean abs comparable to no-dropout |
 | s=1024 causal, p=0.1 | **1.04 ms vs 1.97 ms math = 1.90x** |
+
+## P0-3 Triton sliding window and varlen (2026-11-25)
+
+The sliding window is now arithmetic inside the Triton fwd+bwd kernels: block
+iteration starts at `max(0, block_start - left)` aligned down to BLOCK_N and
+skips blocks beyond the right bound; per-element window bounds are applied
+without allocating a dense mask. A dense-mask fallback remains only for
+unsupported shapes.
+
+| case (s=512, B1 H8 D64 fp16) | fwd err | grad err |
+|---|---|---|
+| causal window (32,0) | 2.0e-3 | 2.0e-3 |
+| causal window (64,0) | 2.0e-3 | 2.9e-3 |
+| non-causal window (16,16) | 1.0e-3 | 2.0e-3 |
+| non-causal window (64,32) | 4.9e-4 | 1.1e-3 |
+| varlen [128,256,384] causal window (64,0) | 1.0e-3 | 3.9e-3 |
+
+Speed (s=1024): window (128,0) causal **0.26 ms vs 1.87 ms** math with dense
+mask (7.1x); non-causal window (64,0) 0.26 vs 1.85 ms (7.15x).
+
+`flash_attn_varlen_func` now dispatches per sequence through the Triton kernel
+without dense masks; a fused packed-varlen kernel is still open. The backward
+preprocess kernel assumes a contiguous (B,H,N,D) layout, so the Triton path now
+makes inputs contiguous (a no-op for normal calls) — this also fixes varlen
+gradients through transposed views.
