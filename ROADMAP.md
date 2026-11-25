@@ -248,6 +248,11 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - bf16 emulation works on ZLUDA:** with in-place parameter
+  conversion (bf16 storage -> fp32 compute) the ZLUDA process runs bf16-emul at
+  **5488 tok/s prefill / 29.6 tok/s decode / 2073 MB**, beating both native ZLUDA
+  bf16 (3450/11.1) and ROCm bf16-emul (3812/26.0). The earlier "crash" was a
+  harness invocation without the ZLUDA launcher, not a GPU/VRAM issue.
 - **2026-11-25 - graph-replayed decode works (zLUDA):** found and fixed the
   decode GEMV dispatch bug in `zluda_ops.auto` (decode F.linear gets (1,1,D)
   tensors, so the 2-D-only Triton GEMV path never triggered - 0 calls, rocBLAS

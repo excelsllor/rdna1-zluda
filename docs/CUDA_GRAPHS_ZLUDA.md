@@ -114,13 +114,7 @@ fails for two separate reasons:
    for capture-unsafe behaviour (internal sync, stream handling) so that GEMMs
    can be recorded into a graph.
 
-### bf16 emulation
-
-bf16 emulation (bf16 weights, fp32 compute) works on native ROCm torch
-(3812 tok/s prefill / 26.0 decode vs 2845/10.6 native bf16) but the ZLUDA
-process died without a report (most likely VRAM: an fp32 copy of the model on
-top of the bf16 one). Needs an in-place conversion path and a smaller-VRAM
-recipe before it can be measured there.
+### bf16 emulation\r\n\r\nbf16 emulation (bf16 weights, fp32 compute) works on both backends with in-place\r\nparameter conversion: ZLUDA 5488 tok/s prefill / 29.6 decode / 2073 MB vs\r\n3812/26.0/2096 MB on native ROCm torch (native bf16: ZLUDA 3450/11.1, ROCm\r\n2845/10.6). The earlier "crash" was a harness run without the ZLUDA launcher,\r\nnot a GPU/VRAM problem.
 
 ## Graph-replayed decode: measured result
 
