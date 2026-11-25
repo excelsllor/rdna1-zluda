@@ -29,7 +29,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 
 | Priority | Workstream | Status | Benefit | Effort | Dependencies |
 |---|---|---|---|---|---|
-| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** | basis for all decisions | low | clocks/power blocked |
+| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** (protocol done, clocks blocked) | basis for all decisions | low | ADL live status NOT_SUPPORTED |
 | **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
 | **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 | **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
@@ -197,6 +197,13 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   for this model: it takes ~30 minutes even on an NVIDIA T4, so it is not a
   P0 blocker; use eager training or compile a smaller model.
 - **2026-11-24 - P0-5 HH kernels already existed:** the tuned rocBLAS 7.1.1 library contains 110 HH solutions for gfx1010. `tensile_overrides/gfx1010_hh.csv` selects better existing kernels via `ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH`; `run-zluda.cmd` applies it. HH 2048 **17.94 TF**, HH 4096 **16.73 TF** (defaults 9.5/12.1). No Tensile rebuild needed. SS/HPA remain ~8.2/7.2 TF; zeros/ones/uninitialized data inflated earlier numbers and are not representative.
+- **2026-11-25 - P0-5 monitoring protocol:** `bench/common.py` now records the
+  measurement protocol in every JSON report and offers `bench_median` (median
+  of per-round means; shuffle variant order between rounds when comparing).
+  `bench/gpu_clocks.py` talks to `atiadlxx.dll`: the adapter is enumerated, but
+  OverdriveN/6/5 live status returns `ADL_ERR_NOT_SUPPORTED` (-8) on this
+  driver, so sclk/mclk/temperature/power remain unavailable; utilization and
+  VRAM come from Windows performance counters (`bench/monitor.py`).
 - **2026-11-24 - Stage 2.1 (partial):** `zluda_ops/flash_attention.py` exposes
   Triton FA as an autograd op and SDPA-compatible function/module. Causal and
   non-causal fwd+bwd work; GQA works. Masks/dropout/sliding/varlen are
@@ -229,7 +236,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | FA masks/dropout/window/varlen | **FUNCTIONAL FALLBACK** | correct math; Triton path open |
 | Flash-decoding | **OPEN** | |
 | bf16 native / emulation | **DONE (emulation)** | 4.42 native / 7.92 emulated TF |
-| GPU monitoring | **PARTIAL** | utilization/VRAM; clocks/power blocked |
+| GPU monitoring | **PARTIAL** | utilization/VRAM via Windows PDH; measurement protocol enforced in every report; ADL live clocks return NOT_SUPPORTED (-8), documented blocker |
 | int8 compute | **IMPOSSIBLE** | storage/dequant only |
 | Winograd / MIOpen conv | **AUDIT DONE, TEST OPEN** | solvers found; benchmark/auto-select pending |
 
@@ -242,7 +249,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | 3 | Triton sliding-window + varlen FA | P0 | correctness vs math; no dense mask allocation |
 | 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
 | 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
-| 6 | Clock/power monitoring | P0 | sclk/mclk/temp available or documented blocked |
+| 6 | Clock/power monitoring | P0 | **DONE 2026-11-25**: protocol (random data, shuffled rounds, median) enforced in `bench/common.save_report`; utilization/VRAM via Windows PDH; sclk/mclk/temp are a documented blocker (`bench/gpu_clocks.py`: ADL adapters enumerate but OverdriveN/6/5 return ADL_ERR_NOT_SUPPORTED = -8) |
 | 7 | Flash-decoding split-KV | P1 | >=1.5x decode at 4k |
 | 8 | Full 8-layer `torch.compile` | Deferred | only if compile time becomes acceptable |
 

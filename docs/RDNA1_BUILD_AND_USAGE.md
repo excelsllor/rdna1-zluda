@@ -277,6 +277,7 @@ run-zluda-auto.cmd venv\Scripts\python.exe smoke\auto_test.py
 run-zluda.cmd venv\Scripts\python.exe bench\fp16_ux.py
 run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
 run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
+venv\Scripts\python.exe bench\gpu_clocks.py --seconds 3
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -298,10 +299,13 @@ Expected reference numbers are in `RESULTS_RDNA1.md`.
   that `target\release\ptxas.exe` exists; rebuild it with
   `build-env.cmd cargo build --release -p ptxas`. Triton uses this stub to
   forward PTX to ZLUDA instead of producing NVIDIA SASS.
-- **No clocks/power telemetry**: ZLUDA NVML reports `NotSupported` and the
-  Windows ROCm 10.1 packages do not ship rocm-smi/amd-smi. Use the driver's
-  fixed performance profile for reproducible runs; utilization can still be
-  sampled with Windows GPU performance counters.
+- **No clocks/power telemetry**: ZLUDA NVML reports `NotSupported`, the Windows
+  ROCm 10.1 packages ship no rocm-smi/amd-smi, and the ADL API of the Adrenalin
+  driver returns `ADL_ERR_NOT_SUPPORTED` for its live status calls (the adapter
+  itself is visible; see `bench/gpu_clocks.py`). Utilization/VRAM are available
+  through Windows performance counters. Keep measurements comparable by using
+  the built-in protocol (random data, warmup, median of shuffled rounds — see
+  `bench/common.py`) and a fixed driver performance profile.
 - **`cudaErrorSymbolNotFound` with PyTorch**: you are using a cu128+ wheel
   (SASS only). Use `cu118`.
 - **`cublasLtMatmulAlgoGetHeuristic` / `cublasLtMatmulDescCreate` errors**:
