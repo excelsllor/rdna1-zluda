@@ -1,3 +1,6 @@
 ext/** linguist-vendored
 *.dll filter=lfs diff=lfs merge=lfs -text
 *.bc filter=lfs diff=lfs merge=lfs -text
+
+# The exported patch must stay UTF-8 with LF: git apply rejects BOM/CRLF/UTF-16.
+local-patches/*.patch text eol=lf

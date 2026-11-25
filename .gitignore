@@ -7,11 +7,13 @@ Cargo.lock
 ptx/lib/zluda_ptx_impl.ll
 ptx/lib/zluda_ptx_impl_constrained.ll
 venv/
+venv-comfy/
 hip/
 .triton_cache/
 .inductor_cache/
 .rocmlibs/
 *.log
+*.err
 
 local-patches/*.bundle
 
@@ -22,3 +24,7 @@ __pycache__/
 .triton_cache*/
 .inductor_cache*/
 .zluda_cache*/
+
+# Machine-specific experiment scripts (hardcoded local paths) and scratch data.
+smoke/local/
+/hh_*.pt
