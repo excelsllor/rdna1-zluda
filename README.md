@@ -12,6 +12,7 @@ attention with working backward.
 - **Roadmap:** [`ROADMAP.md`](ROADMAP.md)
 - **Build and usage guide:** [`docs/RDNA1_BUILD_AND_USAGE.md`](docs/RDNA1_BUILD_AND_USAGE.md)
 - **Patch against upstream v7-preview.21:** [`local-patches/zluda-rdna1-gfx1010.patch`](local-patches/zluda-rdna1-gfx1010.patch)
+  (regenerate with `tools\export_patch.ps1`, validate with `tools\check_patch.ps1`)
 
 ## At a glance (RX 5700 XT, 4096² GEMM)
 

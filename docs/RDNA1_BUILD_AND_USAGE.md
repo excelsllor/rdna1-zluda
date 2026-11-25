@@ -36,6 +36,11 @@ git clone --recursive --depth 1 --branch v7-preview.21 https://github.com/vosen/
 git apply local-patches\zluda-rdna1-gfx1010.patch
 ```
 
+The patch is the diff of `rdna1-gfx1010` against the `v7-preview.21` tag, kept
+as UTF-8/LF and never containing itself. Regenerate it after source changes with
+`tools\export_patch.ps1` and validate it with `tools\check_patch.ps1`;
+`tools\install_hooks.ps1` installs the same check as a pre-push hook.
+
 Verify that the LFS files are real (not 132-byte stubs):
 
 - `llvm_zluda\src\device-libs\ockl.bc` starts with `BC`
@@ -93,8 +98,11 @@ Staging:
 3. Back up the stock `rocblas.dll` and `rocblas\library`.
 4. Replace `rocblas.dll` with the 7.1.1 dll from the tuned package and put the
    package's `library` contents into `<runtime>\bin\rocblas\library`.
-5. Verify: `run-zluda.cmd cuda_check.exe` — every line must be `OK`
-   (`nvapi` reports “Library check not implemented” and is informational).
+5. Verify: `run-zluda.cmd target\release\cuda_check.exe` — every line must be
+   `OK` (`nvapi` reports “Library check not implemented” and is informational).
+   `cuda_check.exe` is produced by `cargo xtask zip --release`; when it is not
+   built, `run-zluda.cmd venv\Scripts\python.exe smoke\torch_check.py` performs
+   the same runtime checks (device, matmul for fp32/fp16/bf16, MLP).
 
 Notes:
 
@@ -123,18 +131,24 @@ Triton must produce PTX, not NVIDIA SASS; point it at ZLUDA's `ptxas.exe` stub
 
 ## 6. Environment variables and launchers
 
-`run-zluda.cmd` sets:
+`run-zluda.cmd` derives every path from the repository root:
 
 ```bat
-set HIP_PATH=<runtime root>
+rem all paths are relative to the repository root
+set HIP_PATH=<repo>\hip
 set HIP_VISIBLE_DEVICES=0
 set ZLUDA_CC=8.6
-set TRITON_PTXAS_PATH=target\release\ptxas.exe
+set TRITON_PTXAS_PATH=<repo>\target\release\ptxas.exe
 set TRITON_CACHE_DIR=<repo>\.triton_cache
 set TORCHINDUCTOR_CACHE_DIR=<repo>\.inductor_cache
-set PATH=target\release;<runtime root>\bin;%PATH%
-target\release\zluda.exe -- %*
+set PATH=<repo>\target\release;%HIP_PATH%\bin;%PATH%
+<repo>\target\release\zluda.exe -- %*
 ```
+
+Every variable is only set when it is not already defined, so a different HIP
+installation or cache location can be selected in the environment before the
+launcher runs. The Visual Studio environment is located with `vswhere` (set `VS`
+to override) and is optional at run time.
 
 Important:
 
@@ -190,7 +204,8 @@ torch._C._set_cublas_allow_fp16_accumulation(True)  # selects packed HH kernels
 
 Verified with ComfyUI 0.45.0 and a separate Python 3.12 venv
 (`venv-comfy`, `torch==2.7.1+cu118`, `torchvision==0.22.1+cu118`,
-`triton-windows==3.3.1.post21`); the native ROCm venv is left untouched.
+`triton-windows==3.3.1.post21`); the native ROCm venv is left untouched. The
+exact package set is recorded in [`comfy-freeze.txt`](comfy-freeze.txt).
 
 ```bat
 rem base mode, no custom nodes (most reliable)
@@ -198,10 +213,13 @@ start-comfy.cmd
 
 rem full mode with custom nodes (UTF-8 is required: some nodes raise
 rem ImportError messages containing emoji and crash a cp1251 console)
-set PYTHONUTF8=1
-set PYTHONIOENCODING=utf-8
-comfy-zluda-nodes.cmd
+start-comfy-nodes.cmd
 ```
+
+The launchers are repository-relative; set `COMFY_DIR` to the ComfyUI checkout
+and `COMFY_PYTHON` to the ComfyUI venv Python when your layout differs.
+`comfy-zluda.cmd`/`comfy-zluda-nodes.cmd` run the same commands in the current
+console without log redirection.
 
 - Both launchers use `--use-pytorch-cross-attention` (math SDPA),
   `--force-fp16`, `--disable-smart-memory`, `--gpu-only`,
@@ -232,10 +250,10 @@ comfy-zluda-nodes.cmd
   set `ZLUDA_OPS_DISABLE=1` to roll back. See `INTEGRATION.md`.
 - If `torch.cuda.is_available()` starts hanging and even a plain HIP
   `hipStreamCreateWithFlags` blocks, the AMD driver is wedged (usually after
-  force-killing a process during CUDA init). Restart the display device, e.g.
-  `pnputil /restart-device "<GPU instance id>"` from an elevated shell, or
-  reboot. Never force-kill ComfyUI while it is initializing CUDA unless
-  necessary.
+  force-killing a process during CUDA init). Restart the display device with
+  `gpu_reset.ps1` from an elevated PowerShell (pass `-InstanceId` for another
+  GPU; see `Get-PnpDevice -Class Display`), or reboot. Never force-kill
+  ComfyUI while it is initializing CUDA unless necessary.
 
 ## 8. Validation and benchmarks
 
@@ -300,9 +318,12 @@ Expected reference numbers are in `RESULTS_RDNA1.md`.
   `v7-preview.21`.
 - `RESULTS_RDNA1.md` — measurements and ZLUDA vs native ROCm comparison.
 - `ROADMAP.md` — priorities, stages, acceptance metrics.
-- `bench/`, `smoke/` — benchmark and validation scripts.
+- `bench/`, `smoke/` — benchmark and validation scripts; `smoke/local/` holds
+  machine-specific experiment scripts and is not committed.
 - `zluda_ops/` — Python ops: SDPA-compatible causal flash attention (GQA
   support) and a bf16→fp32 GEMM emulation helper.
+- `tools/` — `export_patch.ps1`/`check_patch.ps1` (patch tooling) and the
+  ComfyUI auto-op installer.
 - `build-env.cmd`, `run-zluda.cmd` — build/run helpers.
 
 ### Tensile HH override
