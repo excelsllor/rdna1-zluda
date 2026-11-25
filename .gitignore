@@ -28,3 +28,7 @@ __pycache__/
 # Machine-specific experiment scripts (hardcoded local paths) and scratch data.
 smoke/local/
 /hh_*.pt
+
+# Local model files and downloaded engine binaries (not part of the fork)
+models/
+tools/llamacpp-cuda/

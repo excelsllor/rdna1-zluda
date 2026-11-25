@@ -36,20 +36,26 @@ def bench_median(fn, rounds=5, iters=5, warmup=2):
 
 
 def gpu_info():
-    props = torch.cuda.get_device_properties(0)
     info = {
-        "device": torch.cuda.get_device_name(0),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "hip": getattr(torch.version, "hip", None),
-        "multi_processor_count": props.multi_processor_count,
-        "total_memory_gb": round(props.total_memory / 1024**3, 2),
-        "l2_cache_mb": round(getattr(props, "L2_cache_size", 0) / 1024**2, 2),
-        "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
-        "float32_matmul_precision": torch.get_float32_matmul_precision(),
         "hip_path": os.environ.get("HIP_PATH"),
         "zluda_cc": os.environ.get("ZLUDA_CC"),
     }
+    try:
+        props = torch.cuda.get_device_properties(0)
+        info.update({
+            "device": torch.cuda.get_device_name(0),
+            "multi_processor_count": props.multi_processor_count,
+            "total_memory_gb": round(props.total_memory / 1024**3, 2),
+            "l2_cache_mb": round(getattr(props, "L2_cache_size", 0) / 1024**2, 2),
+        })
+    except Exception as exc:  # plain python without ZLUDA injection
+        info["device"] = None
+        info["device_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+    info["allow_tf32"] = torch.backends.cuda.matmul.allow_tf32
+    info["float32_matmul_precision"] = torch.get_float32_matmul_precision()
     try:
         import triton
 
