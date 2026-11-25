@@ -248,6 +248,21 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - Triton optimality + custom HIP kernels audit:** Triton GEMV
+  reaches 15-40% of bandwidth on per-layer decode matvecs (68-181 GB/s of
+  448 GB/s) and flash-decoding wastes 7x KV bandwidth on GQA; FA prefill (33%
+  of fp16 peak) and fused kernels are near practical limits. A custom HIP
+  warp-per-row fp16 GEMV prototype (clang 20 -> gfx1010 DLL, launched from
+  Python via ctypes) is 1.1-4.8x faster than Triton (qkv 4.9 vs 23.5 us, gate
+  27.6 vs 48.2, down 29.9 vs 49.7, lm_head 751 vs 820 us; 292-362 GB/s), which
+  would cut ~3.3 ms/token (~30%) from the graph-decode step. Integration caveat:
+  raw HIP launches on stream 0 are not ordered with ZLUDA streams (races, hang)
+  and per-call device sync costs ~140 us; CUDA-graph capture of external HIP
+  launches is unverified. Recommendation: do not replace the stack; focus on
+  Triton GQA KV-reuse + fused QKV/gate-up + multi-row GEMV, and only build a HIP
+  GEMV library once ZLUDA exposes proper stream/graph integration. Custom GEMM
+  is not worth it (rocBLAS+Tensile at 84% of fp32 peak). Docs:
+  docs/TRITON_HIP_AUDIT.md; prototype: tools/hip_proto/.
 - **2026-11-25 - int4 solver audit:** decode-shape comparison of the fused int4
   GEMV vs dequant-once + tuned fp16 GEMV (M=1, group 64): dequant-once wins on
   every shape (43 vs 63 us qkv, 70 vs 120 gate/up, 75 vs 87 down, 832 vs 2329 us
