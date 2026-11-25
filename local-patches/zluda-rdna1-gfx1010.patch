@@ -6494,6 +6494,39 @@ index 0000000000000000000000000000000000000000..23d7a589bcba6d7f28e1fb3a64a98624
 +if __name__ == "__main__":
 +    main()
 +
+diff --git a/bench/results/llamacpp_zluda_vs_vulkan.json b/bench/results/llamacpp_zluda_vs_vulkan.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa3adc726e16e65771a961d47bbf06aef93ba84e
+--- /dev/null
++++ b/bench/results/llamacpp_zluda_vs_vulkan.json
+@@ -0,0 +1,26 @@
++{
++  "date": "2026-11-25",
++  "gpu": "Radeon RX 5700 XT (gfx1010, 8 GB)",
++  "model": "Qwen2.5-0.5B-Instruct F16 GGUF",
++  "engine": "llama.cpp (same engine both backends)",
++  "flags": {"flash_attention": 0, "ngl": 99, "kv_cache_type": "f16"},
++  "vulkan": {"provider": "Ollama 0.40.18 (llama.cpp Vulkan)"},
++  "zluda": {
++    "build": "local CMake build, CUDA 12.4.1 portable, CMAKE_CUDA_ARCHITECTURES=86-virtual (PTX only)",
++    "env": {"GGML_CUDA_PDL": 0, "GGML_CUDA_DISABLE_GRAPHS": 1}
++  },
++  "results": [
++    {"ctx": 2048, "zluda_prefill_tok_s": 6144.33, "vulkan_prefill_tok_s": 6258.0,
++     "zluda_decode_tok_s": 184.20, "vulkan_decode_tok_s": 212.3},
++    {"ctx": 8192, "zluda_prefill_tok_s": 3294.47, "vulkan_prefill_tok_s": 4179.0,
++     "zluda_decode_tok_s": 184.56, "vulkan_decode_tok_s": 172.7},
++    {"ctx": 32768, "zluda_prefill_tok_s": 732.25, "vulkan_prefill_tok_s": null,
++     "zluda_decode_tok_s": 183.87, "vulkan_decode_tok_s": null,
++     "note": "Ollama clamps F16 context to 8192 on 8 GB VRAM"}
++  ],
++  "limitations": [
++    "llama.cpp FA (mma.sync kernel) fails on ZLUDA (no tensor cores on RDNA1)",
++    "Q4_K_M MMQ kernels hang on ZLUDA",
++    "official SASS-only CUDA builds cannot run under ZLUDA at all (no PTX for sm_86)"
++  ]
++}
+\ No newline at end of file
 diff --git a/bench/rocblas_gap.py b/bench/rocblas_gap.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..2b24ce00f5a7d21308426fe8efb89c226134b4e5
