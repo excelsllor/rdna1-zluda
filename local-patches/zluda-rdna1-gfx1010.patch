@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..307eb74edf642cac5fb129e6e86dd06aa645d83b
+index 0000000000000000000000000000000000000000..5c03fc86780e6187ed722be66215150c15c097fd
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,496 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,17 @@ index 0000000000000000000000000000000000000000..307eb74edf642cac5fb129e6e86dd06a
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - decode/CUDA-graphs follow-up:** measured the decode gap
++  components: launches cost only ~2 us (240 launches ~0.5 ms/token), while
++  rocBLAS GEMV costs 24.7-251 us per matvec (down_proj 1x896x4864 = 251 us vs
++  Triton 35.8 us, 7x faster); PyTorch eager decode 34.0 ms/token vs llama.cpp
++  Vulkan 4.2 ms/token. So the Vulkan advantage is kernel efficiency
++  (bandwidth-bound hand-written GEMV + few submissions per token), not launch
++  overhead; CUDA graphs alone cannot close it. torch.compile reduce-overhead now
++  reaches graph instantiation and fails on (a) DynamicCache torch.cat inside
++  the captured region (use StaticCache) and (b) cuBLAS not being graph-capture
++  safe (zluda_blas audit is the next item). bf16-emul works on ROCm (3812/26.0)
++  but still crashes on ZLUDA (VRAM). Details: docs/CUDA_GRAPHS_ZLUDA.md.
 +- **2026-11-25 - CUDA graphs work under ZLUDA:** torch.cuda.CUDAGraph capture
 +  and replay now work. PyTorch's runtime path called three unimplemented legacy
 +  driver entry points - `cuStreamBeginCapture` (no mode arg),
@@ -10023,10 +10034,10 @@ index 0000000000000000000000000000000000000000..f1a7f1f0a33209ebc1034d6316e77aec
 \ No newline at end of file
 diff --git a/docs/CUDA_GRAPHS_ZLUDA.md b/docs/CUDA_GRAPHS_ZLUDA.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..4bf07d6568801bc06562804b21c39f851711affc
+index 0000000000000000000000000000000000000000..7c395a25600686db88598223bf5d641a5842c121
 --- /dev/null
 +++ b/docs/CUDA_GRAPHS_ZLUDA.md
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,123 @@
 +# CUDA graphs under ZLUDA on gfx1010
 +
 +Status 2026-11-25: **working for PyTorch `torch.cuda.CUDAGraph`** after adding
@@ -10095,7 +10106,61 @@ index 0000000000000000000000000000000000000000..4bf07d6568801bc06562804b21c39f85
 +- bf16 emulation (`bf16` storage with fp32 compute) on ZLUDA: retest with
 +  in-place parameter conversion (the current implementation crashed without a
 +  report, most likely a VRAM spike on the 8 GB card).
-\ No newline at end of file
++## Decode gap analysis (why Vulkan is much faster at decode)
++
++Measured on Qwen2.5-0.5B fp16, 1024-token context:
++
++| quantity | value |
++|---|---|
++| PyTorch/ZLUDA eager decode | 34.0 ms/token (~29 tok/s) |
++| llama.cpp/Vulkan decode | 4.2 ms/token (~240 tok/s) |
++| trivial kernel launch on ZLUDA | 2.0 us |
++| 240 launches/token (estimate) | ~0.5 ms |
++| rocBLAS GEMV 1x896x896 | 24.7 us |
++| rocBLAS GEMV 1x4864x896 (gate/up) | 47.5 us |
++| rocBLAS GEMV 1x896x4864 (down_proj) | 251 us |
++| Triton GEMV 1x896x896 | 21.6 us (1.14x faster) |
++| Triton GEMV 1x4864x896 | 35.4 us (1.34x faster) |
++| Triton GEMV 1x896x4864 | 35.8 us (7.0x faster) |
++
++So kernel launches are cheap (2 us); CUDA graphs only remove ~0.5 ms/token and
++cannot close an 8x gap alone. The decode gap comes from **the GEMM/GEMV kernels
++themselves**: PyTorch's rocBLAS path spends 24.7-251 us per matvec (the MLP
++down_proj is 251 us, 7x slower than an equivalent Triton kernel), while
++llama.cpp uses hand-written bandwidth-bound GEMV kernels and packs a whole
++token into a few command submissions. Attention (math SDPA with GQA expand) and
++per-op elementwise/copies add the rest.
++
++`zluda_ops.gemv` already provides fast Triton GEMV paths for small M and
++`zluda_ops.auto` patches `F.linear` for decode shapes, but the end-to-end decode
++improvement is not visible yet (26-29 tok/s measured with and without auto at
++1k context), so the next step is to tune/extend those kernels for the exact
++decode shapes (896/4864, bias, fp16) and fuse QKV/RoPE/KV-append rather than
++relying on the generic path.
++
++### torch.compile with cudagraphs: where it stops now
++
++With the graph APIs implemented, `torch.compile(mode="reduce-overhead")` gets
++through graph instantiation (`cuGraphInstantiateWithFlags` is called) and then
++fails for two separate reasons:
++
++1. Transformers' `DynamicCache` does `torch.cat` inside the compiled region -
++   Inductor cudagraph trees reject writes to tensors captured from outside
++   ("clone the tensor outside of torch.compile or use cudagraph_mark_step_begin").
++   Fix on the model side: use `StaticCache` (fixed buffers).
++2. Capturing the full forward with `StaticCache` then fails inside
++   `cublasSgemm` during capture (`CUDA error: <unknown>`), i.e. ZLUDA's cuBLAS
++   layer is not fully graph-capture-safe yet. Next step: audit `zluda_blas`
++   for capture-unsafe behaviour (internal sync, stream handling) so that GEMMs
++   can be recorded into a graph.
++
++### bf16 emulation
++
++bf16 emulation (bf16 weights, fp32 compute) works on native ROCm torch
++(3812 tok/s prefill / 26.0 decode vs 2845/10.6 native bf16) but the ZLUDA
++process died without a report (most likely VRAM: an fp32 copy of the model on
++top of the bf16 one). Needs an in-place conversion path and a smaller-VRAM
++recipe before it can be measured there.
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
