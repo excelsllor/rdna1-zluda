@@ -248,6 +248,17 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - decode/CUDA-graphs follow-up:** measured the decode gap
+  components: launches cost only ~2 us (240 launches ~0.5 ms/token), while
+  rocBLAS GEMV costs 24.7-251 us per matvec (down_proj 1x896x4864 = 251 us vs
+  Triton 35.8 us, 7x faster); PyTorch eager decode 34.0 ms/token vs llama.cpp
+  Vulkan 4.2 ms/token. So the Vulkan advantage is kernel efficiency
+  (bandwidth-bound hand-written GEMV + few submissions per token), not launch
+  overhead; CUDA graphs alone cannot close it. torch.compile reduce-overhead now
+  reaches graph instantiation and fails on (a) DynamicCache torch.cat inside
+  the captured region (use StaticCache) and (b) cuBLAS not being graph-capture
+  safe (zluda_blas audit is the next item). bf16-emul works on ROCm (3812/26.0)
+  but still crashes on ZLUDA (VRAM). Details: docs/CUDA_GRAPHS_ZLUDA.md.
 - **2026-11-25 - CUDA graphs work under ZLUDA:** torch.cuda.CUDAGraph capture
   and replay now work. PyTorch's runtime path called three unimplemented legacy
   driver entry points - `cuStreamBeginCapture` (no mode arg),
