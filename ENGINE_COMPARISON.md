@@ -13,13 +13,23 @@ in PyTorch runs. GPU clocks cannot be fixed (+-15-30% run-to-run spread).
 - **ZLUDA**: this fork (PyTorch 2.7.1+cu118, Triton 3.3.1, ROCm 10.1 + tuned
   rocBLAS 7.1.1), measured with `bench/model_bench.py` (which also reports the
   flash-attention/flash-decoding dispatch counters from `zluda_ops.auto`).
-- **llama.cpp CUDA under ZLUDA: blocked.** Two Windows CUDA builds were tried:
-  b12721 (current) fails at `cudaLaunchKernelEx` (programmatic dependent launch,
-  PDL) with `CUDA error: operation not supported`, and hangs with
-  `GGML_CUDA_PDL=0`; b9802 (pre-PDL) fails with `CUDA error` in
-  `ggml-cuda.cu`. The CUDA backend loads and sees the GPU (8176 MiB, CC 8.6),
-  but kernels cannot run through ZLUDA. Same-engine Vulkan-vs-ZLUDA comparison
-  is therefore not possible today.
+- **llama.cpp CUDA under ZLUDA: patched, still blocked at kernel level.**
+  ZLUDA used to reject `cudaLaunchKernelEx` when the PDL launch attribute was
+  set (`ERROR_NOT_SUPPORTED`); this fork now accepts launch-time attributes and
+  runs the kernels serialized (`zluda/src/impl/driver.rs`; PDL is an overlap
+  hint, so serialization is correct) and `nvcuda.dll` was rebuilt.
+  With the patch llama.cpp b12721 loads under ZLUDA and sees the GPU
+  (8176 MiB, CC 8.6), and `llama-bench -ngl 0` works through the CUDA backend on
+  the CPU (pp16 124 tok/s, tg2 17.4 tok/s). But **`-ngl >= 1` hangs** with every
+  workaround tried (`GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_CUDA_NO_PINNED=1`,
+  `GGML_CUDA_DISABLE_FUSION=1`, `GGML_CUDA_FORCE_MMQ=1`, `GGML_CUDA_PDL=0`), and
+  the pre-PDL build b9802 errors in `ggml-cuda.cu`. The remaining blocker is
+  ZLUDA's execution/JIT of llama.cpp's CUDA kernels (the async-copy pipeline;
+  `cp.async` strings are present in ggml-cuda.dll, while the Triton/PyTorch
+  kernels ZLUDA already runs do not use it). Fixing this requires extending
+  ZLUDA's `ptx`/`llvm_zluda` support; no llama.cpp binary patch can avoid those
+  kernels. Same-engine Vulkan-vs-ZLUDA comparison therefore remains blocked and
+  the cross-engine table below is labelled accordingly.
 - **bitsandbytes: excluded.** 0.50.2 imports and ships ROCm libraries, but its
   kernels fail under ZLUDA (`named symbol not found`, default and
   `BNB_BACKEND=rocm`). Substitute in this repo: `zluda_ops/optim8bit.py`.
@@ -113,11 +123,12 @@ is not available (ComfyUI, dynamic shapes) and for isolated ops.
 ## What else can be implemented (not touched yet)
 
 ZLUDA core / runtime:
-- `cudaLaunchKernelEx` / PDL support and broader CUDA 12 launch API coverage in
-  ZLUDA (unblocks llama.cpp CUDA, and with it a same-engine Vulkan-vs-ZLUDA
-  comparison); CUDA graph capture/instantiate support (unblocks
+- CUDA graph capture/instantiate support (unblocks
   `torch.compile(mode="reduce-overhead")` and would attack the decode gap
-  directly).
+  directly); broader CUDA 12 launch API coverage is partly done (launch-time
+  attributes/PDL are now accepted, see the llama.cpp section), and the next
+  ZLUDA compiler item is support for llama.cpp's async-copy kernel pipeline
+  (a prerequisite for the same-engine Vulkan-vs-ZLUDA comparison).
 - Native HIP-process ZLUDA (no CUDA shim) and a Vulkan/DX12 backend are out of
   scope but would remove the CUDA-API translation overhead.
 
