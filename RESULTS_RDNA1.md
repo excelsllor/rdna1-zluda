@@ -463,3 +463,21 @@ into long rows), and dropout/window/varlen still use math SDPA.
 
 Speed (s=1024, bool mask, median of shuffled rounds): masked causal Triton
 **1.22 ms vs 2.04 ms math = 1.67x**; non-causal 1.82 vs 1.98 ms = 1.09x.
+
+## P0-2b Triton flash-attention dropout (2026-11-25)
+
+Dropout now runs in the Triton kernels: inverted dropout on the attention
+weights, with the row normalization using the sum of the *original*
+probabilities, so the output matches torch SDPA semantics (E[out] equals the
+non-dropout output). The same Philox mask is regenerated in backward from the
+saved seed and per-(head, query, key) offsets, so no dropout mask is stored.
+
+`bench/fa_dropout.py` (B1 H8 D64 fp16, s=256):
+
+| check | result |
+|---|---|
+| dropout=0 vs math SDPA | fwd err 2.0e-3, grad err 3.9e-3 (unchanged) |
+| unbiasedness p=0.1 / p=0.5, 16 seeds | z = 0.82 / 0.81 (unbiased, threshold 3) |
+| determinism | same seed identical, different seed differs |
+| gradients | finite, mean abs comparable to no-dropout |
+| s=1024 causal, p=0.1 | **1.04 ms vs 1.97 ms math = 1.90x** |

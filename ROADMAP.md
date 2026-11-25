@@ -33,7 +33,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
 | **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 | **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
-| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks done; dropout/window/varlen still math fallback |
+| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks+dropout done; window/varlen still math fallback |
 | **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
 | **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
 | **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
@@ -241,7 +241,8 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | GEMV M16-32 target | **PARTIAL** | 155/78 GB/s; target 70-80% not met |
 | FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
 | FA masks | **DONE** | bool/additive 2D/3D/4D broadcast masks, causal+mask, fwd+bwd in Triton; fwd err ≤1e-3, grad err ≤4e-3; masked causal 1024 is 1.67x math |
-| FA dropout / window / varlen | **FUNCTIONAL FALLBACK** | correct math; Triton kernels open |
+| FA dropout | **DONE** | inverted dropout in Triton fwd+bwd, unbiased (z<1), deterministic per seed, fwd+bwd errors unchanged; causal 1024 1.90x math |
+| FA window / varlen | **FUNCTIONAL FALLBACK** | correct math; Triton kernels open |
 | Flash-decoding | **OPEN** | |
 | bf16 native / emulation | **DONE (emulation)** | 4.42 native / 7.92 emulated TF |
 | GPU monitoring | **PARTIAL** | utilization/VRAM via Windows PDH; measurement protocol enforced in every report; ADL live clocks return NOT_SUPPORTED (-8), documented blocker |
@@ -253,7 +254,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | # | Action | Priority | Gate/acceptance |
 |---|---|---|---|
 | 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | >=10% vs implicit GEMM or document "not beneficial" |
-| 2 | Triton dropout for FA | P0 | masks **DONE 2026-11-25** (bool/additive, fwd+bwd, 1.67x masked causal @1024); dropout still math fallback |
+| 2 | Triton dropout for FA | P0 | **CLOSED 2026-11-25**: masks and inverted dropout run in Triton fwd+bwd; window/varlen remain (row 3) |
 | 3 | Triton sliding-window + varlen FA | P0 | correctness vs math; no dense mask allocation |
 | 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
 | 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
