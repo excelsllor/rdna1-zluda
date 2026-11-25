@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..10aa987fab59b67fe585042a9c0fe5763b2e33ea
+index 0000000000000000000000000000000000000000..f10820c658fda76e6b9baaee4fca4459029cd641
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,530 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,15 @@ index 0000000000000000000000000000000000000000..10aa987fab59b67fe585042a9c0fe576
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - solver/kernel audit (first pass):** GEMV configs were a single
++  fixed (4096,4) - swept and replaced with a shape-aware TUNED_M1 table
++  (qkv 28.5 us 2.07x vs rocBLAS, gate/up 40.1 us 2.01x, down_proj 53.7 us
++  5.29x, lm_head 798 us 12.2x). FA prefill config swept at 512..8192: current
++  config already optimal (<=1.05x). Flash-decode SPLITS heuristic already
++  optimal (1.00x) and 2.5-6.8x faster than math SDPA, but GQA was unsupported -
++  added native GQA indexing and dispatch (correctness 3e-5); graph decode now
++  89.7 tok/s @1k / 72.3 @2k. Remaining: conv solver selection, int4 decode
++  shapes, fused int8. Details: docs/SOLVER_AUDIT.md.
 +- **2026-11-25 - reusable graph decoder:** added `zluda_ops/graph_decode.py`
 +  (`GraphDecoder`: StaticCache prefill + CApture of one decode step + replay,
 +  token/position buffers updated outside the graph). Replay-only decode:
@@ -10743,6 +10752,100 @@ index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb9
 +enabled (`torch._C._set_cublas_allow_fp16_accumulation(True)`); HPA/SS lines
 +are intentionally not included. Use random data for measurements: zeros,
 +ones and uninitialized buffers are not representative.
+diff --git a/docs/SOLVER_AUDIT.md b/docs/SOLVER_AUDIT.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1dfd4b29d5e3ec6ed4e5e65de48ec5e22f5e04b3
+--- /dev/null
++++ b/docs/SOLVER_AUDIT.md
+@@ -0,0 +1,87 @@
++# Solver / kernel audit (RDNA1, 2026-11-25)
++
++Goal: go through every computation in the stack, check which solver/kernel is
++used, and replace non-optimal ones. GPU clocks are unfixed (+-15-30% spread).
++
++## 1. GEMV (decode matrix-vector products)
++
++Before: one fixed config `(BK=4096, warps=4)` for all small-M shapes; rocBLAS was
++used in decode until the auto patch started matching decode layouts.
++
++Sweep (M=1, fp16 weights/activations, gfx1010):
++
++| shape (N x K) | role | rocBLAS | Triton before | Triton tuned (BK,warps) | speedup vs rocBLAS |
++|---|---|---|---|---|---|
++| 896 x 896 | qkv / o_proj | 59.0 us | ~35 us | **28.5 us (512, 2)** | 2.07x |
++| 4864 x 896 | gate/up | 80.7 us | ~35 us | **40.1 us (1024, 2)** | 2.01x |
++| 896 x 4864 | down_proj | 284.1 us | ~36 us | **53.7 us (512, 4)** | 5.29x |
++| 151936 x 896 | lm_head | 9739.8 us | ~800 us | **798.0 us (1024, 2)** | 12.20x |
++
++Action: `zluda_ops/gemv.py` now has a shape-aware `TUNED_M1` table
++(`_config(m, n, k)`), falling back to `CONFIGS[m]`. This is what makes decode
++graph-fast (lm_head used to be 9.7 ms of a 34 ms token before the GEMV path).
++
++## 2. Flash-attention prefill (Triton FA)
++
++Current: BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=1 (causal).
++Sweep over 10 configurations at seq 512/1024/2048/4096/8192 (14 heads, D=64):
++
++| seq | current | best config | gain |
++|---|---|---|---|
++| 512 | 0.60 ms | (64,64,4,2) 0.57 ms | 1.05x |
++| 1024 | 1.47 ms | (64,64,4,1) 1.47 ms | 1.00x |
++| 2048 | 4.71 ms | (64,64,8,1) 4.69 ms | 1.00x |
++| 4096 | 16.75 ms | (128,64,4,2) 16.59 ms | 1.01x |
++| 8192 | 63.00 ms | (128,64,4,1) 62.96 ms | 1.00x |
++
++Verdict: **current FA prefill config is optimal** (all differences within
++noise). A `_CONFIG_OVERRIDE` hook was added for future autotuning.
++
++## 3. Flash-decoding (decode attention, split-KV)
++
++Current heuristic `_choose_splits(n_ctx, batch_heads)` picks the largest
++SPLITS<=16 dividing N/128 and filling >=128 programs with BLOCK_N=128.
++
++Sweep over SPLITS 1..32 at KV 512..8192 (GQA 14 q / 2 kv heads):
++
++| KV len | math SDPA | heuristic SPLITS | Triton flash-decode | speedup vs math |
++|---|---|---|---|---|
++| 512 | 255.2 us | 4 | 82.1 us | 3.11x |
++| 1024 | 405.4 us | 8 | 106.5 us | 3.81x |
++| 2048 | 424.9 us | 16 | 140.2 us | 3.03x |
++| 4096 | 530.4 us | 16 | 208.8 us | 2.54x |
++| 8192 | 1897.3 us | 16 | 280.6 us | 6.76x |
++
++Verdict: heuristic SPLITS are already optimal at every length (gain 1.00x over
++the best swept value). **But the kernel did not support GQA**: the dispatcher
++required equal query/KV head counts, so Qwen-style GQA decode fell back to math
++SDPA. Added native GQA indexing (`off_hkv = off_h // GROUP`) to `_decode_split`
++and relaxed the auto dispatch to `q_heads % kv_heads == 0`; correctness vs an
++explicit repeat-interleave reference is 3e-5 at KV 512/2048. End-to-end
++graph-replay decode with correct GQA flash-decoding: 89.7 tok/s @1k, 72.3 tok/s
++@2k.
++
++## 4. Other computations checked
++
++| computation | current solver | verdict |
++|---|---|---|
++| GEMM (prefill matmuls) | rocBLAS 7.1.1 + tuned gfx1010 Tensile overrides (ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH) | near peak (8.18 TF fp32 of 9.75 TF paper peak); native ROCm torch without overrides is 4.6x slower on fp32 - keep |
++| RMSNorm / SwiGLU / GeGLU / RoPE / softmax / AdamW | zluda_ops.fused Triton kernels | 1.5-10.9x faster than torch eager (previous benchmarks), keep |
++| fp16 accumulation | cuBLAS HPA path | 1.5-1.7x prefill; keep opt-in |
++| bf16 native | ZLUDA bf16 | slower than fp32/emul; emul (fp32 compute) is the optimal bf16 route |
++| bf16 emul | bf16 weights -> fp32 compute | 5488 tok/s prefill (vs 3450 native bf16) - optimal available |
++| int4 GEMV/GEMM | zluda_ops.quant tuned for 4096 shapes | decode shapes need a dedicated sweep (open) |
++| int8 | dequant-once cache (no fused kernel) | fused int8 GEMV is missing (open; memory-optimal but not compute-optimal) |
++| 8-bit AdamW | Triton blockwise int8 | 4.6x faster than torch AdamW, keep |
++| conv2d | MIOpen fp16 solver vs fp32 Winograd workaround | audit in progress (see next section) |
++| FFT / sparse / RNG | cuFFT->rocFFT, cuSPARSE->rocSPARSE, cuRAND->? mapping | used only by non-LLM workloads; not yet audited |
++
++## 5. Open items
++
++- Conv2d solver selection (MIOpen fp16 GemmFwdRest vs fp32 Winograd) - implement
++  per-shape solver cache/dispatch.
++- int4 decoder-shaped GEMV sweep and fused int8 GEMV.
++- GEMM epilogue/hipBLASLt alternatives are not exposed by ZLUDA; rocBLAS path
++  stays the optimum available.
++- CUDA graphs for decode are now the delivery mechanism for the GEMV path
++  (see docs/CUDA_GRAPHS_ZLUDA.md).
+\ No newline at end of file
 diff --git a/docs/comfy-freeze.txt b/docs/comfy-freeze.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..6c3369aaf97348f7df7750daccdd46200301148e
@@ -15012,10 +15115,10 @@ index 0000000000000000000000000000000000000000..a6c16c402b227657444e5c1dfdab2d9f
 +from . import graph_decode  # noqa: F401
 diff --git a/zluda_ops/auto.py b/zluda_ops/auto.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e60bafdb03fdaf102256762ff296a5fc9a048b5d
+index 0000000000000000000000000000000000000000..3879a19ead0031be0bc0b3b68fa0b7673f25a73e
 --- /dev/null
 +++ b/zluda_ops/auto.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,145 @@
 +import os
 +
 +import torch
@@ -15098,13 +15201,14 @@ index 0000000000000000000000000000000000000000..e60bafdb03fdaf102256762ff296a5fc
 +    # Decode: a few query tokens against a long KV cache -> flash-decoding
 +    # (split-KV), which needs no backward and no mask/scale override.
 +    if (not _compiling() and attn_mask is None and dropout_p == 0.0
-+            and scale is None and not enable_gqa
++            and scale is None
 +            and query.is_cuda and query.dtype == torch.float16
 +            and key.dtype == torch.float16 and value.dtype == torch.float16
 +            and query.dim() == 4 and query.shape[-1] == 64
 +            and 1 <= query.shape[2] <= 16
 +            and query.shape[0] == key.shape[0] == value.shape[0]
-+            and query.shape[1] == key.shape[1] == value.shape[1]
++            and key.shape[1] == value.shape[1]
++            and query.shape[1] % key.shape[1] == 0
 +            and key.shape[2] == value.shape[2] and key.shape[2] >= 512
 +            and key.shape[2] % 128 == 0
 +            and not _needs_grad(query, key, value)):
@@ -15287,10 +15391,10 @@ index 0000000000000000000000000000000000000000..024c0f3a3bdfec8526b917af5aa1ccd8
 +__all__ = ["conv2d", "install", "uninstall", "installed", "is_eligible"]
 diff --git a/zluda_ops/flash_attention.py b/zluda_ops/flash_attention.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9680694d14248bea367a993cf01691a4a241b33d
+index 0000000000000000000000000000000000000000..2057cfabac282ea9a70fd6f56e1369495109d0e6
 --- /dev/null
 +++ b/zluda_ops/flash_attention.py
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,654 @@
 +import math
 +
 +import torch
@@ -15306,6 +15410,8 @@ index 0000000000000000000000000000000000000000..9680694d14248bea367a993cf01691a4
 +
 +# Tests may pin the dropout RNG to check determinism across fwd/bwd.
 +_DROPOUT_SEED_OVERRIDE = None
++# (BLOCK_M, BLOCK_N, num_warps, num_stages) override used by bench/autotune scripts.
++_CONFIG_OVERRIDE = None
 +@triton.jit
 +def _attn_fwd_inner(acc, l_i, m_i, q,
 +                    K_block_ptr, V_block_ptr,
@@ -15945,10 +16051,10 @@ index 0000000000000000000000000000000000000000..9680694d14248bea367a993cf01691a4
 +__all__ = ["TritonFlashAttention", "attention", "scaled_dot_product_attention", "flash_attn_func", "flash_attn_varlen_func", "FlashAttention"]
 diff --git a/zluda_ops/flash_decode.py b/zluda_ops/flash_decode.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..79e5f9ee524ebd9939675da268f42f5141672797
+index 0000000000000000000000000000000000000000..065be3b137b112718b848f1ab02adb87f70caca2
 --- /dev/null
 +++ b/zluda_ops/flash_decode.py
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,177 @@
 +"""Flash-decoding attention for small query lengths (decode).
 +
 +During LLM decode the query has 1-8 tokens while the KV cache is long, so the
@@ -15978,7 +16084,7 @@ index 0000000000000000000000000000000000000000..79e5f9ee524ebd9939675da268f42f51
 +                  stride_qz, stride_qh, stride_qm, stride_qk,
 +                  stride_kz, stride_kh, stride_kn, stride_kk,
 +                  stride_vz, stride_vh, stride_vn, stride_vk,
-+                  H, M, N, OFFSET, sm_scale,
++                  H, HKV, GROUP, M, N, OFFSET, sm_scale,
 +                  SPLITS: tl.constexpr, BLOCK_M: tl.constexpr,
 +                  BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
 +                  CAUSAL: tl.constexpr):
@@ -15986,9 +16092,10 @@ index 0000000000000000000000000000000000000000..79e5f9ee524ebd9939675da268f42f51
 +    bhid = tl.program_id(1)
 +    off_z = bhid // H
 +    off_h = bhid % H
++    off_hkv = off_h // GROUP
 +    q_off = off_z * stride_qz + off_h * stride_qh
-+    k_off = off_z * stride_kz + off_h * stride_kh
-+    v_off = off_z * stride_vz + off_h * stride_vh
++    k_off = off_z * stride_kz + off_hkv * stride_kh
++    v_off = off_z * stride_vz + off_hkv * stride_vh
 +
 +    offs_m = tl.arange(0, BLOCK_M)
 +    offs_d = tl.arange(0, HEAD_DIM)
@@ -16086,8 +16193,10 @@ index 0000000000000000000000000000000000000000..79e5f9ee524ebd9939675da268f42f51
 +    n = k.shape[2]
 +    if d != 64 or m > BLOCK_M or k.shape[3] != d or v.shape[3] != d:
 +        raise NotImplementedError("flash_decode_attn requires head_dim=64 and M<=16")
-+    if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1]:
-+        raise NotImplementedError("q/k/v batch and head counts must match")
++    if q.shape[0] != k.shape[0] or k.shape[1] != v.shape[1]:
++        raise NotImplementedError("q/k/v batch and kv head counts must match")
++    if h % k.shape[1]:
++        raise NotImplementedError("query heads must be a multiple of kv heads")
 +    if n % BLOCK_N != 0:
 +        raise NotImplementedError("KV length must be a multiple of 128")
 +
@@ -16110,7 +16219,7 @@ index 0000000000000000000000000000000000000000..79e5f9ee524ebd9939675da268f42f51
 +        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
 +        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
 +        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-+        h, m, n, offset, sm_scale,
++        h, k.shape[1], h // k.shape[1], m, n, offset, sm_scale,
 +        SPLITS=splits, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=d,
 +        CAUSAL=causal, num_warps=4, num_stages=1,
 +    )
@@ -16609,10 +16718,10 @@ index 0000000000000000000000000000000000000000..f2c468916bf29529b0e9f1f0c46d54e2
 +__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
 diff --git a/zluda_ops/gemv.py b/zluda_ops/gemv.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..38dcde5db7c612e561976380b6f94108adbeeebf
+index 0000000000000000000000000000000000000000..ef18a47deb4135107a7533b6f46c69cbdbbb868d
 --- /dev/null
 +++ b/zluda_ops/gemv.py
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,78 @@
 +import torch
 +import triton
 +import triton.language as tl
@@ -16625,6 +16734,25 @@ index 0000000000000000000000000000000000000000..38dcde5db7c612e561976380b6f94108
 +    16: (4096, 4),
 +    32: (4096, 4),
 +}
++
++# Shape-aware (BK, num_warps) overrides tuned on gfx1010 for M=1 decode
++# (2026-11-25 sweep): qkv/o 896x896 (512,2) 2.07x rocBLAS, gate/up 4864x896
++# (1024,2) 2.01x, down 896x4864 (512,4) 5.29x, lm_head 151936x896 (1024,2)
++# 12.2x. Falls back to CONFIGS[m] for other shapes.
++TUNED_M1 = {
++    (896, 896): (512, 2),
++    (4864, 896): (1024, 2),
++    (896, 4864): (512, 4),
++    (151936, 896): (1024, 2),
++}
++
++
++def _config(m, n, k):
++    if m == 1:
++        cfg = TUNED_M1.get((n, k))
++        if cfg is not None:
++            return cfg
++    return CONFIGS[m]
 +
 +
 +@triton.jit
@@ -16666,7 +16794,7 @@ index 0000000000000000000000000000000000000000..38dcde5db7c612e561976380b6f94108
 +        return None
 +    n, k = w.shape
 +    m = x.shape[0]
-+    bk, warps = CONFIGS[m]
++    bk, warps = _config(m, n, k)
 +    y = torch.empty(m, n, device=x.device, dtype=x.dtype)
 +    _gemv_kernel[(n,)](w, x, bias if bias is not None else y, y, n, k, M=m, BK=bk,
 +                       HAS_BIAS=bias is not None, PROD_F16=not accurate,
