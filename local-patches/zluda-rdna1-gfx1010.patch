@@ -776,61 +776,125 @@ index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312
 +- GPU clock/power telemetry on Windows.
 diff --git a/ENGINE_COMPARISON.md b/ENGINE_COMPARISON.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..a8bc9a6935398da8dbfd448af5733727b70ca027
+index 0000000000000000000000000000000000000000..d998862a2c32891ee2ebfcf15b3ce8e7c9b5a6b1
 --- /dev/null
 +++ b/ENGINE_COMPARISON.md
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,115 @@
 +# Engine comparison: Vulkan (Ollama) vs ZLUDA (PyTorch/Triton) on gfx1010
 +
-+Status: in progress (2026-11-25). GPU: RX 5700 XT (gfx1010, 8 GB).
-+Model: Qwen2.5-0.5B-Instruct (same weights in GGUF for Ollama and safetensors
-+for PyTorch).
++Updated: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B
++(same weights: GGUF for Ollama, safetensors for PyTorch). VRAM capped to 85%
++for PyTorch runs. GPU clocks cannot be fixed: single-run spread is +-15-30%.
 +
 +## Setups
 +
-+- **Vulkan**: Ollama 0.40.18, llama.cpp Vulkan backend, GGUF models imported
-+  with `num_ctx` up to 32768. `OLLAMA_FLASH_ATTENTION=1`,
-+  `OLLAMA_KV_CACHE_TYPE=q8_0` (configurable through `bench/ollama_config.ps1`),
-+  100% GPU offload confirmed by `ollama ps`.
-+- **ZLUDA**: fork engine (this repo) with PyTorch 2.7.1+cu118, Triton 3.3.1,
-+  ROCm 10.1 user space + tuned rocBLAS 7.1.1, launcher `run-zluda.cmd`.
-+  Harness: `bench/model_bench.py` (fp32/fp16/bf16 x fp16-accum x math/Triton-FA
-+  x torch.compile x int8/int4 quantization).
-+- **llama.cpp CUDA under ZLUDA (blocked)**: the Windows CUDA build
-+  (b12721, CUDA 12.4) loads under ZLUDA, sees the RX 5700 XT (8176 MiB,
-+  compute 8.6), but kernel launch fails with `CUDA error: operation not
-+  supported` at `cudaLaunchKernelEx` (programmatic dependent launch, PDL).
-+  Disabling PDL via `GGML_CUDA_PDL=0` did not produce a usable run (hang).
-+  Conclusion: the same-engine (llama.cpp) Vulkan-vs-ZLUDA comparison is not
-+  currently possible; the ZLUDA side uses the PyTorch/Triton stack instead.
-+- **bitsandbytes (excluded)**: 0.50.2 imports and ships ROCm libraries, but its
-+  ops fail on ZLUDA (`named symbol not found` in its nvcc-built kernels, both
-+  default and `BNB_BACKEND=rocm`). Substitute implemented in this repo:
-+  `zluda_ops/optim8bit.py` (Triton blockwise-int8 AdamW).
++- **Vulkan**: Ollama 0.40.18, llama.cpp Vulkan backend, 100% GPU offload.
++  GGUF Q4_K_M and F16 imported with num_ctx 32768.
++  `OLLAMA_FLASH_ATTENTION` (on/off) and `OLLAMA_KV_CACHE_TYPE` (q8_0/f16/f32)
++  set through `bench/ollama_config.ps1`; measurement via `bench/ollama_bench.py`
++  (`bench/run_vulkan_matrix.py` for the matrix).
++- **ZLUDA**: this fork (PyTorch 2.7.1+cu118, Triton 3.3.1, ROCm 10.1 + tuned
++  rocBLAS 7.1.1), benchmarked with `bench/model_bench.py`.
++- **llama.cpp CUDA under ZLUDA: blocked.** b12721 CUDA 12.4 build loads under
++  ZLUDA (device found: 8176 MiB, compute 8.6) but kernel launch fails with
++  `CUDA error: operation not supported` at `cudaLaunchKernelEx` (programmatic
++  dependent launch). With `GGML_CUDA_PDL=0` the run hangs. Same-engine
++  Vulkan-vs-ZLUDA is therefore not possible today.
++- **bitsandbytes: excluded.** 0.50.2 imports and ships ROCm libs, but its
++  kernels fail under ZLUDA (`named symbol not found`, both default and
++  `BNB_BACKEND=rocm`). Substitute: `zluda_ops/optim8bit.py` (Triton
++  blockwise-int8 AdamW): step 0.124 ms vs 0.566 ms torch AdamW at 1 Mi
++  params (4.6x), optimizer-state memory 3.94x smaller, 11% parameter deviation
++  after 8 steps (int8 state quantization, same tradeoff as bnb).
 +
-+## First results (Vulkan/Ollama, Q4_K_M and F16 GGUF, FA=1, KV=q8_0)
++## Vulkan results (Ollama, KV=q8_0, FA=1 unless noted)
 +
-+| model | context | prompt tokens | prefill tok/s | decode tok/s |
++| model | ctx | prompt tok | prefill tok/s | decode tok/s |
 +|---|---|---|---|---|
-+| Q4_K_M | 2048 | 1850 | 4474 | 151.4 |
-+| Q4_K_M | 32768 | 29150 | 943.8 | 105.4 |
-+| F16 | 2048 | 1850 | 3760.8 | 133.3 |
-+| F16 | 32768 | 4098 (*) | 3838.7 | 129.4 |
++| Q4_K_M | 2048 | 1850 | 4531 | 150.8 |
++| Q4_K_M | 8192 | 7310 | 2741 | 135.2 |
++| Q4_K_M | 32768 | 29150 | 946 | 104.8 |
++| F16 | 2048 | 1850 | 4771 | 133.7 |
++| F16 | 8192 | 7310 | 2810 | 123.3 |
++| F16 | 32768 (clamped to 8192) | 4098 | 3843 | 129.0 |
 +
-+(*) F16 run reported `context_length=8192` in `ollama ps` and truncated the
-+prompt to ~4k tokens, i.e. Ollama clamped the context for the F16 model on this
-+8 GB card. Investigating (likely a VRAM-aware clamp; Q4_K_M kept 32k).
++FA on/off and KV variants (KV=f16, FA=0 is the valid combination; q8_0 KV
++requires FA, otherwise Ollama returns HTTP 500):
 +
-+## Notes
++| model | FA | KV | ctx | prefill tok/s | decode tok/s |
++|---|---|---|---|---|---|
++| Q4_K_M | 1 | f16 | 2048 | 4364 | 31.8 (*) |
++| Q4_K_M | 1 | f16 | 8192 | 2769 | 143.1 |
++| F16 | 1 | f16 | 2048 | 4905 | 142.8 |
++| F16 | 1 | f16 | 8192 | 2857 | 133.4 |
++| Q4_K_M | 0 | f16 | 2048 | 2782 | 196.2 |
++| Q4_K_M | 0 | f16 | 8192 | 3986 | 178.6 |
++| F16 | 0 | f16 | 2048 | 6258 | 212.3 |
++| F16 | 0 | f16 | 8192 | 4179 | 172.7 |
 +
-+- Vulkan equivalents of the PyTorch flags: no fp32/bf16 model execution (GGUF
-+  tensors are F16/Q4_K_M...), no `torch.compile`, no `fp16accum`; flash
-+  attention is a llama.cpp flag (`OLLAMA_FLASH_ATTENTION`), KV cache type is
-+  `OLLAMA_KV_CACHE_TYPE` (f16/f32/q8_0).
-+- All numbers are single-run medians of the Ollama API durations; GPU clocks
-+  cannot be fixed on this card, so +/-15-30% run-to-run variance applies.
-+- The ZLUDA-side measurement matrix and the final analysis (problems, missed
-+  optimizations) are still to be filled in.
++(*) outlier, likely a warm-up artefact; decode is otherwise 130-212 tok/s.
++
++Observations: flash attention mainly helps prefill at short context; FA=0
++decodes faster here; **F16 model is clamped by Ollama to 8192 context** on
++8 GB while Q4_K_M reaches 32768.
++
++## ZLUDA/PyTorch results (prefill 1024 tokens, decode 8, ctx 1024)
++
++| config | prefill tok/s | decode tok/s | peak VRAM |
++|---|---|---|---|
++| fp16, math SDPA | 4525 | 22.1 | 1270 MB |
++| fp16, fp16-accum | **7774** | 26.2 | 1270 MB |
++| fp16, Triton FA (`--exact-seq 1024`) | 4813 | 27.9 | 1281 MB |
++| bf16, math SDPA | 2798 | 10.2 | 1270 MB |
++| fp32, math SDPA | 4984 | 25.3 | 2518 MB |
++| int4 weights (fused dequant), fp16 | 2031 | 25.4 | 2014 MB (**) |
++| int8 weights (dequant-once), fp16 | 1990 | 18.9 | 2496 MB (**) |
++| 8-bit AdamW step (1 Mi fp32 params) | 0.124 ms/step vs 0.566 torch | - | 4x less state |
++
++(**) peak includes model load + quantization temporaries; int4 should end lower
++than fp16 once the guard/measurement is refined.
++
++## Comparison and diagnosis
++
++- **Prefill** is competitive: ZLUDA fp16 4525 tok/s vs Vulkan 4364-4905 tok/s;
++  fp16 accumulation pushes ZLUDA to 7774 tok/s (~+70% over Vulkan), and fp32
++  (4984) is faster than fp16 because rocBLAS fp32 (8.16 TF) beats HPA fp16
++  (6.9 TF) for prefill-sized GEMMs.
++- **Decode is 4-8x slower**: ZLUDA 19-28 tok/s vs Vulkan 105-212 tok/s. Main
++  causes: one Python/kernel-launch-heavy forward per token, math SDPA for the
++  1-token query in the default path, no CUDA graphs, no persistent/merged
++  decode kernels. This is the biggest known ZLUDA-side gap.
++- **Quantization** does not help prefill on ZLUDA (dequant ALU is no longer
++  hidden at M>=1024) - int4 2031 / int8 1990 tok/s vs 4525 fp16; its value is
++  memory/storage (see the quant sections of RESULTS_RDNA1.md). The int4 memory
++  measurement still needs a guard-aware peak fix.
++- **fp16-accum** is the cheapest large prefill win (7.8k tok/s) at the cost of
++  accuracy (documented in RESULTS_RDNA1.md); it also slightly helps decode.
++- Anthropic-tokenizer note: initial FA test used a 1021-token prompt (not
++  divisible by 128) and silently fell back to math; `--exact-seq` pads to an
++  exact 1024-token random prompt so the Triton path runs.
++
++## Bugs found and fixed during this comparison
++
++- `zluda_ops.flash_attention` fallback called the globally patched
++  `F.scaled_dot_product_attention`, causing infinite recursion when the Triton
++  FA path falls back (e.g. sequence not divisible by 128). Now it captures the
++  original function at import (`_ORIGINAL_SDPA`).
++- `torch.compile` and long-context ZLUDA runs are still to be measured
++  (compile of the full model is expected to be slow on this stack).
++
++## Next steps
++
++1. ZLUDA decode optimizations: CUDA/HIP graphs, fused per-token kernels,
++   flash-decoding dispatch in the default path, batching - target is to close
++   the 4-8x gap to Vulkan.
++2. Max-context ZLUDA runs with Triton FA (8k/16k/32k) and the F16-context clamp
++   investigation on the Vulkan side.
++3. torch.compile runs (fp16, fp16-accum) and the TORCH_LOGS fusion audit;
++   implement the missing fusions.
++4. Refine quantization memory accounting (peak during load/quant vs steady
++   state) and re-measure int4/int8.
++5. Final analysis of usage problems and missed optimizations.
 \ No newline at end of file
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
@@ -1941,10 +2005,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b71c090bcb8614c2e4e3f403c6449321c079294f
+index 0000000000000000000000000000000000000000..4cc1e1c375de42fc62017fe877a4e0d4e855acc0
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,398 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2195,6 +2259,17 @@ index 0000000000000000000000000000000000000000..b71c090bcb8614c2e4e3f403c6449321
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - engine comparison (Vulkan vs ZLUDA), first pass:** Ollama
++  Vulkan runs Qwen2.5-0.5B 100% on GPU (Q4_K_M: 4531 tok/s prefill and 150.8
++  tok/s decode at 2k context, 946/104.8 at 32k; F16 is clamped to 8192 context).
++  ZLUDA/PyTorch: prefill 4525 tok/s fp16, **7774 tok/s with fp16 accumulation**
++  (faster than Vulkan), 4984 fp32, 2798 bf16; decode 19-28 tok/s, i.e. **4-8x
++  slower than Vulkan** due to per-token launch overhead and the math attention
++  fallback - the main ZLUDA-side gap. llama.cpp-CUDA under ZLUDA is blocked by
++  `cudaLaunchKernelEx`/PDL (hangs with PDL disabled); bitsandbytes is excluded
++  (`named symbol not found`), replaced by a Triton blockwise-int8 AdamW
++  (4.6x faster step, 3.94x smaller state). Fixed a recursion bug in the Triton
++  FA math fallback. Full data: ENGINE_COMPARISON.md.
 +- **2026-11-25 - P1-3 prefill extension:** added `quant.int4_matmul` (fused
 +  dequant-GEMM, weights never materialised as fp16) and
 +  `quant.int4_prefill_linear` (dequant-once reference). At N=K=4096 the fused
@@ -5049,10 +5124,10 @@ index 0000000000000000000000000000000000000000..a05eacddf9b6a886f544ebf224221770
 +    sys.exit(main())
 diff --git a/bench/model_bench.py b/bench/model_bench.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f8c27e3412a8f8f7670ad45c5672ef62498d91df
+index 0000000000000000000000000000000000000000..6283b83ec22ab5a10f668e2af6e2ad84a23b8e3c
 --- /dev/null
 +++ b/bench/model_bench.py
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,251 @@
 +"""Benchmark a Hugging Face causal LM on the ZLUDA/PyTorch/Triton engine.
 +
 +Measures prefill and decode throughput, peak memory and a training step for a
@@ -5232,6 +5307,8 @@ index 0000000000000000000000000000000000000000..f8c27e3412a8f8f7670ad45c5672ef62
 +    parser.add_argument("--prefill", type=int, default=512)
 +    parser.add_argument("--decode", type=int, default=16)
 +    parser.add_argument("--train", action="store_true")
++    parser.add_argument("--exact-seq", action="store_true",
++                        help="use random token ids of exactly --prefill length (for FA tests)")
 +    parser.add_argument("--quick", action="store_true")
 +    parser.add_argument("--vram-fraction", type=float, default=0.85)
 +    parser.add_argument("--tag", default="")
@@ -5270,8 +5347,13 @@ index 0000000000000000000000000000000000000000..f8c27e3412a8f8f7670ad45c5672ef62
 +            compile_s = None
 +
 +        text = "The quick brown fox jumps over the lazy dog. " * max(1, args.prefill // 10)
-+        ids = tokenizer(text, return_tensors="pt", truncation=True,
-+                        max_length=args.prefill).input_ids.cuda()
++        if args.exact_seq:
++            vocab = model.config.vocab_size
++            torch.manual_seed(0)
++            ids = torch.randint(0, vocab, (1, args.prefill), device="cuda")
++        else:
++            ids = tokenizer(text, return_tensors="pt", truncation=True,
++                            max_length=args.prefill).input_ids.cuda()
 +        seq = ids.shape[1]
 +        prefill_ms = measure_prefill(model, ids)
 +        decode_ms = measure_decode(model, ids, args.decode)
@@ -6560,6 +6642,94 @@ index 0000000000000000000000000000000000000000..453c5bc2f73c481f1c1e2b79117a97c3
 +if __name__ == "__main__":
 +    main()
 +
+diff --git a/bench/run_vulkan_matrix.py b/bench/run_vulkan_matrix.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ef28acb6638632607e219a001b0be7183b9b4a4
+--- /dev/null
++++ b/bench/run_vulkan_matrix.py
+@@ -0,0 +1,82 @@
++"""Run the Ollama/Vulkan benchmark matrix and aggregate the results.
++
++For each (model, flash-attention, kv-cache-type) the Ollama server is restarted
++with `bench/ollama_config.ps1`, then prefill/decode are measured at every
++requested context length. Results are written to one JSON report.
++
++Usage:
++  venv\\Scripts\\python.exe bench\\run_vulkan_matrix.py --ctx 2048,8192,32768 --num-predict 16
++  venv\\Scripts\\python.exe bench\\run_vulkan_matrix.py --models qwen05-q4 --fa 1 --kv q8_0
++"""
++
++import argparse
++import json
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPO / "bench"))
++from ollama_bench import bench_ctx, ps  # noqa: E402
++from common import save_report  # noqa: E402
++
++
++def restart_ollama(fa, kv):
++    proc = subprocess.run(
++        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
++         "-File", str(REPO / "bench" / "ollama_config.ps1"),
++         "-FlashAttention", str(fa), "-KvCacheType", kv],
++        capture_output=True, text=True, timeout=180,
++    )
++    ok = proc.returncode == 0
++    print(f"ollama restart FA={fa} KV={kv}: {'ok' if ok else 'FAILED'} "
++          f"{(proc.stdout or '').strip()[-120:]}", flush=True)
++    return ok
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--models", default="qwen05-q4,qwen05-f16")
++    parser.add_argument("--fa", default="1,0")
++    parser.add_argument("--kv", default="q8_0")
++    parser.add_argument("--ctx", default="2048,8192,32768")
++    parser.add_argument("--num-predict", type=int, default=16)
++    args = parser.parse_args()
++    models = [m for m in args.models.split(",") if m]
++    fas = [int(x) for x in args.fa.split(",") if x]
++    kvs = [k for k in args.kv.split(",") if k]
++    ctxs = [int(x) for x in args.ctx.split(",") if x]
++    rows = []
++    for kv in kvs:
++        for fa in fas:
++            if not restart_ollama(fa, kv):
++                rows.append({"error": "restart failed", "fa": fa, "kv": kv})
++                continue
++            for model in models:
++                for ctx in ctxs:
++                    try:
++                        row = bench_ctx(model, ctx, args.num_predict)
++                        row.update({"model": model, "fa": fa, "kv": kv})
++                    except Exception as exc:  # noqa: BLE001
++                        row = {"model": model, "fa": fa, "kv": kv, "ctx": ctx,
++                               "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
++                    # record the context Ollama actually allocated
++                    try:
++                        loaded = [m for m in ps() if m.get("name", "").startswith(model)]
++                        row["context_length"] = loaded[0].get("context_length") if loaded else None
++                        row["size_vram"] = loaded[0].get("size_vram") if loaded else None
++                    except Exception:
++                        pass
++                    rows.append(row)
++                    keys = ('model', 'fa', 'kv', 'requested_ctx', 'context_length',
++                            'prefill_tok_s', 'decode_tok_s')
++                    summary = {k: row.get(k) for k in keys}
++                    print("  -> " + json.dumps(summary), flush=True)
++    path = save_report("vulkan_matrix", {"rows": rows})
++    print(f"report: {path}", flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/sdpa_one.py b/bench/sdpa_one.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..dd9cea56f9189e7e51c531ff75d7bfad1e900b60
@@ -12260,10 +12430,10 @@ index 0000000000000000000000000000000000000000..024c0f3a3bdfec8526b917af5aa1ccd8
 +__all__ = ["conv2d", "install", "uninstall", "installed", "is_eligible"]
 diff --git a/zluda_ops/flash_attention.py b/zluda_ops/flash_attention.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..60cf1391f4b9ca868c737e6cf7268579911335b3
+index 0000000000000000000000000000000000000000..9680694d14248bea367a993cf01691a4a241b33d
 --- /dev/null
 +++ b/zluda_ops/flash_attention.py
-@@ -0,0 +1,648 @@
+@@ -0,0 +1,652 @@
 +import math
 +
 +import torch
@@ -12272,6 +12442,10 @@ index 0000000000000000000000000000000000000000..60cf1391f4b9ca868c737e6cf7268579
 +import triton.language as tl
 +from torch import nn
 +from torch.nn.attention import SDPBackend, sdpa_kernel
++
++# Captured before zluda_ops.auto patches F.sdpa, so the math fallback never
++# recurses into the patched entry point.
++_ORIGINAL_SDPA = F.scaled_dot_product_attention
 +
 +# Tests may pin the dropout RNG to check determinism across fwd/bwd.
 +_DROPOUT_SEED_OVERRIDE = None
@@ -12772,7 +12946,7 @@ index 0000000000000000000000000000000000000000..60cf1391f4b9ca868c737e6cf7268579
 +        v = v.repeat_interleave(groups, dim=1)
 +        enable_gqa = False
 +    with sdpa_kernel(SDPBackend.MATH):
-+        return F.scaled_dot_product_attention(
++        return _ORIGINAL_SDPA(
 +            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
 +            is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
 +        )
@@ -13701,10 +13875,10 @@ index 0000000000000000000000000000000000000000..dfc22e22129ff9afe19212172aa216f7
 +__all__ = ["install", "uninstall", "installed"]
 diff --git a/zluda_ops/optim8bit.py b/zluda_ops/optim8bit.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..5faed3f134a9c02463acf7ad3579e16b3186455c
+index 0000000000000000000000000000000000000000..2725af6f74a44c2869d5a36973d1c8ae57f58425
 --- /dev/null
 +++ b/zluda_ops/optim8bit.py
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,133 @@
 +"""8-bit AdamW optimizer (bitsandbytes-style) implemented with Triton.
 +
 +bitsandbytes' prebuilt CUDA kernels cannot run through ZLUDA on gfx1010
@@ -13727,6 +13901,7 @@ index 0000000000000000000000000000000000000000..5faed3f134a9c02463acf7ad3579e16b
 +import torch
 +import triton
 +import triton.language as tl
++from triton.language.extra import libdevice
 +
 +BLOCK = 256
 +
@@ -13760,8 +13935,8 @@ index 0000000000000000000000000000000000000000..5faed3f134a9c02463acf7ad3579e16b
 +    v_amax = tl.max(tl.abs(v))
 +    m_amax = tl.maximum(m_amax, 1e-12)
 +    v_amax = tl.maximum(v_amax, 1e-12)
-+    mq_new = tl.maximum(tl.minimum(tl.round(m / m_amax * 127.0), 127.0), -127.0)
-+    vq_new = tl.maximum(tl.minimum(tl.round(v / v_amax * 127.0), 127.0), -127.0)
++    mq_new = tl.maximum(tl.minimum(libdevice.rint(m / m_amax * 127.0), 127.0), -127.0)
++    vq_new = tl.maximum(tl.minimum(libdevice.rint(v / v_amax * 127.0), 127.0), -127.0)
 +    tl.store(P + offs, p.to(P.dtype.element_ty), mask=mask)
 +    tl.store(MQ + offs, mq_new.to(tl.int8), mask=mask)
 +    tl.store(VQ + offs, vq_new.to(tl.int8), mask=mask)

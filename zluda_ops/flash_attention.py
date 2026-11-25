@@ -7,6 +7,10 @@ import triton.language as tl
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+# Captured before zluda_ops.auto patches F.sdpa, so the math fallback never
+# recurses into the patched entry point.
+_ORIGINAL_SDPA = F.scaled_dot_product_attention
+
 # Tests may pin the dropout RNG to check determinism across fwd/bwd.
 _DROPOUT_SEED_OVERRIDE = None
 @triton.jit
@@ -506,7 +510,7 @@ def _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa):
         v = v.repeat_interleave(groups, dim=1)
         enable_gqa = False
     with sdpa_kernel(SDPBackend.MATH):
-        return F.scaled_dot_product_attention(
+        return _ORIGINAL_SDPA(
             q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
             is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
         )
