@@ -777,10 +777,10 @@ index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312
 +- GPU clock/power telemetry on Windows.
 diff --git a/ENGINE_COMPARISON.md b/ENGINE_COMPARISON.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..6f2355554259f0745b508f991740e7e93e391f24
+index 0000000000000000000000000000000000000000..16fb647253e103ccdfe22d6a4950d039386d92bd
 --- /dev/null
 +++ b/ENGINE_COMPARISON.md
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,207 @@
 +# Engine comparison: Vulkan (Ollama) vs ZLUDA (PyTorch/Triton) on gfx1010
 +
 +Final report: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B
@@ -960,12 +960,40 @@ index 0000000000000000000000000000000000000000..6f2355554259f0745b508f991740e7e9
 +3. Fused int8 GEMV + tiled int4 prefill; exact GPTQ/AWQ loading.
 +4. Long-context decode tuning (flash-decoding split count, KV layout).
 +5. Same-engine comparison once ZLUDA supports the llama.cpp launch API.
++
++### llama.cpp addendum (2026-11-25, final verdict)
++
++After the ZLUDA launch-attribute patch, llama.cpp's CUDA backend runs only in a
++narrow, unusable configuration:
++
++- `-ngl 0` (CPU compute through the CUDA backend): works (pp16 124 tok/s,
++  tg2 17.4 tok/s).
++- `-ngl 1 -fa 0` with the F16 GGUF: works (pp8 415.6 tok/s, tg1 61.5 tok/s).
++- Increasing the number of offloaded layers (`-ngl 2..99`) either fails with
++  `CUDA error: unspecified launch failure` / `operation not supported` or
++  **hard-crashes the AMD driver** (the machine has to be rebooted; this happened
++  several times). The Q4_K_M model (K-quant dequant/MMQ kernels) hangs even
++  with `-ngl 1`.
++- Workarounds have no effect: `GGML_CUDA_PDL=0`, `GGML_CUDA_DISABLE_GRAPHS=1`,
++  `GGML_CUDA_NO_PINNED=1`, `GGML_CUDA_DISABLE_FUSION=1`,
++  `GGML_CUDA_FORCE_MMQ=1`.
++
++**Verdict:** running llama.cpp with GPU offload through ZLUDA is not viable on
++this machine today; it is a ZLUDA runtime/compiler problem (llama.cpp's kernel
++set + launch/graph model vs. ZLUDA's PTX JIT and HIP launch path), not a
++llama.cpp binary issue. The patched launch-attribute support
++(`zluda/src/impl/driver.rs`, `cudaLaunchKernelEx`/PDL attributes accepted,
++kernels serialized) is kept because it is a general ZLUDA improvement. A
++legitimate same-engine Vulkan-vs-ZLUDA comparison is therefore still not
++available; `bench/llamacpp_zluda_matrix.ps1` is ready for when the ZLUDA side
++can run llama.cpp kernels. **Warning: do not run llama.cpp with ngl>1 through
++ZLUDA unless a reboot is acceptable - the driver can hang hard.**
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..75de5ac2e36413b013712767267abc2ae54b7e64
+index 0000000000000000000000000000000000000000..7dab61aef2961de3447afa1156f4b200bf55d9e8
 --- /dev/null
 +++ b/INTEGRATION.md
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,196 @@
 +# Out-of-the-box acceleration
 +
 +`zluda_ops.auto` patches two PyTorch entry points at runtime:
@@ -1121,6 +1149,47 @@ index 0000000000000000000000000000000000000000..75de5ac2e36413b013712767267abc2a
 +5. Re-tune Tensile for fp32 8.8–9.2 TF and HH 14–16 TF; evaluate int8
 +   quantization (Stage 3).
 +6. Keep `ZLUDA_OPS_DISABLE=1` as the rollback switch for any regression.
++
++## Ecosystem shims: flash_attn and xformers (no CUDA build required)
++
++Real `flash-attn` and `xformers` wheels cannot be used on this stack (they need
++nvcc/CUTLASS sm80+ kernels, and RDNA1 has no matrix cores). The repo ships API
++shims backed by the Triton kernels instead:
++
++```bat
++venv\Scripts\python.exe tools\install_ecosystem.py
++venv\Scripts\python.exe -c "import flash_attn, xformers; print(flash_attn.__version__, xformers.__version__)"
++```
++
++- `integrations/flash_attn`: `flash_attn_func`, `flash_attn_varlen_func`,
++  `FlashAttnFunc`, `flash_attn.bert_padding.unpad_input/pad_input`, version
++  string. Layout is (B, S, H, D) like the real package. The Triton FA /
++  flash-decoding path is used when supported (fp16, head_dim 64, causal,
++  sequence divisible by 128); otherwise it falls back to math SDPA.
++- `integrations/xformers`: `xformers.ops.memory_efficient_attention`,
++  `memory_efficient_attention_forward`, `AttentionBias`,
++  `LowerTriangularMask`, `TensorBias`, `BlockDiagonalMask`, `fmha` aliases.
++  (B, S, H, D) tensors, additive biases and causal markers are mapped to the
++  Triton path with a math-SDPA fallback.
++- The installer writes `zluda_ecosystem.pth` into the venv site-packages (adds
++  the repo root and `integrations/` to sys.path). Remove it or run the installer
++  with `--uninstall` to roll back.
++
++Limitations: no real CUDA flash-attention kernels (no matrix cores on RDNA1),
++no xformers CUTLASS kernels, no block-sparse/attention-bias kernels beyond the
++math fallback. `transformers` can detect the shim via `is_flash_attn_2_available`
++and will exercise the Triton path for supported shapes.
++
++### llama.cpp on ZLUDA (blocked - do not run with GPU offload)
++
++With the launch-attribute patch (`zluda/src/impl/driver.rs`) llama.cpp's CUDA
++backend loads under ZLUDA and runs at `-ngl 0` (CPU: pp16 124 tok/s, tg2 17.4)
++and `-ngl 1 -fa 0` with the F16 GGUF (pp8 415.6, tg1 61.5). Increasing the
++offloaded layers causes launch failures or **hard AMD driver crashes that
++require a reboot**. The cause is ZLUDA's execution/JIT of llama.cpp's CUDA
++kernel set, not the launch API; a same-engine Vulkan-vs-ZLUDA comparison stays
++blocked. Details and the ready matrix runner: ENGINE_COMPARISON.md and
++bench/llamacpp_zluda_matrix.ps1.
 diff --git a/README.md b/README.md
 index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb460ca40544 100644
 --- a/README.md
@@ -2069,10 +2138,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..5ca50337ed11d7acbc9ff077bf2b2a3f6024c214
+index 0000000000000000000000000000000000000000..f0c69eaf62d5ad29239b0a47df9a82103142a2de
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,445 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2323,6 +2392,24 @@ index 0000000000000000000000000000000000000000..5ca50337ed11d7acbc9ff077bf2b2a3f
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - ecosystem shims:** added `integrations/flash_attn` and
++  `integrations/xformers` shims (flash_attn_func/varlen_func/bert_padding,
++  xformers.ops.memory_efficient_attention + bias types) backed by the Triton FA
++  and flash-decoding kernels with a math-SDPA fallback, installable with
++  `tools/install_ecosystem.py` (venv `.pth`). CPU API/fallback tests pass
++  (flash_attn err 4e-7, xformers ops finite); GPU smoke tests of the shims are
++  the next safe step. llama.cpp remains blocked (driver hard-crash with
++  offloaded layers) and is documented in INTEGRATION/ENGINE_COMPARISON.
++- **2026-11-25 - llama.cpp verdict:** after the launch-attribute patch ZLUDA can
++  run llama.cpp only at `-ngl 0` (CPU: pp16 124/tg2 17.4) or `-ngl 1 -fa 0`
++  (F16: pp8 415.6/tg1 61.5). Scaling GPU offload fails with launch errors or
++  hard-crashes the AMD driver (reboot required); Q4_K_M hangs at ngl=1. This is
++  a ZLUDA runtime/compiler limitation (llama.cpp kernel set + PTX JIT), not a
++  llama.cpp binary bug, so a same-engine Vulkan-vs-ZLUDA comparison stays
++  blocked. The launch-attribute patch is kept as a general improvement; the
++  matrix runner is ready for when ZLUDA can execute llama.cpp kernels. Next
++  ecosystem work continues with safe paths (torch.compile/SDPA/ComfyUI and API
++  shims for flash_attn/xformers backed by the Triton kernels).
 +- **2026-11-25 - llama.cpp under ZLUDA (patch attempt):** ZLUDA's
 +  `launch_kernel_ex` rejected PDL launch attributes; patched
 +  `zluda/src/impl/driver.rs` to accept launch-time attributes (serialized
@@ -8792,6 +8879,291 @@ index 0000000000000000000000000000000000000000..49d12a9c15c17c0db4c945311ce3d09e
 +
 +NODE_CLASS_MAPPINGS = {}
 +NODE_DISPLAY_NAME_MAPPINGS = {}
+diff --git a/integrations/flash_attn/__init__.py b/integrations/flash_attn/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6eb5bff68b89e056d1b08774f62ea249372ff1c4
+--- /dev/null
++++ b/integrations/flash_attn/__init__.py
+@@ -0,0 +1,103 @@
++"""flash_attn-compatible shim backed by the ZLUDA Triton kernels.
++
++`pip install flash-attn` cannot work on this stack: the package needs nvcc, and
++its CUDA kernels target sm80+ SASS/PTX while RDNA1 has no matrix cores. This
++module provides the public surface that inference/training code and
++`transformers` expect, implemented with `zluda_ops.flash_attention` (Triton FA
++forward+backward, math fallback for unsupported shapes) and
++`zluda_ops.flash_decode` (split-KV decode).
++
++Install with `tools/install_ecosystem.py` (adds `integrations/` and the repo root
++to sys.path) or set `PYTHONPATH=integrations;.`.
++
++Limitations: no real CUDA flash-attention kernels; the Triton path needs
++head_dim=64 and fp16; everything else falls back to PyTorch math SDPA (correct,
++slower). `flash_attn_func` expects (B, S, H, D) like the real package.
++"""
++
++import torch
++import torch.nn.functional as F
++
++__version__ = "2.7.4+zluda-shim"
++
++
++def _math_sdpa(q, k, v, dropout_p, scale, causal):
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    with sdpa_kernel(SDPBackend.MATH):
++        return F.scaled_dot_product_attention(
++            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal,
++            scale=scale,
++        )
++
++
++def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
++                    window_size=(-1, -1), softcap=0.0, alibi_slopes=None,
++                    deterministic=False, return_attn_probs=False):
++    """Drop-in replacement for flash_attn.flash_attn_func (B, S, H, D layout)."""
++    q_bhsd, k_bhsd, v_bhsd = (t.transpose(1, 2).contiguous() for t in (q, k, v))
++    try:
++        from zluda_ops.flash_attention import flash_attn_func as _impl
++
++        out = _impl(q_bhsd, k_bhsd, v_bhsd, dropout_p=dropout_p,
++                    softmax_scale=softmax_scale, causal=causal,
++                    window_size=window_size, softcap=softcap,
++                    alibi_slopes=alibi_slopes, deterministic=deterministic,
++                    return_attn_probs=return_attn_probs)
++        return out.transpose(1, 2).contiguous()
++    except NotImplementedError:
++        out = _math_sdpa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
++                         dropout_p, softmax_scale, causal)
++        return out.transpose(1, 2).contiguous()
++
++
++def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
++                           max_seqlen_q=None, max_seqlen_k=None,
++                           dropout_p=0.0, softmax_scale=None, causal=False,
++                           window_size=(-1, -1), softcap=0.0,
++                           alibi_slopes=None, deterministic=False,
++                           return_attn_probs=False, block_table=None):
++    """Drop-in replacement for flash_attn.flash_attn_varlen_func."""
++    from zluda_ops.flash_attention import flash_attn_varlen_func as _impl
++
++    if q.dim() != 3:
++        raise ValueError("varlen expects (total, heads, head_dim) tensors")
++    return _impl(q, k, v, cu_seqlens_q, cu_seqlens_k,
++                 max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
++                 dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal,
++                 window_size=window_size, softcap=softcap,
++                 alibi_slopes=alibi_slopes, deterministic=deterministic,
++                 return_attn_probs=return_attn_probs, block_table=block_table)
++
++
++class FlashAttnFunc(torch.autograd.Function):
++    """Minimal autograd wrapper for code that instantiates the class."""
++
++    @staticmethod
++    def forward(ctx, q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
++                window_size=(-1, -1), softcap=0.0, alibi_slopes=None,
++                deterministic=False, return_attn_probs=False):
++        ctx.save_for_backward(q, k, v)
++        ctx.params = (dropout_p, softmax_scale, causal, window_size, softcap,
++                      deterministic)
++        return flash_attn_func(q, k, v, dropout_p=dropout_p,
++                               softmax_scale=softmax_scale, causal=causal,
++                               window_size=window_size, softcap=softcap,
++                               deterministic=deterministic)
++
++    @staticmethod
++    def backward(ctx, grad_out):
++        q, k, v = ctx.saved_tensors
++        dropout_p, softmax_scale, causal, window_size, softcap, _ = ctx.params
++        with torch.enable_grad():
++            q_ = q.detach().requires_grad_(True)
++            k_ = k.detach().requires_grad_(True)
++            v_ = v.detach().requires_grad_(True)
++            out = flash_attn_func(q_, k_, v_, dropout_p=dropout_p,
++                                  softmax_scale=softmax_scale, causal=causal,
++                                  window_size=window_size, softcap=softcap)
++            gq, gk, gv = torch.autograd.grad(out, (q_, k_, v_), grad_out)
++        return gq, gk, gv, None, None, None, None, None, None, None, None
++
++__all__ = ["flash_attn_func", "flash_attn_varlen_func", "FlashAttnFunc",
++           "__version__"]
+diff --git a/integrations/flash_attn/bert_padding.py b/integrations/flash_attn/bert_padding.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..04e528f31273cbab31bd8ad92046d9fee92b2637
+--- /dev/null
++++ b/integrations/flash_attn/bert_padding.py
+@@ -0,0 +1,37 @@
++"""flash_attn.bert_padding-compatible helpers (eager PyTorch implementations).
++
++These are only used by code that unpads padded batches before calling
++flash_attn_varlen_func; the implementations mirror the upstream flash-attn
++semantics without any CUDA kernels.
++"""
++
++import torch
++
++
++def index_first_axis(x, indices):
++    return x.index_select(0, indices)
++
++
++def unpad_input(hidden_states, attention_mask):
++    """(B, S, ...) + (B, S) mask -> (total, ...), indices, cu_seqlens, max_len."""
++    if attention_mask.dim() == 4:  # HF sometimes passes (B, 1, S, S)
++        attention_mask = attention_mask[:, 0, 0, :]
++    seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
++    flat_mask = attention_mask.flatten()
++    indices = torch.nonzero(flat_mask, as_tuple=False).flatten()
++    max_seqlen = int(seqlens.max().item()) if seqlens.numel() else 0
++    cu_seqlens = torch.zeros(seqlens.shape[0] + 1, dtype=torch.int32,
++                             device=attention_mask.device)
++    cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
++    flat = hidden_states.reshape(-1, *hidden_states.shape[2:])
++    return index_first_axis(flat, indices), indices, cu_seqlens, max_seqlen
++
++
++def pad_input(hidden_states, indices, batch, seqlen):
++    """(total, ...) + indices -> (B, S, ...)."""
++    out = hidden_states.new_zeros(batch * seqlen, *hidden_states.shape[1:])
++    out.index_copy_(0, indices, hidden_states)
++    return out.reshape(batch, seqlen, *hidden_states.shape[1:])
++
++
++__all__ = ["unpad_input", "pad_input", "index_first_axis"]
+diff --git a/integrations/xformers/__init__.py b/integrations/xformers/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c302e4b6b6b9d1aa7970b05f9a3c2cf90dc1fdbd
+--- /dev/null
++++ b/integrations/xformers/__init__.py
+@@ -0,0 +1,21 @@
++"""xformers-compatible shim for the ops most code uses on gfx1010.
++
++Real xformers cannot be installed/used here: its memory-efficient attention
++kernels are CUDA/CUTLASS sm80+ and RDNA1 has no matrix cores. This shim maps
++`xformers.ops.memory_efficient_attention` (and friends) to the ZLUDA Triton
++flash-attention path from `zluda_ops`, with a math-SDPA fallback.
++
++Supports: `memory_efficient_attention`, `memory_efficient_attention_forward`,
++`AttentionBias`, `LowerTriangularMask`, `TensorBias`, `BlockDiagonalMask`
++(minimal), and `xformers.ops.fmha` aliases. Layouts follow xformers: (B, S, H, D)
++tensors and optional attn_bias; unsupported biases fall back to math SDPA.
++"""
++
++import torch
++import torch.nn.functional as F
++
++from . import ops  # noqa: F401
++
++__version__ = "0.0.29+zluda-shim"
++
++__all__ = ["ops", "__version__"]
+diff --git a/integrations/xformers/ops/__init__.py b/integrations/xformers/ops/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd39d03a428514a08a54c65203f7bf3e2627de46
+--- /dev/null
++++ b/integrations/xformers/ops/__init__.py
+@@ -0,0 +1,100 @@
++"""xformers.ops shim: memory-efficient attention via ZLUDA Triton kernels."""
++
++import torch
++import torch.nn.functional as F
++
++
++class AttentionBias:
++    """Base class for xformers attention biases."""
++
++
++class LowerTriangularMask(AttentionBias):
++    """Causal mask marker (maps to is_causal=True)."""
++
++
++class TensorBias(AttentionBias):
++    """Additive bias; `bias` may be broadcastable to (B, H, S, S) or (S, S)."""
++
++    def __init__(self, bias):
++        self.bias = bias
++
++
++class BlockDiagonalMask(AttentionBias):
++    """Block-diagonal (varlen) bias; handled by the math fallback if needed."""
++
++    def __init__(self, q_seqlen, kv_seqlen=None):
++        self.q_seqlen = q_seqlen
++        self.kv_seqlen = kv_seqlen if kv_seqlen is not None else q_seqlen
++
++
++class BlockDiagonalCausalMask(BlockDiagonalMask):
++    pass
++
++
++def _to_bhsd(t):
++    return t.transpose(1, 2).contiguous()
++
++
++def _bias_to_mask(attn_bias, q, k):
++    if attn_bias is None:
++        return None, False
++    if isinstance(attn_bias, LowerTriangularMask):
++        return None, True
++    if isinstance(attn_bias, TensorBias):
++        bias = attn_bias.bias
++        if bias.dtype != q.dtype:
++            bias = bias.to(q.dtype)
++        return bias, False
++    return None, False
++
++
++def memory_efficient_attention_forward(query, key, value, attn_bias=None,
++                                       p=0.0, scale=None, output_dtype=None):
++    """xformers API: (B, S, H, D) tensors -> (B, S, H, D) tensor."""
++    if output_dtype is None:
++        output_dtype = query.dtype
++    q_bhsd, k_bhsd, v_bhsd = _to_bhsd(query), _to_bhsd(key), _to_bhsd(value)
++    mask, causal = _bias_to_mask(attn_bias, query, key)
++    try:
++        from zluda_ops.flash_attention import scaled_dot_product_attention as _fa
++
++        out = _fa(q_bhsd, k_bhsd, v_bhsd, attn_mask=mask, dropout_p=p,
++                  is_causal=causal, scale=scale)
++    except Exception:  # noqa: BLE001 - fall back to math SDPA
++        from torch.nn.attention import SDPBackend, sdpa_kernel
++
++        with sdpa_kernel(SDPBackend.MATH):
++            out = F.scaled_dot_product_attention(
++                q_bhsd, k_bhsd, v_bhsd, attn_mask=mask, dropout_p=p,
++                is_causal=causal, scale=scale)
++    return out.transpose(1, 2).contiguous().to(output_dtype)
++
++
++def memory_efficient_attention(query, key, value, attn_bias=None, p=0.0,
++                               scale=None, output_dtype=None):
++    return memory_efficient_attention_forward(query, key, value, attn_bias, p,
++                                              scale, output_dtype)
++
++
++def unbind(x, dim=0):
++    return x.unbind(dim)
++
++
++class fmha:
++    """Minimal `xformers.ops.fmha` namespace used by some integrations."""
++
++    memory_efficient_attention = staticmethod(memory_efficient_attention)
++    memory_efficient_attention_forward = staticmethod(
++        memory_efficient_attention_forward)
++    AttentionBias = AttentionBias
++    LowerTriangularMask = LowerTriangularMask
++    TensorBias = TensorBias
++    BlockDiagonalMask = BlockDiagonalMask
++    BlockDiagonalCausalMask = BlockDiagonalCausalMask
++
++
++__all__ = [
++    "memory_efficient_attention", "memory_efficient_attention_forward",
++    "AttentionBias", "LowerTriangularMask", "TensorBias", "BlockDiagonalMask",
++    "BlockDiagonalCausalMask", "fmha", "unbind",
++]
 diff --git a/llvm_zluda/build.rs b/llvm_zluda/build.rs
 index 8db3551904bf0375c98ffca54f1cbc6ce1a93cc5..9d9c5ac3063f69f6a9c5eb570e2919bbafe60028 100644
 --- a/llvm_zluda/build.rs
@@ -11226,6 +11598,69 @@ index 0000000000000000000000000000000000000000..4a9f9d08cc94a3ce295146211da873ed
 +    dest = comfy / "custom_nodes" / "zluda_ops_auto"
 +    shutil.copytree(src, dest, dirs_exist_ok=True)
 +    print(f"installed {dest}")
+diff --git a/tools/install_ecosystem.py b/tools/install_ecosystem.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..08068aeb5b6dc4d2fb539345d4c2f7bd4e0ed2f1
+--- /dev/null
++++ b/tools/install_ecosystem.py
+@@ -0,0 +1,57 @@
++"""Install the ZLUDA ecosystem shims (flash_attn, xformers) into the venv.
++
++Adds a `.pth` file to site-packages that puts the repository root and
++`integrations/` on sys.path, so `import flash_attn` / `import xformers` resolve
++to the shims backed by the Triton kernels (no CUDA flash-attn/xformers build
++needed). Reversible: delete the generated `.pth` file.
++
++Usage:
++  venv\\Scripts\\python.exe tools\\install_ecosystem.py
++  venv\\Scripts\\python.exe tools\\install_ecosystem.py --uninstall
++"""
++
++import argparse
++import site
++import sys
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++PTH_NAME = "zluda_ecosystem.pth"
++
++
++def target_dir():
++    candidates = [Path(p) for p in site.getsitepackages()]
++    for cand in candidates:
++        if cand.exists():
++            return cand
++    return Path(site.getusersitepackages())
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--uninstall", action="store_true")
++    args = parser.parse_args()
++    dest = target_dir() / PTH_NAME
++    if args.uninstall:
++        if dest.exists():
++            dest.unlink()
++            print(f"removed {dest}")
++        else:
++            print(f"{dest} does not exist")
++        return 0
++    lines = [
++        f"{REPO}",
++        f"{REPO / 'integrations'}",
++    ]
++    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    print(f"wrote {dest}")
++    print("  paths:")
++    for line in lines:
++        print(f"    {line}")
++    print("verify: venv\\Scripts\\python.exe -c \"import flash_attn, xformers; "
++          "print(flash_attn.__version__, xformers.__version__)\"")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/tools/install_hooks.ps1 b/tools/install_hooks.ps1
 new file mode 100644
 index 0000000000000000000000000000000000000000..9fb3fe5ba2807c4dc92eb9038f1f8ed9e1f7ea34
