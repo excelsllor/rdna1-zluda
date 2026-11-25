@@ -248,6 +248,18 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - ecosystem roadmap (3 phases) + Phase-1 analysis:**
+  docs/ROADMAP_ECOSYSTEM.md created: Phase 1 close the infrastructure (status
+  matrix of every library/engine/application with evidence, verification
+  checklist, ranked fixes), Phase 2 custom fast Triton kernels for everything
+  (kernel inventory + roofline targets), Phase 3 replace hipBLAS/rocBLAS hot
+  paths with custom kernels (only where phase 2 leaves a gap). Phase-1 probes
+  already found: cuFFT FAIL (CUFFT_NOT_SUPPORTED for torch.fft), cuSPARSE FAIL
+  (cusparseSetStream not supported), cuDNN batchnorm FAIL
+  (CUDNN_STATUS_NOT_SUPPORTED), RNN/LSTM FAIL (CUDNN_STATUS_INTERNAL_ERROR +
+  MIOpen kernel argument error, process died); pooling/convT/randn/topk/sort/
+  bmm/sdpa work. Top fixes ranked: cuSPARSE stream, cuFFT plans, cuDNN
+  batchnorm, RNN/LSTM, then llama.cpp FA/Q4, torch.compile decode, shims, ComfyUI.
 - **2026-11-25 - Triton optimality + custom HIP kernels audit:** Triton GEMV
   reaches 15-40% of bandwidth on per-layer decode matvecs (68-181 GB/s of
   448 GB/s) and flash-decoding wastes 7x KV bandwidth on GQA; FA prefill (33%
