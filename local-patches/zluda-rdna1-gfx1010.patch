@@ -1046,10 +1046,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..202189e318420bebc688a19d9c992b289a2a7b52
+index 0000000000000000000000000000000000000000..baaa8ed9faa37748b80254e5cff6630034f2a7f1
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,574 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1583,12 +1583,53 @@ index 0000000000000000000000000000000000000000..202189e318420bebc688a19d9c992b28
 +  302/331 GB/s (fp16/fp32) with the measurement protocol from P0-5.
 +- M=32 keeps the rocBLAS fallback on the auto path (119 GB/s fp32 vs 76-83
 +  Triton), and the 70-80% target is recorded as unreachable rather than open.
++
++## P1-1 Winograd / MIOpen convolution audit (2026-11-25)
++
++`bench/conv.py` measures 3x3 stride-1 conv2d on ResNet/SD shapes, checks
++correctness against CPU and captures the MIOpen solver choice. Correctness:
++max abs 2.5e-5 (relative 4.8e-7) vs CPU for fp32.
++
++The MIOpen logs (MIOPEN_ENABLE_LOGGING=1, MIOPEN_LOG_LEVEL=6) show that for
++NCHW fp16 3x3 the selected solution is **`GemmFwdRest` with
++`miopenConvolutionFwdAlgoGEMM`** (find time 0.1052 ms): MIOpen lowers the
++convolution to a rocBLAS GEMM. Winograd and HIP implicit-GEMM solvers are not
++selected for gfx1010 here. Additional environment findings:
++
++- `MIOpen: Warning [ParseAndLoadDb] File is unreadable: gfx1010_20.HIP.fdb.txt`
++  — there is no gfx1010 perf-db, so every new shape runs a runtime find.
++- `MIOpen: Warning [OpenRuntimeLibraryForDevice] CK grouped conv library not
++  found for device gfx1010` — the CK grouped-conv path is unavailable.
++
++Performance (NCHW, s=forward, 3x3 s1 p1):
++
++| shape (B,C,H,W,O) | fp32 fwd | fp16 fwd | fp32 fwd+bwd | fp16 fwd+bwd |
++|---|---|---|---|---|
++| 1x64x56x56x64 | 0.08 ms | 0.16 ms | 0.48 ms | 0.67 ms |
++| 8x64x56x56x64 | 0.22 ms | 0.72 ms | 1.16 ms | 2.82 ms |
++| 8x256x14x14x256 | 0.18 ms | 0.96 ms | 0.75 ms | 2.39 ms |
++| 2x256x64x64x256 | 0.67 ms | 2.14 ms | 2.92 ms | 6.24 ms |
++
++Two practical results:
++
++- **channels_last is unusable** on gfx1010: 10-1000x slower than NCHW
++  (e.g. 2x256x64x64 fp32: 546 ms vs 0.67 ms). Keep NCHW.
++- **fp16 convolution is 2-4x slower than fp32** through MIOpen on this card,
++  even though the selected solver is a GEMM in both cases. This matters for
++  fp16 SD/ComfyUI workloads and is a candidate follow-up (e.g. running
++  selected convs in fp32 or forcing a different solver).
++
++Decision for the roadmap: no custom Winograd path. MIOpen already lets its
++find choose among solvers (ZLUDA calls `miopenFindSolutions` and takes the
++fastest), and for gfx1010 it picks the GEMM fallback; Winograd is "not
++beneficial/not selected" rather than an opportunity. The remaining conv win
++would come from the missing gfx1010 perf-db and from the fp16-vs-fp32 anomaly.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..da05141b71f65faa5808bb67db45700a9204f531
+index 0000000000000000000000000000000000000000..add023e0efa97cb27776f08ff1890a6ffcc1b913
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,326 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1630,7 +1671,7 @@ index 0000000000000000000000000000000000000000..da05141b71f65faa5808bb67db45700a
 +| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 +| **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 +| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **OPEN** | memory/speed | medium | Triton |
-+| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **AUDIT DONE / TEST OPEN** | SD/CNN speedup if MIOpen wins | medium | MIOpen; no ZLUDA-native kernels |
++| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | result: MIOpen lowers 3x3 to GEMM (`GemmFwdRest`), no Winograd/implicit-GEMM selected; channels_last unusable; fp16 2-4x slower than fp32; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
 +| **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **OPEN** | high if SD is a target | medium-high | measure first |
 +| **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | **PARTIAL** | +5–15% | medium | measured, not fused/auto |
 +| **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | **OPEN** | +5–20% on kernels | low-medium | benchmarks |
@@ -1652,7 +1693,7 @@ index 0000000000000000000000000000000000000000..da05141b71f65faa5808bb67db45700a
 +| 2 — Attention | **PARTIAL** | causal/non-causal/GQA done; masks/dropout/window/varlen fallback; flash-decoding open |
 +| 3 — Quantization | **OPEN** | storage path not implemented; no int8 compute |
 +| 4 — Fused kernels | **OPEN** | not started |
-+| 5 — Diffusion/MIOpen | **PARTIAL** | Winograd audit done; benchmark and auto-selection open |
++| 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 +| 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
 +| 7 — Compiler/LLVM/Triton | **OPEN** | WGP/CU and autotune not started |
 +| 8 — Integrations/distribution | **PARTIAL** | ComfyUI auto/GGUF works; wheels/CI/other apps open |
@@ -1811,6 +1852,14 @@ index 0000000000000000000000000000000000000000..da05141b71f65faa5808bb67db45700a
 +  kernels with the Philox mask regenerated from (head, query, key) offsets;
 +  unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
 +  s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
++- **2026-11-25 - P1-1 (conv audit):** `bench/conv.py` measures ResNet/SD 3x3
++  convolutions. MIOpen logs prove the selected solver is `GemmFwdRest`
++  (`miopenConvolutionFwdAlgoGEMM`, find 0.1052 ms): 3x3 is lowered to a rocBLAS
++  GEMM on gfx1010, Winograd/implicit-GEMM are not selected. NCHW is the only
++  usable layout (channels_last 10-1000x slower); fp16 conv is 2-4x slower than
++  fp32; the gfx1010 perf-db (`gfx1010_20.HIP.fdb.txt`) is missing and the CK
++  grouped-conv library is unavailable. Decision: no custom Winograd path; the
++  remaining win is the fp16-conv anomaly and shipping a perf-db.
 +- **2026-11-25 - P0-4 (GEMV M=16/32):** benchmarked a split-K / tl.dot kernel
 +  (`bench/gemv_m32.py`) and packed-fp16 product variants. Split-K reaches
 +  64-81 GB/s at M=32 (mvec 81), packed-fp16 is worse (31-50), so the 70-80%
@@ -1864,7 +1913,7 @@ index 0000000000000000000000000000000000000000..da05141b71f65faa5808bb67db45700a
 +
 +| # | Action | Priority | Gate/acceptance |
 +|---|---|---|---|
-+| 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | >=10% vs implicit GEMM or document "not beneficial" |
++| 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | **CLOSED 2026-11-25**: MIOpen selects `GemmFwdRest` (GEMM) for 3x3; Winograd not selected; NCHW-only; fp16 2-4x slower than fp32; perf-db for gfx1010 missing — decision: no custom Winograd path, follow-ups = fp16 conv + perf-db |
 +| 2 | Triton dropout for FA | P0 | **CLOSED 2026-11-25**: masks and inverted dropout run in Triton fwd+bwd; window/varlen remain (row 3) |
 +| 3 | Triton sliding-window + varlen FA | P0 | **CLOSED 2026-11-25**: window arithmetic in kernel (7.1x @1024), varlen per-sequence Triton; fused packed varlen kernel still open |
 +| 4 | GEMV M=16/32 tuning | P0 | **CLOSED 2026-11-25**: M16 176 GB/s (+13% via fp32-product config), M32 83; split-K/tl.dot (64-81) and packed-fp16 (31-50) measured worse; target 70-80% recorded as unreachable, rocBLAS fp32 M=32 kept as fallback |
@@ -2264,6 +2313,199 @@ index 0000000000000000000000000000000000000000..3cc6326e0d09030c49d8498dfaec8d13
 +    print(f"compiled fp16: {ms_comp:.2f} ms")
 +    err = (y - model(x)).abs().max().item()
 +    print(f"max diff vs eager: {err:.4f}")
+diff --git a/bench/conv.py b/bench/conv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..86f45a436ff2512f06fc18d1131affc27a259512
+--- /dev/null
++++ b/bench/conv.py
+@@ -0,0 +1,187 @@
++"""Winograd / MIOpen convolution audit on gfx1010.
++
++The roadmap asks whether MIOpen's Winograd solvers are available and faster
++than implicit GEMM for 3x3 stride-1/dilation-1 convolutions (SD/ResNet shapes).
++ZLUDA maps cuDNN calls to MIOpen (`zluda_dnn`), so PyTorch conv2d exercises the
++MIOpen solver selection. This script measures forward/backward for a shape
++matrix, compares NCHW vs channels_last and fp16 vs fp32, checks correctness
++against a CPU reference on a small shape, and can capture the MIOpen solver
++choice by re-running one convolution with MIOPEN_LOG_LEVEL set.
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\conv.py --quick
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\conv.py
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\conv.py --solver-probe
++"""
++
++import argparse
++import os
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from common import bench_median, save_report
++
++DEV = "cuda"
++
++
++def make(shape, dtype, channels_last, requires_grad=False):
++    b, c, h, w, o, k = shape
++    x = torch.randn(b, c, h, w, device=DEV, dtype=dtype, requires_grad=requires_grad)
++    weight = torch.randn(o, c, k, k, device=DEV, dtype=dtype, requires_grad=requires_grad)
++    bias = torch.randn(o, device=DEV, dtype=dtype)
++    if channels_last:
++        x = x.to(memory_format=torch.channels_last)
++    return x, weight, bias
++
++
++def fwd_ms(shape, dtype, channels_last, benchmark):
++    x, weight, bias = make(shape, dtype, channels_last)
++    torch.backends.cudnn.benchmark = benchmark
++    b, c, h, w, o, k = shape
++    p = k // 2
++    run = lambda: F.conv2d(x, weight, bias, stride=1, padding=p)
++    run()
++    torch.cuda.synchronize()
++    return bench_median(run, rounds=3, iters=3)
++
++
++def fwd_bwd_ms(shape, dtype, channels_last):
++    x, weight, bias = make(shape, dtype, channels_last, requires_grad=True)
++    b, c, h, w, o, k = shape
++    p = k // 2
++
++    def run():
++        y = F.conv2d(x, weight, bias, stride=1, padding=p)
++        loss = y.float().mean()
++        loss.backward()
++        x.grad = weight.grad = None
++
++    run()
++    torch.cuda.synchronize()
++    return bench_median(run, rounds=3, iters=2)
++
++
++def correctness():
++    torch.manual_seed(0)
++    x = torch.randn(1, 16, 32, 32, dtype=torch.float32)
++    w = torch.randn(32, 16, 3, 3, dtype=torch.float32)
++    b = torch.randn(32, dtype=torch.float32)
++    ref = F.conv2d(x, w, b, stride=1, padding=1)
++    out = F.conv2d(x.cuda(), w.cuda(), b.cuda(), stride=1, padding=1).float().cpu()
++    err = (out - ref).abs().max().item()
++    rel = err / ref.abs().max().item()
++    print(f"correctness 3x3 fp32 vs CPU: max abs {err:.3e} (rel {rel:.3e})", flush=True)
++    return {"max_abs": err, "relative": rel}
++
++
++def run_matrix(shapes, dtypes, layouts):
++    rows = []
++    for shape in shapes:
++        for dtype in dtypes:
++            for channels_last in layouts:
++                row = {"shape": shape, "dtype": str(dtype).split(".")[-1],
++                       "channels_last": channels_last}
++                try:
++                    row["fwd_ms"] = fwd_ms(shape, dtype, channels_last, False)
++                except Exception as exc:
++                    row["fwd_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
++                    rows.append(row)
++                    print(f"{shape} {row['dtype']} cl={channels_last}: FAIL {row['fwd_error']}",
++                          flush=True)
++                    continue
++                try:
++                    row["fwd_bwd_ms"] = fwd_bwd_ms(shape, dtype, channels_last)
++                except Exception as exc:
++                    row["fwd_bwd_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
++                try:
++                    row["fwd_benchmark_ms"] = fwd_ms(shape, dtype, channels_last, True)
++                except Exception as exc:
++                    row["fwd_benchmark_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
++                torch.backends.cudnn.benchmark = False
++                b, c, h, w, o, k = shape
++                flops = 2.0 * b * o * h * w * c * k * k
++                row["fwd_tflops"] = flops / (row["fwd_ms"] / 1000.0) / 1e12
++                rows.append(row)
++                parts = [f"{shape} {row['dtype']:8s} cl={int(channels_last)}: "
++                         f"fwd {row['fwd_ms']:7.2f} ms"]
++                if "fwd_bwd_ms" in row:
++                    parts.append(f"fwd+bwd {row['fwd_bwd_ms']:7.2f} ms")
++                if "fwd_benchmark_ms" in row:
++                    parts.append(f"benchmark {row['fwd_benchmark_ms']:7.2f} ms")
++                print(" ".join(parts), flush=True)
++    return rows
++
++
++def solver_probe(shape=(1, 64, 56, 56, 64, 3), dtype=torch.float16):
++    """Re-run one conv in a child process with MIOpen logging and grep solvers."""
++    script = (
++        "import torch, torch.nn.functional as F\n"
++        f"b,c,h,w,o,k = {shape}\n"
++        "x = torch.randn(b,c,h,w,device='cuda',dtype=torch." + str(dtype).split('.')[-1] + ")\n"
++        "w_ = torch.randn(o,c,k,k,device='cuda',dtype=x.dtype)\n"
++        "y = F.conv2d(x,w_,padding=k//2)\n"
++        "torch.cuda.synchronize()\n"
++        "print('conv done', tuple(y.shape), flush=True)\n"
++    )
++    env = dict(os.environ)
++    env["MIOPEN_ENABLE_LOGGING"] = "1"
++    env["MIOPEN_LOG_LEVEL"] = os.environ.get("MIOPEN_LOG_LEVEL", "6")
++    print(f"solver probe: MIOPEN_LOG_LEVEL={env['MIOPEN_LOG_LEVEL']}", flush=True)
++    proc = subprocess.run(
++        [sys.executable, "-c", script], env=env, capture_output=True, text=True,
++        timeout=900,
++    )
++    text = (proc.stdout or "") + (proc.stderr or "")
++    interesting = [
++        line.strip() for line in text.splitlines()
++        if re.search(r"winograd|implicit|igemm|GemmFwd|FindSolution|FindConvolution|fdb|solver",
++                     line, re.IGNORECASE)
++    ]
++    tail = interesting[-40:]
++    print(f"probe exit {proc.returncode}, {len(interesting)} solver-related lines", flush=True)
++    for line in tail:
++        print("  " + line[:220], flush=True)
++    return {"exit": proc.returncode, "lines": len(interesting), "tail": tail}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--quick", action="store_true")
++    parser.add_argument("--solver-probe", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    args = parser.parse_args()
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    torch.backends.cudnn.benchmark = False
++    print(f"VRAM fraction {args.vram_fraction}", flush=True)
++    print(f"cudnn {torch.backends.cudnn.version()}, channels_last supported: "
++          f"{torch.backends.cudnn.is_available()}", flush=True)
++
++    corr = correctness()
++    shapes = [
++        (1, 64, 56, 56, 64, 3),
++        (8, 64, 56, 56, 64, 3),
++        (1, 128, 28, 28, 128, 3),
++        (8, 256, 14, 14, 256, 3),
++        (1, 320, 32, 32, 320, 3),
++        (2, 256, 64, 64, 256, 3),
++        (1, 320, 64, 64, 320, 3),
++    ]
++    if args.quick:
++        shapes = shapes[:3]
++    rows = run_matrix(shapes, (torch.float16, torch.float32), (False, True))
++    probe = solver_probe() if args.solver_probe else None
++    save_report("conv", {"correctness": corr, "rows": rows, "solver_probe": probe})
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/fa_dropout.py b/bench/fa_dropout.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..7a2f004f02d4adea05970c9273d764cf1adceaa6
@@ -5727,10 +5969,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff68bc4bd8ab51ceff286dc927f9b6850bdf8f13
+index 0000000000000000000000000000000000000000..a5cb396e5d583960145bd9a7a172129fb6df447a
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,358 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -6015,6 +6257,7 @@ index 0000000000000000000000000000000000000000..ff68bc4bd8ab51ceff286dc927f9b685
 +run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench
 +run-zluda.cmd venv\Scripts\python.exe bench\fa_window.py --s 512 --bench
 +run-zluda.cmd venv\Scripts\python.exe bench\gemv_m32.py --n 4096 --k 4096 --mvec
++run-zluda.cmd venv\Scripts\python.exe bench\conv.py --quick
 +```
 +
 +Expected reference numbers are in `RESULTS_RDNA1.md`.
