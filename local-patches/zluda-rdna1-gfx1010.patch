@@ -777,10 +777,10 @@ index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312
 +- GPU clock/power telemetry on Windows.
 diff --git a/ENGINE_COMPARISON.md b/ENGINE_COMPARISON.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..16fb647253e103ccdfe22d6a4950d039386d92bd
+index 0000000000000000000000000000000000000000..665c91d8930e892ed621c8398ccf33523f15e730
 --- /dev/null
 +++ b/ENGINE_COMPARISON.md
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,218 @@
 +# Engine comparison: Vulkan (Ollama) vs ZLUDA (PyTorch/Triton) on gfx1010
 +
 +Final report: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B
@@ -988,12 +988,23 @@ index 0000000000000000000000000000000000000000..16fb647253e103ccdfe22d6a4950d039
 +available; `bench/llamacpp_zluda_matrix.ps1` is ready for when the ZLUDA side
 +can run llama.cpp kernels. **Warning: do not run llama.cpp with ngl>1 through
 +ZLUDA unless a reboot is acceptable - the driver can hang hard.**
++
++### Corrected llama.cpp root cause (2026-11-25)
++
++The earlier "async-copy pipeline" hypothesis was wrong. Scanning the official
++Windows CUDA builds (b12721, b9802, b6000) shows `ggml-cuda.dll` contains only
++SASS cubins for `sm_50/61/70/75/80` and **no PTX at all**, while ZLUDA can only
++execute PTX. llama.cpp therefore reports
++`CUDA kernel ... has no device code compatible with CUDA arch 86`; with many
++offloaded layers the driver can even hard-crash. The fix is a local llama.cpp
++build with `-DCMAKE_CUDA_ARCHITECTURES=86-virtual` (PTX-only compute_86); recipe
++and verified toolchain: docs/LLAMACPP_ZLUDA_BUILD.md.
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7dab61aef2961de3447afa1156f4b200bf55d9e8
+index 0000000000000000000000000000000000000000..f133f4cd7db83d31fa4f99060a2b17b01547278a
 --- /dev/null
 +++ b/INTEGRATION.md
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,206 @@
 +# Out-of-the-box acceleration
 +
 +`zluda_ops.auto` patches two PyTorch entry points at runtime:
@@ -1190,6 +1201,16 @@ index 0000000000000000000000000000000000000000..7dab61aef2961de3447afa1156f4b200
 +kernel set, not the launch API; a same-engine Vulkan-vs-ZLUDA comparison stays
 +blocked. Details and the ready matrix runner: ENGINE_COMPARISON.md and
 +bench/llamacpp_zluda_matrix.ps1.
++
++### llama.cpp on ZLUDA: now works (F16, no flash attention)
++
++A local llama.cpp build with compute_86 PTX (`86-virtual`, CUDA 12.4.1 portable
++toolchain, VS 2022) runs under ZLUDA with full GPU offload (`-ngl 99`).
++Same-engine Vulkan-vs-ZLUDA numbers (Qwen2.5-0.5B F16, FA=0): ZLUDA 6144/3294
++tok/s prefill at 2k/8k and 184 tok/s decode vs Vulkan 6258/4179 and 212/173.
++llama.cpp FA (`mma.sync`) and Q4_K_M (MMQ) kernels are still unsupported by
++ZLUDA on RDNA1. See docs/LLAMACPP_VULKAN_VS_ZLUDA.md and
++docs/LLAMACPP_ZLUDA_BUILD.md; run risky tests through tools/gpu_watchdog.ps1.
 diff --git a/README.md b/README.md
 index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb460ca40544 100644
 --- a/README.md
@@ -2138,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f0c69eaf62d5ad29239b0a47df9a82103142a2de
+index 0000000000000000000000000000000000000000..8c103df91f53f1bf88e34f3ceab76e67020ea44b
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,458 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2392,6 +2413,19 @@ index 0000000000000000000000000000000000000000..f0c69eaf62d5ad29239b0a47df9a8210
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - llama.cpp under ZLUDA WORKS (custom PTX build), same-engine
++  Vulkan comparison:** built llama.cpp locally with portable CUDA 12.4.1
++  (nvcc 12.4.131, VS 2022) and `-DCMAKE_CUDA_ARCHITECTURES=86-virtual`
++  (PTX only - the official SASS-only builds have no code for sm_86 and cannot
++  run on ZLUDA). Result: `-ngl 99` full GPU offload, stable driver, F16 GGUF
++  works; FA=1 (mma.sync) and Q4_K_M (MMQ) still fail/hang on ZLUDA. Same-engine
++  measurement (Qwen2.5-0.5B F16, fa=0): ZLUDA prefill 6144/3294/732 tok/s and
++  decode 184.2/184.6/183.9 tok/s at 2k/8k/32k vs Vulkan (Ollama) 6258/4179 and
++  212.3/172.7 tok/s at 2k/8k (F16 clamped to 8192 on Vulkan). ZLUDA is within
++  -2% prefill at 2k, -21% at 8k, decode -13%/+7% at 2k/8k, and can run 32k
++  context where Vulkan clamps. Full report:
++  docs/LLAMACPP_VULKAN_VS_ZLUDA.md; recipe: docs/LLAMACPP_ZLUDA_BUILD.md;
++  raw data: bench/results/llamacpp_zluda_vs_vulkan.json.
 +- **2026-11-25 - ecosystem shims:** added `integrations/flash_attn` and
 +  `integrations/xformers` shims (flash_attn_func/varlen_func/bert_padding,
 +  xformers.ops.memory_efficient_attention + bias types) backed by the Triton FA
@@ -5118,10 +5152,10 @@ index 0000000000000000000000000000000000000000..8641d0b3d336d4f4b9a9ea5f5aa76f72
 +    sys.exit(main())
 diff --git a/bench/llamacpp_zluda_matrix.ps1 b/bench/llamacpp_zluda_matrix.ps1
 new file mode 100644
-index 0000000000000000000000000000000000000000..13cd57d977095b32bf239e1a98ff76e38984a73a
+index 0000000000000000000000000000000000000000..1cc3afe32e94e308042402b7067c64d8afc25332
 --- /dev/null
 +++ b/bench/llamacpp_zluda_matrix.ps1
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,52 @@
 +# Run llama.cpp (same engine as Ollama) on the ZLUDA GPU and compare with the
 +# Ollama Vulkan numbers. Requires the patched ZLUDA (cudaLaunchKernelEx/PDL) and
 +# the CUDA llama.cpp build in tools/llamacpp-cuda (gitignored).
@@ -5134,13 +5168,15 @@ index 0000000000000000000000000000000000000000..13cd57d977095b32bf239e1a98ff76e3
 +    [string]$Models = "q4,f16",
 +    [int]$Predict = 32,
 +    [string]$Fa = "1,0",
-+    [int]$Reps = 3
++    [int]$Reps = 3,
++    [string]$BinDir = "G:\zluda\tools\llamacpp-cuda\build",
++    [string]$CudartDir = "G:\zluda\tools\llamacpp-cuda\cudart"
 +)
 +
 +$ErrorActionPreference = "Continue"
 +$repo = "G:\zluda"
-+$exe = Join-Path $repo "tools\llamacpp-cuda\build\llama-bench.exe"
-+$cudart = Join-Path $repo "tools\llamacpp-cuda\cudart"
++$exe = Join-Path $BinDir "llama-bench.exe"
++$cudart = $CudartDir
 +$gguf = Join-Path $repo "models\qwen05-gguf"
 +$modelFiles = @{
 +    q4  = Join-Path $gguf "qwen2.5-0.5b-instruct-q4_k_m.gguf"
@@ -8386,6 +8422,184 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +set "ZLUDA_AUTO_VERBOSE=1"
 +cd /d "%COMFY_DIR%" || exit /b 1
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
+diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
+--- /dev/null
++++ b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
+@@ -0,0 +1,85 @@
++# Same-engine comparison: llama.cpp Vulkan vs llama.cpp on ZLUDA (gfx1010)
++
++Date: 2026-11-25. GPU: Radeon RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B
++Instruct, **F16 GGUF** (the same file for both backends). This is the first
++legitimate same-engine Vulkan-vs-ZLUDA measurement on this machine.
++
++## Why this needed a custom llama.cpp build
++
++The official Windows CUDA release builds of llama.cpp ship only SASS cubins for
++sm_50/61/70/75/80 and no PTX. ZLUDA executes PTX only, so those builds report
++`CUDA kernel ... has no device code compatible with CUDA arch 86` and either
++fail or hang. The fix is a local build with compute_86 PTX:
++
++- portable CUDA 12.4.1 (nvcc 12.4.131) extracted from NVIDIA redist components
++  (`cuda_nvcc`, `cuda_cudart`, `cuda_cccl`, `libcublas`, plus a minimal
++  `nvml.h` stub - NVML is loaded dynamically and is absent on AMD);
++- VS 2022 BuildTools as host compiler (nvcc 12.4 rejects VS 2026);
++- `cmake -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86-virtual ...`
++  (`86-virtual` = PTX-only, exactly what ZLUDA JITs).
++
++Full recipe: `docs/LLAMACPP_ZLUDA_BUILD.md`. Verified: the resulting
++`ggml-cuda.dll` has `.target sm_86` only.
++
++## Configuration
++
++- **Vulkan**: Ollama 0.40.18 (llama.cpp Vulkan backend), 100% GPU offload,
++  `OLLAMA_FLASH_ATTENTION=0`, `OLLAMA_KV_CACHE_TYPE=f16`, num_ctx up to 32768.
++- **ZLUDA**: local PTX build, `-ngl 99 -fa 0`, `GGML_CUDA_PDL=0`,
++  `GGML_CUDA_DISABLE_GRAPHS=1`, run through `run-zluda.cmd`.
++- Flash attention is disabled on both sides: llama.cpp's FA kernels use
++  `mma.sync` (tensor-core instructions) which RDNA1 does not have and ZLUDA
++  cannot translate, so FA works on Vulkan but fails on ZLUDA. FA=0 uses the
++  vector kernels and is the common denominator.
++- Measurement: `llama-bench` (`pp` prefill, `tg` 32-token decode) for ZLUDA and
++  the Ollama HTTP API (prompt/eval durations) for Vulkan; single run, GPU
++  clocks cannot be fixed (+-15-30% run-to-run variance).
++
++## Results (Qwen2.5-0.5B F16 GGUF, FA=0)
++
++| context | ZLUDA prefill tok/s | Vulkan prefill tok/s | ZLUDA decode tok/s | Vulkan decode tok/s |
++|---|---|---|---|---|
++| 2048 | 6144 | 6258 | 184.2 | 212.3 |
++| 8192 | 3294 | 4179 | 184.6 | 172.7 |
++| 32768 | 732 | n/a (Ollama clamps F16 to 8192 ctx on 8 GB) | 183.9 | n/a |
++
++Raw data: `bench/results/llamacpp_zluda_vs_vulkan.json`.
++
++**Reading of the numbers:** on this small model the two backends are close -
++ZLUDA is within -2% of Vulkan at 2k prefill and -21% at 8k, decode is -13% at
++2k and +7% at 8k (all within/about the run-to-run spread except the 8k
++prefill). ZLUDA can go to 32k context with F16 while Ollama clamps F16 to 8192
++on this card, and at 32k ZLUDA still produces 732 tok/s prefill and 184 tok/s
++decode.
++
++## Limitations / not yet working on ZLUDA
++
++- `-fa 1` (llama.cpp flash attention): fails in `fattn-mma-f16` kernels
++  (tensor-core/mma path not supported by ZLUDA on RDNA1). Vulkan supports it.
++- `Q4_K_M` GGUF: hangs in the quantized MMQ kernels on ZLUDA (watchdog killed
++  it after 100 s of no progress; the device itself stayed healthy). F16 works.
++- CUDA graphs and PDL are disabled on the ZLUDA side
++  (`GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_CUDA_PDL=0`); the launch-attribute patch
++  in this fork is what lets llama.cpp get this far.
++
++## Safety note
++
++Testing llama.cpp with GPU offload through ZLUDA used to hard-crash the AMD
++driver (reboot required), and a watchdog that tried `Restart-PnpDevice`
++crashed Windows once. Since the PTX build works, run these tests only through
++`tools/gpu_watchdog.ps1` with driver restart disabled (default):
++`-PollSeconds 20..30 -StallLimit 4..8`. Do not run `-ngl > 1` with the
++official SASS-only builds.
++
++## Reproduce
++
++```bat
++set "VS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
++call G:\zluda\build-env.cmd build_llama_ptx86.cmd
++set "PATH=C:\build\llama.cpp\build-ptx86\bin;C:\cuda-12.4.1\bin;%PATH%"
++set GGML_CUDA_DISABLE_GRAPHS=1
++set GGML_CUDA_PDL=0
++G:\zluda\run-zluda.cmd C:\build\llama.cpp\build-ptx86\bin\llama-bench.exe ^
++  -m G:\zluda\models\qwen05-gguf\qwen2.5-0.5b-instruct-fp16.gguf ^
++  -p 2048,8192,32768 -n 32 -ngl 99 -fa 0 -r 1
++```
+\ No newline at end of file
+diff --git a/docs/LLAMACPP_ZLUDA_BUILD.md b/docs/LLAMACPP_ZLUDA_BUILD.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa81d2ce186045a6d2d56e5048cfee7b3fbe5e86
+--- /dev/null
++++ b/docs/LLAMACPP_ZLUDA_BUILD.md
+@@ -0,0 +1,79 @@
++# Building llama.cpp for ZLUDA on gfx1010 (RDNA1)
++
++## Why a custom build is needed
++
++The official `llama-b####-bin-win-cuda-*.zip` release builds contain only SASS
++cubins compiled for `sm_50/61/70/75/80` (checked in b12721, b9802, b6000 by
++scanning `ggml-cuda.dll` for `.target sm_` - no 86, and no PTX source at all).
++ZLUDA executes PTX and JIT-compiles it for gfx1010; SASS cannot be used. As a
++result llama.cpp prints
++`CUDA kernel ... has no device code compatible with CUDA arch 86` and GPU
++offload fails or hangs (hard driver crashes were observed with high `-ngl`).
++
++The fix is a local llama.cpp build that embeds **compute_86 PTX** (ZLUDA reports
++compute capability 8.6 through `ZLUDA_CC`, default 8.6).
++
++## Prerequisites (no admin rights needed)
++
++- Visual Studio 2022 Build Tools with the C++ toolchain (VS 2026 is rejected by
++  nvcc 12.4 as an unsupported host compiler, so use 2022: set `VS` before
++  `build-env.cmd`).
++- Portable CUDA 12.4.1 redist components (installed manually by extracting
++  zips, because the CUDA installer requires admin):
++
++```powershell
++# from https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.4.1.json
++# cuda_nvcc   -> nvcc, ptxas, cudafe
++# cuda_cudart -> runtime headers/libs
++# cuda_cccl   -> thrust/cub headers
++# libcublas   -> cuBLAS headers + import libraries (llama.cpp links cuBLAS)
++# extract each archive and merge its bin/include/lib/nvvm/src into C:\cuda-12.4.1
++```
++
++Verified versions: nvcc 12.4.131, VS 2022 BuildTools, CMake/Ninja bundled with
++VS.
++
++## Configure and build
++
++```bat
++set "VS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
++call G:\zluda\build-env.cmd build_llama_ptx86.cmd
++```
++
++where `build_llama_ptx86.cmd` runs:
++
++```bat
++cd /d C:\build\llama.cpp
++cmake -B build-ptx86 -G Ninja -DGGML_CUDA=ON ^
++      -DCMAKE_CUDA_ARCHITECTURES=86-virtual ^
++      -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release ^
++      -DCMAKE_CUDA_COMPILER=C:/cuda-12.4.1/bin/nvcc.exe ^
++      -DCUDAToolkit_ROOT=C:/cuda-12.4.1
++cmake --build build-ptx86 -j 6 --target llama-bench llama-cli
++```
++
++`86-virtual` makes CMake emit `-gencode arch=compute_86,code=compute_86`, i.e.
++PTX only (exactly what ZLUDA needs). Verify after the build:
++
++```powershell
++$s = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(
++     "C:\build\llama.cpp\build-ptx86\bin\ggml-cuda.dll"))
++([regex]::Matches($s, '\.target sm_(\d+)') | % { $_.Groups[1].Value } | Sort-Object -Unique)
++# expected: 86
++```
++
++## Running and safety
++
++- Always run through `run-zluda.cmd` with the local build in `PATH` and the
++  cudart DLLs available (`tools/llamacpp-cuda/cudart` or the new build's bin).
++- Start with `-ngl 1 -fa 0 -p 8 -n 1`; scale offload only under
++  `tools/gpu_watchdog.ps1` (kill-only; driver restart is disabled by default
++  because it crashed Windows once).
++- If the GPU wedges, reboot. Do not use `-ngl` high values without a reboot
++  being acceptable.
++
++## Status
++
++- 2026-11-25: portable CUDA toolchain + llama.cpp build configured and started;
++  see the ROADMAP entry for the outcome and ENGINE_COMPARISON.md for the
++  Vulkan-vs-ZLUDA matrix once the PTX build runs.
+\ No newline at end of file
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb991c82c47
@@ -11564,6 +11778,137 @@ index 0000000000000000000000000000000000000000..80d9276ba1f57dc1ff80f00c1be791e3
 +    throw 'the generated patch is empty'
 +}
 +"exported $Output ($($bytes.Length) bytes) from $Base..HEAD"
+diff --git a/tools/gpu_watchdog.ps1 b/tools/gpu_watchdog.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..b71d08980d5efe7a95fd31ed62ee8ebae718e87b
+--- /dev/null
++++ b/tools/gpu_watchdog.ps1
+@@ -0,0 +1,125 @@
++param(
++    [Parameter(Mandatory = $true)][string]$Command,
++    [string]$LogPath = "G:\zluda\watchdog\watchdog-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
++    [string]$WatchLog = "",
++    [int]$PollSeconds = 30,
++    [int]$StallLimit = 2,
++    [int]$MaxMinutes = 30,
++    [string]$InstanceId = "PCI\VEN_1002&DEV_731F&SUBSYS_51011849&REV_C1\6&CF24139&0&00000009",
++    [switch]$AllowDriverRestart
++)
++
++# Watchdog for risky GPU workloads on the 8 GB RX 5700 XT under ZLUDA.
++#
++# Starts $Command through cmd.exe, polls every $PollSeconds and reports:
++#   * is the workload process still alive,
++#   * display device PnP status,
++#   * whether the workload log grew (StallLimit polls without growth = hang).
++# On a hang/crash it kills the workload tree. Driver restart is DISABLED by
++# default: restarting the active display adapter crashed Windows on 2026-11-25
++# (verified), so it is only attempted with -AllowDriverRestart from an elevated
++# shell - and that is still risky. Without it the watchdog only kills, which is
++# enough in most cases; a manual reboot is the fallback when the GPU is wedged.
++
++$ErrorActionPreference = "Continue"
++if (-not $WatchLog) {
++    $WatchLog = [System.IO.Path]::ChangeExtension($LogPath, ".watchdog.log")
++}
++New-Item -ItemType Directory -Force (Split-Path $LogPath) | Out-Null
++New-Item -ItemType Directory -Force (Split-Path $WatchLog) | Out-Null
++
++function Write-Watch([string]$msg) {
++    $line = "$(Get-Date -Format 'HH:mm:ss') $msg"
++    Add-Content -Path $WatchLog -Value $line -Encoding utf8
++    Write-Host $line
++}
++
++function Stop-Tree([int]$rootPid) {
++    $children = Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $rootPid }
++    foreach ($c in $children) { Stop-Tree $c.ProcessId }
++    try { Stop-Process -Id $rootPid -Force -ErrorAction Stop } catch { }
++}
++
++function Get-DeviceStatus {
++    try {
++        $d = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
++            Where-Object { $_.InstanceId -eq $InstanceId } | Select-Object -First 1
++        if ($d) { return [string]$d.Status } else { return "NOT_FOUND" }
++    } catch {
++        return "QUERY_FAILED"
++    }
++}
++
++function Restart-Device {
++    if (-not $AllowDriverRestart) {
++        Write-Watch "driver restart disabled (default): killed only; reboot manually if the GPU stays wedged"
++        return $false
++    }
++    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
++    $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
++    if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
++        Write-Watch "driver restart skipped: not elevated (restarting the display adapter can crash Windows)"
++        return $false
++    }
++    Write-Watch "attempting display-device restart ($InstanceId) - this can crash Windows"
++    try {
++        Restart-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
++        Start-Sleep -Seconds 5
++        Write-Watch "display device restarted, status=$(Get-DeviceStatus)"
++        return $true
++    } catch {
++        Write-Watch "display-device restart failed: $($_.Exception.Message.Trim())"
++    }
++    return $false
++}
++
++Write-Watch "START command=$Command log=$LogPath poll=${PollSeconds}s stall=${StallLimit} max=${MaxMinutes}min restart_allowed=$([int]$AllowDriverRestart)"
++$proc = Start-Process -FilePath "cmd.exe" `
++    -ArgumentList '/c', "$Command > `"$LogPath`" 2>&1" `
++    -PassThru -WindowStyle Hidden
++Write-Watch "pid=$($proc.Id)"
++
++$start = Get-Date
++$lastSize = -1
++$stall = 0
++$reason = "completed"
++while ($true) {
++    Start-Sleep -Seconds $PollSeconds
++    $exited = $proc.HasExited
++    $logSize = if (Test-Path $LogPath) { (Get-Item $LogPath).Length } else { 0 }
++    $dev = Get-DeviceStatus
++    $grew = $logSize -gt $lastSize
++    if ($grew) { $stall = 0 } else { $stall++ }
++    $lastSize = $logSize
++    Write-Watch "poll pid=$($proc.Id) alive=$([int](-not $exited)) device=$dev logBytes=$logSize stall=$stall"
++
++    if ($exited) {
++        $reason = "completed(exit=$($proc.ExitCode))"
++        break
++    }
++    if ($dev -ne "OK") {
++        $reason = "device-status-$dev"
++        break
++    }
++    if ($stall -ge $StallLimit) {
++        $reason = "hang(log stalled for $($stall * $PollSeconds)s)"
++        break
++    }
++    if (((Get-Date) - $start).TotalMinutes -ge $MaxMinutes) {
++        $reason = "max-time(${MaxMinutes}min)"
++        break
++    }
++}
++
++if (-not $proc.HasExited) {
++    Write-Watch "killing workload tree (reason=$reason)"
++    Stop-Tree $proc.Id
++    Start-Sleep -Seconds 3
++    Write-Watch "after kill: alive=$([int](-not $proc.HasExited)) device=$(Get-DeviceStatus)"
++    Restart-Device | Out-Null
++} else {
++    Write-Watch "workload exited: $reason"
++}
++
++Write-Watch "END reason=$reason"
++exit 0
 diff --git a/tools/install_auto.py b/tools/install_auto.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..4a9f9d08cc94a3ce295146211da873edf4766695
