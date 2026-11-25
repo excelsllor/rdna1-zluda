@@ -38,7 +38,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **PARTIAL** | 4x/2x compression (7B: 3.5/7 GB), fused int4 GEMV 1.44-1.63x vs fp16 decode; 70-80% bandwidth not met; GPTQ/AWQ exact loading + prefill GEMM open | high | GEMV/GEMM |
 | **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 | **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
-| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **OPEN** | memory/speed | medium | Triton |
+| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **DONE** | RMSNorm 8.2x fwd / 6.1x bwd, softmax 18.5x, RoPE 5.1-8.8x, SwiGLU 1.2-1.5x vs torch eager; chunked CE -28% peak memory but slower than torch | medium | Triton |
 | **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | result: MIOpen lowers 3x3 to GEMM (`GemmFwdRest`), no Winograd/implicit-GEMM selected; channels_last unusable; fp16 2-4x slower than fp32; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
 | **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **OPEN** | high if SD is a target | medium-high | measure first |
 | **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | **PARTIAL** | +5–15% | medium | measured, not fused/auto |
@@ -60,7 +60,7 @@ Status keys: **DONE**, **PARTIAL**, **OPEN**, **BLOCKED**, **REJECTED**, and **A
 | 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
 | 2 — Attention | **PARTIAL** | masks/dropout/window in Triton, varlen per-sequence, flash-decoding done; fused decode/backward integration open |
 | 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (`zluda_ops/quant.py`); exact GPTQ/AWQ loading and prefill GEMM open; no int8 compute |
-| 4 — Fused kernels | **OPEN** | not started |
+| 4 — Fused kernels | **PARTIAL** | Triton RMSNorm/RoPE/SwiGLU/softmax implemented and faster (`zluda_ops/fused.py`); chunked CE is memory-only (slower); LayerNorm/GeGLU/AdamW/sampling open |
 | 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 | 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
 | 7 — Compiler/LLVM/Triton | **OPEN** | WGP/CU and autotune not started |
@@ -220,6 +220,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   kernels with the Philox mask regenerated from (head, query, key) offsets;
   unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
   s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
+- **2026-11-25 - P1-5 (fused kernels):** `zluda_ops/fused.py` adds Triton
+  RMSNorm (fwd+bwd), RoPE rotate-half (fwd+bwd), SwiGLU (fwd+bwd), row softmax
+  and a memory-saving chunked cross-entropy, with `bench/fused.py` comparing
+  against torch eager. At 8192x4096 fp16: RMSNorm 8.2x forward and 6.1x
+  forward+backward, softmax 18.5x, RoPE (1x32x2048x128) 5.1x/8.8x, SwiGLU
+  1.2x/1.5x; errors are fp16 accumulation-level. Chunked CE reduces peak memory
+  from 1024 to 736 MB at 4096x16384 but is slower than torch (38 vs 17 ms), so
+  it stays a memory-only option. LayerNorm/GeGLU/AdamW/sampling remain open.
 - **2026-11-25 - P1-3 (quantization storage):** `zluda_ops/quant.py` implements
   groupwise symmetric int4/int8 weight-only storage (groups 32/64/128, fp16
   scales, two nibbles per byte) plus reference dequantizers and a fused Triton
