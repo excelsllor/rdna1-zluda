@@ -352,3 +352,4 @@ roll back. It only matches when PyTorch fp16 accumulation is explicitly
 enabled (`torch._C._set_cublas_allow_fp16_accumulation(True)`); HPA/SS lines
 are intentionally not included. Use random data for measurements: zeros,
 ones and uninitialized buffers are not representative.
+run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench

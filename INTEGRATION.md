@@ -105,8 +105,9 @@ or 4D with batch/head broadcast, optionally combined with causal) run in the
 Triton kernel for forward and backward; masks that are not broadcastable fall
 back to math SDPA. `flash_attn_func` supports sliding
 `window_size`; `flash_attn_varlen_func` accepts packed q/k/v and
-`cu_seqlens`. Dropout, sliding window and varlen currently use the correct math
-fallback (not the Triton kernel); Triton dropout/window/varlen kernels are
+`cu_seqlens`. Dropout also runs in the Triton kernels (inverted dropout, same
+mask regenerated in backward). Sliding window and varlen currently use the
+correct math fallback (not the Triton kernel); Triton window/varlen kernels are
 open. A 1-layer TransformerEncoder compiles in ~1 s; the full 8-layer
 model is skipped because compile takes ~30 min even on a T4.
 
