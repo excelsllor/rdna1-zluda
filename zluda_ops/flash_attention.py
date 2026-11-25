@@ -13,6 +13,8 @@ _ORIGINAL_SDPA = F.scaled_dot_product_attention
 
 # Tests may pin the dropout RNG to check determinism across fwd/bwd.
 _DROPOUT_SEED_OVERRIDE = None
+# (BLOCK_M, BLOCK_N, num_warps, num_stages) override used by bench/autotune scripts.
+_CONFIG_OVERRIDE = None
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,
                     K_block_ptr, V_block_ptr,

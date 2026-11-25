@@ -27,7 +27,7 @@ def _decode_split(Q, K, V, Out, Max, Lsum,
                   stride_qz, stride_qh, stride_qm, stride_qk,
                   stride_kz, stride_kh, stride_kn, stride_kk,
                   stride_vz, stride_vh, stride_vn, stride_vk,
-                  H, M, N, OFFSET, sm_scale,
+                  H, HKV, GROUP, M, N, OFFSET, sm_scale,
                   SPLITS: tl.constexpr, BLOCK_M: tl.constexpr,
                   BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
                   CAUSAL: tl.constexpr):
@@ -35,9 +35,10 @@ def _decode_split(Q, K, V, Out, Max, Lsum,
     bhid = tl.program_id(1)
     off_z = bhid // H
     off_h = bhid % H
+    off_hkv = off_h // GROUP
     q_off = off_z * stride_qz + off_h * stride_qh
-    k_off = off_z * stride_kz + off_h * stride_kh
-    v_off = off_z * stride_vz + off_h * stride_vh
+    k_off = off_z * stride_kz + off_hkv * stride_kh
+    v_off = off_z * stride_vz + off_hkv * stride_vh
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -135,8 +136,10 @@ def flash_decode_attn(q, k, v, causal=False, splits=None):
     n = k.shape[2]
     if d != 64 or m > BLOCK_M or k.shape[3] != d or v.shape[3] != d:
         raise NotImplementedError("flash_decode_attn requires head_dim=64 and M<=16")
-    if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1]:
-        raise NotImplementedError("q/k/v batch and head counts must match")
+    if q.shape[0] != k.shape[0] or k.shape[1] != v.shape[1]:
+        raise NotImplementedError("q/k/v batch and kv head counts must match")
+    if h % k.shape[1]:
+        raise NotImplementedError("query heads must be a multiple of kv heads")
     if n % BLOCK_N != 0:
         raise NotImplementedError("KV length must be a multiple of 128")
 
@@ -159,7 +162,7 @@ def flash_decode_attn(q, k, v, causal=False, splits=None):
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        h, m, n, offset, sm_scale,
+        h, k.shape[1], h // k.shape[1], m, n, offset, sm_scale,
         SPLITS=splits, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=d,
         CAUSAL=causal, num_warps=4, num_stages=1,
     )
