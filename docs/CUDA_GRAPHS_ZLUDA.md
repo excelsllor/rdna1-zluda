@@ -121,3 +121,36 @@ bf16 emulation (bf16 weights, fp32 compute) works on native ROCm torch
 process died without a report (most likely VRAM: an fp32 copy of the model on
 top of the bf16 one). Needs an in-place conversion path and a smaller-VRAM
 recipe before it can be measured there.
+
+## Graph-replayed decode: measured result
+
+Two fixes made the decode step capturable end-to-end and fast:
+
+1. `zluda_ops/auto.py` now flattens decode-layout `F.linear` inputs
+   `(1, 1, D)` to `(1, D)` and dispatches them to the Triton GEMV kernels
+   (previously the GEMV path only handled 2-D inputs, so decode silently fell
+   back to rocBLAS: 0 GEMV calls per step). After the fix a decode step makes
+   ~170 Triton GEMV calls (all Linear layers + lm_head) and no cuBLAS calls.
+2. With that path the whole decode step is graph-capture safe:
+   `torch.cuda.CUDAGraph` capture + replay works (the earlier capture failure
+   inside `cublasSgemm` is avoided because no cuBLAS is left in the step).
+
+Measured on Qwen2.5-0.5B fp16 with `bench/graph_decode.py` (StaticCache, fixed
+decode position, 16 replay steps):
+
+| context | eager ms/tok | eager tok/s | graph ms/tok | graph tok/s | speedup |
+|---|---|---|---|---|---|
+| 1024 | 39.9 | 25.1 | **11.4** | **87.6** | 3.5x |
+| 2048 | 37.4 | 26.7 | **13.7** | **72.8** | 2.7x |
+
+Reference: llama.cpp on Vulkan decodes at ~4.2 ms/token (238 tok/s) at 2k
+context for the F16 GGUF, so PyTorch/ZLUDA is now within ~2-3x of the native
+engine instead of ~8x. Remaining gap: the Triton GEMV kernels are not yet tuned
+for the exact decode shapes (e.g. lm_head is a 151936x896 matvec), the graph
+replays a frozen position (real generation needs position updates inside/around
+the graph), and attention/flash-decoding at long context can be tuned further.
+
+Note: eager decode with the GEMV patch is slightly slower than with rocBLAS
+(39.9 vs 34.0 ms/token) because each Triton launch costs more CPU per call; the
+graph replay removes that overhead entirely. This is why graphs are the right
+delivery mechanism for the GEMV path.

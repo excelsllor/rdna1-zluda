@@ -44,13 +44,21 @@ def _linear(input, weight, bias=None):
             except Exception:
                 pass
         max_m = 16 if input.dtype == torch.float32 else 32
-        if (not _needs_grad(input, weight, bias) and input.dim() == 2 and input.shape[0] <= max_m
-                and input.dtype in (torch.float16, torch.float32)
-                and weight.dtype == input.dtype and _gemv._supported(input, weight, bias)):
+        grad_needed = torch.is_grad_enabled() and _needs_grad(input, weight, bias)
+        # Decode calls F.linear with (B, S, D); flatten B=1 small-S inputs so
+        # the Triton GEMV path can serve token-by-token inference.
+        flat = input
+        out_shape = None
+        if (input.dim() == 3 and input.shape[0] == 1 and input.shape[1] <= max_m):
+            flat = input.reshape(-1, input.shape[-1])
+            out_shape = input.shape[:-1] + (weight.shape[0],)
+        if (not grad_needed and flat.dim() == 2 and flat.shape[0] <= max_m
+                and flat.dtype in (torch.float16, torch.float32)
+                and weight.dtype == flat.dtype and _gemv._supported(flat, weight, bias)):
             try:
-                out = _gemv.linear(input, weight, bias, accurate=True)
+                out = _gemv.linear(flat, weight, bias, accurate=True)
                 if out is not None:
-                    return out
+                    return out.reshape(out_shape) if out_shape is not None else out
             except Exception:
                 pass
     return _orig_linear(input, weight, bias)
