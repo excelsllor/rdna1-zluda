@@ -100,11 +100,14 @@ validate accuracy (`bench/fp16_ux.py`); it is off by default.
 ## Attention API
 
 Causal and non-causal Triton FA work for fp16, head_dim=64, sequence lengths
-divisible by 128 and no mask/dropout. `flash_attn_func` supports sliding
+divisible by 128 and no dropout. Boolean and additive attention masks (2D, 3D
+or 4D with batch/head broadcast, optionally combined with causal) run in the
+Triton kernel for forward and backward; masks that are not broadcastable fall
+back to math SDPA. `flash_attn_func` supports sliding
 `window_size`; `flash_attn_varlen_func` accepts packed q/k/v and
-`cu_seqlens`. Masks, dropout, sliding window and varlen currently use the correct math
-fallback (not the Triton kernel); Triton mask/dropout/window/varlen kernels
-are open. A 1-layer TransformerEncoder compiles in ~1 s; the full 8-layer
+`cu_seqlens`. Dropout, sliding window and varlen currently use the correct math
+fallback (not the Triton kernel); Triton dropout/window/varlen kernels are
+open. A 1-layer TransformerEncoder compiles in ~1 s; the full 8-layer
 model is skipped because compile takes ~30 min even on a T4.
 
 ## Training with HH (experimental)

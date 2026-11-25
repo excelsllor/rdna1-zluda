@@ -440,3 +440,26 @@ variant, mean per round, **median across rounds**, variant order shuffled when
 comparing, and the limits are recorded explicitly. `bench_median` is available
 for new benchmarks. This is why the P0-1 zero-data artifact and earlier +-10%
 run-to-run differences are no longer mixed into the numbers.
+
+## P0-2 Triton flash-attention masks (2026-11-25)
+
+Attention masks now run inside the Triton fwd/bwd kernels instead of the math
+fallback. Supported: boolean masks (2D, 3D per batch, 4D per batch+head, with
+broadcast), additive float masks, and masks combined with causal; the kernel
+keeps broadcast masks as stride-0 views, so no dense mask is materialised.
+Masked lanes are zeroed after the exponential (the old `-1e6` trick would leak
+into long rows), and dropout/window/varlen still use math SDPA.
+
+`bench/fa_mask.py` (B1 H8 D64 fp16, s=512):
+
+| case | fwd err | grad err |
+|---|---|---|
+| bool 2D | 2.4e-4 | 9.8e-4 |
+| additive 2D | 4.9e-4 | 9.8e-4 |
+| bool 4D per head | 2.4e-4 | 9.8e-4 |
+| additive 3D per batch | 4.9e-4 | 9.8e-4 |
+| bool 2D + causal | 9.8e-4 | 2.0e-3 |
+| additive 2D + causal | 9.8e-4 | 3.9e-3 |
+
+Speed (s=1024, bool mask, median of shuffled rounds): masked causal Triton
+**1.22 ms vs 2.04 ms math = 1.67x**; non-causal 1.82 vs 1.98 ms = 1.09x.

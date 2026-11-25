@@ -278,6 +278,7 @@ run-zluda.cmd venv\Scripts\python.exe bench\fp16_ux.py
 run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
 run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
 venv\Scripts\python.exe bench\gpu_clocks.py --seconds 3
+run-zluda.cmd venv\Scripts\python.exe bench\fa_mask.py --s 512 --bench
 ```
 
 Expected reference numbers are in `RESULTS_RDNA1.md`.
