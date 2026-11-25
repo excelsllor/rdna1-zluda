@@ -772,10 +772,10 @@ index 0000000000000000000000000000000000000000..3fc22424edf7544fc2270ecbac3097ca
 +- GPU clock/power telemetry on Windows.
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b33ccb253bede94712624d116d3b49f118ff5a76
+index 0000000000000000000000000000000000000000..5b49856f6c117e0c1c125ffae2fc028a0144c297
 --- /dev/null
 +++ b/INTEGRATION.md
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,151 @@
 +# Out-of-the-box acceleration
 +
 +`zluda_ops.auto` patches two PyTorch entry points at runtime:
@@ -878,11 +878,14 @@ index 0000000000000000000000000000000000000000..b33ccb253bede94712624d116d3b49f1
 +## Attention API
 +
 +Causal and non-causal Triton FA work for fp16, head_dim=64, sequence lengths
-+divisible by 128 and no mask/dropout. `flash_attn_func` supports sliding
++divisible by 128 and no dropout. Boolean and additive attention masks (2D, 3D
++or 4D with batch/head broadcast, optionally combined with causal) run in the
++Triton kernel for forward and backward; masks that are not broadcastable fall
++back to math SDPA. `flash_attn_func` supports sliding
 +`window_size`; `flash_attn_varlen_func` accepts packed q/k/v and
-+`cu_seqlens`. Masks, dropout, sliding window and varlen currently use the correct math
-+fallback (not the Triton kernel); Triton mask/dropout/window/varlen kernels
-+are open. A 1-layer TransformerEncoder compiles in ~1 s; the full 8-layer
++`cu_seqlens`. Dropout, sliding window and varlen currently use the correct math
++fallback (not the Triton kernel); Triton dropout/window/varlen kernels are
++open. A 1-layer TransformerEncoder compiles in ~1 s; the full 8-layer
 +model is skipped because compile takes ~30 min even on a T4.
 +
 +## Training with HH (experimental)
@@ -1042,10 +1045,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..73df7348d77143ffca5ba72963f3f2aa295bed38
+index 0000000000000000000000000000000000000000..7981ec14399e09ebe0993205b6bc5d1f69a9983a
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,465 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1488,12 +1491,35 @@ index 0000000000000000000000000000000000000000..73df7348d77143ffca5ba72963f3f2aa
 +comparing, and the limits are recorded explicitly. `bench_median` is available
 +for new benchmarks. This is why the P0-1 zero-data artifact and earlier +-10%
 +run-to-run differences are no longer mixed into the numbers.
++
++## P0-2 Triton flash-attention masks (2026-11-25)
++
++Attention masks now run inside the Triton fwd/bwd kernels instead of the math
++fallback. Supported: boolean masks (2D, 3D per batch, 4D per batch+head, with
++broadcast), additive float masks, and masks combined with causal; the kernel
++keeps broadcast masks as stride-0 views, so no dense mask is materialised.
++Masked lanes are zeroed after the exponential (the old `-1e6` trick would leak
++into long rows), and dropout/window/varlen still use math SDPA.
++
++`bench/fa_mask.py` (B1 H8 D64 fp16, s=512):
++
++| case | fwd err | grad err |
++|---|---|---|
++| bool 2D | 2.4e-4 | 9.8e-4 |
++| additive 2D | 4.9e-4 | 9.8e-4 |
++| bool 4D per head | 2.4e-4 | 9.8e-4 |
++| additive 3D per batch | 4.9e-4 | 9.8e-4 |
++| bool 2D + causal | 9.8e-4 | 2.0e-3 |
++| additive 2D + causal | 9.8e-4 | 3.9e-3 |
++
++Speed (s=1024, bool mask, median of shuffled rounds): masked causal Triton
++**1.22 ms vs 2.04 ms math = 1.67x**; non-causal 1.82 vs 1.98 ms = 1.09x.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..5f7612a056012332a09f472da1db067dccff24b4
+index 0000000000000000000000000000000000000000..f26e9f7ce4270bef5649cbd737c4b9718b92c53a
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,297 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1529,7 +1555,7 @@ index 0000000000000000000000000000000000000000..5f7612a056012332a09f472da1db067d
 +| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
 +| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 +| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
-+| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks/dropout/window/varlen are math fallback |
++| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks done; dropout/window/varlen still math fallback |
 +| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
 +| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
 +| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
@@ -1705,6 +1731,13 @@ index 0000000000000000000000000000000000000000..5f7612a056012332a09f472da1db067d
 +  non-causal fwd+bwd work; GQA works. Masks/dropout/sliding/varlen are
 +  functional via math fallback but not yet Triton-accelerated. Flash-decoding
 +  remains open.
++- **2026-11-25 - P0-2 (masks):** boolean and additive attention masks (2D, 3D
++  per batch, 4D per batch+head, broadcast, optionally with causal) now run in
++  the Triton fwd+bwd kernels; broadcast masks stay stride-0, masked lanes are
++  zeroed after the exponential (the `-1e6` trick otherwise leaked into long
++  rows). `bench/fa_mask.py`: fwd err ≤1e-3, grad err ≤4e-3; masked causal
++  s=1024 is 1.22 ms vs 2.04 ms math (1.67x). Dropout/window/varlen remain math
++  fallbacks.
 +- **2026-11-25 - repository maintenance:** portable launchers (repository-
 +  relative paths, `vswhere`, `ZLUDA_HIP_PATH`), documented ComfyUI launchers,
 +  `gpu_reset.ps1`, ComfyUI freeze file, patch export/validation tooling
@@ -1729,7 +1762,8 @@ index 0000000000000000000000000000000000000000..5f7612a056012332a09f472da1db067d
 +| GEMV M1-8 / auto M<=32 | **DONE** | ~2x rocBLAS; inference only |
 +| GEMV M16-32 target | **PARTIAL** | 155/78 GB/s; target 70-80% not met |
 +| FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
-+| FA masks/dropout/window/varlen | **FUNCTIONAL FALLBACK** | correct math; Triton path open |
++| FA masks | **DONE** | bool/additive 2D/3D/4D broadcast masks, causal+mask, fwd+bwd in Triton; fwd err ≤1e-3, grad err ≤4e-3; masked causal 1024 is 1.67x math |
++| FA dropout / window / varlen | **FUNCTIONAL FALLBACK** | correct math; Triton kernels open |
 +| Flash-decoding | **OPEN** | |
 +| bf16 native / emulation | **DONE (emulation)** | 4.42 native / 7.92 emulated TF |
 +| GPU monitoring | **PARTIAL** | utilization/VRAM via Windows PDH; measurement protocol enforced in every report; ADL live clocks return NOT_SUPPORTED (-8), documented blocker |
@@ -1741,7 +1775,7 @@ index 0000000000000000000000000000000000000000..5f7612a056012332a09f472da1db067d
 +| # | Action | Priority | Gate/acceptance |
 +|---|---|---|---|
 +| 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | >=10% vs implicit GEMM or document "not beneficial" |
-+| 2 | Triton masks/dropout for FA | P0 | match math fallback within 1e-3, faster at 1k+ |
++| 2 | Triton dropout for FA | P0 | masks **DONE 2026-11-25** (bool/additive, fwd+bwd, 1.67x masked causal @1024); dropout still math fallback |
 +| 3 | Triton sliding-window + varlen FA | P0 | correctness vs math; no dense mask allocation |
 +| 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
 +| 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
@@ -2140,6 +2174,161 @@ index 0000000000000000000000000000000000000000..3cc6326e0d09030c49d8498dfaec8d13
 +    print(f"compiled fp16: {ms_comp:.2f} ms")
 +    err = (y - model(x)).abs().max().item()
 +    print(f"max diff vs eager: {err:.4f}")
+diff --git a/bench/fa_mask.py b/bench/fa_mask.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c7a80406a8ac8371e490dda58daa5b2946ec189
+--- /dev/null
++++ b/bench/fa_mask.py
+@@ -0,0 +1,149 @@
++"""Validate Triton flash-attention masks against the math SDPA fallback.
++
++Cases: boolean 2D mask, additive 2D mask, 4D per-head mask, 3D per-batch mask,
++causal+mask, and (for the benchmark) masked attention at s=1024.
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\fa_mask.py            # s=256 checks
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\fa_mask.py --s 512 --bench
++"""
++
++import argparse
++import math
++import sys
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from torch.nn.attention import SDPBackend, sdpa_kernel
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from zluda_ops import scaled_dot_product_attention as triton_sdpa
++from bench.common import bench_median, save_report
++
++
++def math_sdpa(q, k, v, attn_mask=None, causal=False):
++    with sdpa_kernel(SDPBackend.MATH):
++        return F.scaled_dot_product_attention(
++            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=causal
++        )
++
++
++def make_mask(kind, batch, heads, sq, sk, device):
++    eye = torch.eye(sq, sk, device=device, dtype=torch.bool)
++    if kind == "bool2d":
++        return (torch.rand(sq, sk, device=device) > 0.25) | eye
++    if kind == "additive2d":
++        return torch.randn(sq, sk, device=device, dtype=torch.float32)
++    if kind == "bool4d":
++        return (torch.rand(batch, heads, sq, sk, device=device) > 0.25) | eye
++    if kind == "additive3d":
++        return torch.randn(batch, sq, sk, device=device, dtype=torch.float32)
++    raise ValueError(kind)
++
++
++def combined_mask(mask, s, device):
++    """math SDPA forbids attn_mask together with is_causal; merge them."""
++    causal_allowed = torch.tril(torch.ones(s, s, device=device, dtype=torch.bool))
++    if mask.dtype == torch.bool:
++        return (mask & causal_allowed.view(1, 1, s, s)).contiguous()
++    big_neg = torch.full((s, s), -1.0e9, device=device, dtype=mask.dtype)
++    bias = torch.where(causal_allowed, torch.zeros_like(big_neg), big_neg)
++    return mask + bias.view(1, 1, s, s)
++
++
++def check(kind, s=256, causal=False, device="cuda"):
++    torch.manual_seed(0)
++    b, h, d = 1, 8, 64
++    q = torch.randn(b, h, s, d, device=device, dtype=torch.float16, requires_grad=True)
++    k = torch.randn(b, h, s, d, device=device, dtype=torch.float16, requires_grad=True)
++    v = torch.randn(b, h, s, d, device=device, dtype=torch.float16, requires_grad=True)
++    do = torch.randn_like(q)
++    mask = make_mask(kind, b, h, s, s, device)
++
++    out = triton_sdpa(q, k, v, attn_mask=mask, is_causal=causal)
++    torch.cuda.synchronize()
++    ref = math_sdpa(
++        q, k, v, attn_mask=combined_mask(mask, s, device) if causal else mask,
++        causal=False,
++    )
++    ferr = (out.float() - ref.float()).abs().max().item()
++    out.backward(do, retain_graph=True)
++    gq, gk, gv = q.grad.clone(), k.grad.clone(), v.grad.clone()
++    q.grad = k.grad = v.grad = None
++    ref.backward(do)
++    gerr = max(
++        (gq - q.grad).abs().max().item(),
++        (gk - k.grad).abs().max().item(),
++        (gv - v.grad).abs().max().item(),
++    )
++    q.grad = k.grad = v.grad = None
++    print(
++        f"{kind:12s} s={s} causal={int(causal)}: fwd err {ferr:.5f} grad err {gerr:.5f}",
++        flush=True,
++    )
++    return {"kind": kind, "s": s, "causal": causal, "fwd_err": ferr, "grad_err": gerr}
++
++
++def bench_case(s, causal, device="cuda"):
++    b, h, d = 1, 8, 64
++    torch.manual_seed(0)
++    q = torch.randn(b, h, s, d, device=device, dtype=torch.float16)
++    k = torch.randn(b, h, s, d, device=device, dtype=torch.float16)
++    v = torch.randn(b, h, s, d, device=device, dtype=torch.float16)
++    mask = torch.rand(s, s, device=device) > 0.1
++    triton_ms = bench_median(
++        lambda: triton_sdpa(q, k, v, attn_mask=mask, is_causal=causal), rounds=3, iters=3
++    )
++    ref_mask = combined_mask(mask, s, q.device) if causal else mask
++    math_ms = bench_median(
++        lambda: math_sdpa(q, k, v, attn_mask=ref_mask, causal=False), rounds=3, iters=3
++    )
++    print(
++        f"bench s={s} causal={int(causal)}: triton {triton_ms:.2f} ms math {math_ms:.2f} ms "
++        f"speedup {math_ms / triton_ms:.2f}x",
++        flush=True,
++    )
++    return {
++        "s": s,
++        "causal": causal,
++        "triton_ms": triton_ms,
++        "math_ms": math_ms,
++        "speedup": math_ms / triton_ms,
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--s", type=int, default=256)
++    parser.add_argument("--bench", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    args = parser.parse_args()
++
++    dtype_ok = torch.cuda.is_available()
++    if not dtype_ok:
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    print(f"VRAM fraction {args.vram_fraction}", flush=True)
++
++    rows = [
++        check("bool2d", args.s),
++        check("additive2d", args.s),
++        check("bool4d", args.s),
++        check("additive3d", args.s),
++        check("bool2d", args.s, causal=True),
++        check("additive2d", args.s, causal=True),
++    ]
++    benches = []
++    if args.bench:
++        benches.append(bench_case(1024, True))
++        benches.append(bench_case(1024, False))
++    save_report("fa_mask", {"checks": rows, "benches": benches, "s": args.s})
++    worst = max(max(r["fwd_err"], r["grad_err"]) for r in rows)
++    print(f"worst error {worst:.5f}", flush=True)
++    return 0 if worst < 2e-2 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/flash_pack.py b/bench/flash_pack.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..954fcb0e46aba2f1654f6f3786f14fd5bd199221
@@ -4933,10 +5122,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..e378d34ea04f5ff4d193d9bb27b234beb534d42d
+index 0000000000000000000000000000000000000000..2ebe1ebcd32d2307a548859faaead08a381dab27
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,354 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -5217,6 +5406,7 @@ index 0000000000000000000000000000000000000000..e378d34ea04f5ff4d193d9bb27b234be
 +run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
 +run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
 +venv\Scripts\python.exe bench\gpu_clocks.py --seconds 3
++run-zluda.cmd venv\Scripts\python.exe bench\fa_mask.py --s 512 --bench
 +```
 +
 +Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -9084,10 +9274,10 @@ index 0000000000000000000000000000000000000000..8db2e10b78e555c4ce5243c81ed38707
 +__all__ = ["matmul", "linear"]
 diff --git a/zluda_ops/flash_attention.py b/zluda_ops/flash_attention.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc824dc4d9
+index 0000000000000000000000000000000000000000..35fa961c0930b6e749793bab5f397c2f3d979f13
 --- /dev/null
 +++ b/zluda_ops/flash_attention.py
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,545 @@
 +import math
 +
 +import torch
@@ -9102,7 +9292,9 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +                    start_m, qk_scale,
 +                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
 +                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-+                    N_CTX: tl.constexpr):
++                    N_CTX: tl.constexpr,
++                    Mask, mask_stride_m, mask_stride_n,
++                    MASK_TYPE: tl.constexpr):
 +    if STAGE == 1:
 +        lo, hi = 0, start_m * BLOCK_M
 +    elif STAGE == 2:
@@ -9116,15 +9308,28 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +        start_n = tl.multiple_of(start_n, BLOCK_N)
 +        k = tl.load(K_block_ptr)
 +        qk = tl.dot(q, k)
++        qk = qk * qk_scale
++        # Attn mask first (bool: drop; additive: add in log2 domain), then the
++        # causal constraint so a positive additive bias cannot resurrect a
++        # causally masked position.
++        if MASK_TYPE == 1:
++            mvals = tl.load(Mask + offs_m[:, None] * mask_stride_m
++                            + (start_n + offs_n[None, :]) * mask_stride_n)
++            qk = tl.where(mvals != 0, qk, -1.0e6)
++        elif MASK_TYPE == 2:
++            mvals = tl.load(Mask + offs_m[:, None] * mask_stride_m
++                            + (start_n + offs_n[None, :]) * mask_stride_n)
++            qk += mvals.to(tl.float32) * 1.4426950408889634
 +        if STAGE == 2:
-+            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-+            qk -= m_ij[:, None]
-+        else:
-+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-+            qk = qk * qk_scale - m_ij[:, None]
++            cmask = offs_m[:, None] >= (start_n + offs_n[None, :])
++            qk = tl.where(cmask, qk, -1.0e6)
++        m_ij = tl.maximum(m_i, tl.max(qk, 1))
++        qk -= m_ij[:, None]
 +        p = tl.math.exp2(qk)
++        if MASK_TYPE == 1:
++            # -1e6 survives the row-max subtraction; zero masked lanes so a
++            # partially masked row does not average over masked values.
++            p = tl.where(mvals != 0, p, 0.0)
 +        l_ij = tl.sum(p, 1)
 +        alpha = tl.math.exp2(m_i - m_ij)
 +        l_i = l_i * alpha + l_ij
@@ -9145,16 +9350,19 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +              stride_vz, stride_vh, stride_vk, stride_vn,
 +              stride_oz, stride_oh, stride_om, stride_on,
 +              Z, H, N_CTX,
++              Mask, mask_stride_z, mask_stride_h, mask_stride_m, mask_stride_n,
 +              HEAD_DIM: tl.constexpr,
 +              BLOCK_M: tl.constexpr,
 +              BLOCK_N: tl.constexpr,
-+              STAGE: tl.constexpr):
++              STAGE: tl.constexpr,
++              MASK_TYPE: tl.constexpr):
 +    tl.static_assert(BLOCK_N <= HEAD_DIM)
 +    start_m = tl.program_id(0)
 +    off_hz = tl.program_id(1)
 +    off_z = off_hz // H
 +    off_h = off_hz % H
 +    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
++    Mask += off_z.to(tl.int64) * mask_stride_z + off_h.to(tl.int64) * mask_stride_h
 +
 +    Q_block_ptr = tl.make_block_ptr(
 +        base=Q + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qk),
@@ -9179,11 +9387,13 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +    if STAGE & 1:
 +        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
 +                                        start_m, qk_scale, BLOCK_M, HEAD_DIM, BLOCK_N,
-+                                        4 - STAGE, offs_m, offs_n, N_CTX)
++                                        4 - STAGE, offs_m, offs_n, N_CTX,
++                                        Mask, mask_stride_m, mask_stride_n, MASK_TYPE)
 +    if STAGE & 2:
 +        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
 +                                        start_m, qk_scale, BLOCK_M, HEAD_DIM, BLOCK_N,
-+                                        2, offs_m, offs_n, N_CTX)
++                                        2, offs_m, offs_n, N_CTX,
++                                        Mask, mask_stride_m, mask_stride_n, MASK_TYPE)
 +    m_i += tl.math.log2(l_i)
 +    acc = acc / l_i[:, None]
 +    m_ptrs = M + off_hz * N_CTX + offs_m
@@ -9207,7 +9417,9 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +def _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
 +                   stride_tok, stride_d, H, N_CTX,
 +                   BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr, HEAD_DIM: tl.constexpr,
-+                   start_n, start_m, num_steps, MASK: tl.constexpr):
++                   start_n, start_m, num_steps,
++                   Mask, mask_stride_m, mask_stride_n,
++                   MASK_TYPE: tl.constexpr, MASK: tl.constexpr):
 +    offs_m = start_m + tl.arange(0, BLOCK_M1)
 +    offs_n = start_n + tl.arange(0, BLOCK_N1)
 +    offs_k = tl.arange(0, HEAD_DIM)
@@ -9221,7 +9433,15 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +        offs_m = curr_m + tl.arange(0, BLOCK_M1)
 +        m = tl.load(M + offs_m)
 +        qkT = tl.dot(k, qT)
++        if MASK_TYPE == 2:
++            mv = tl.load(Mask + offs_m[None, :] * mask_stride_m
++                         + offs_n[:, None] * mask_stride_n)
++            qkT += mv.to(tl.float32) * 1.4426950408889634
 +        pT = tl.math.exp2(qkT - m[None, :])
++        if MASK_TYPE == 1:
++            mv = tl.load(Mask + offs_m[None, :] * mask_stride_m
++                         + offs_n[:, None] * mask_stride_n)
++            pT = tl.where(mv != 0, pT, 0.0)
 +        if MASK:
 +            mask = (offs_m[None, :] >= offs_n[:, None])
 +            pT = tl.where(mask, pT, 0.0)
@@ -9243,7 +9463,9 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +def _attn_bwd_dq(dq, q, K, V, do, m, D,
 +                 stride_tok, stride_d, H, N_CTX,
 +                 BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr, HEAD_DIM: tl.constexpr,
-+                 start_m, start_n, num_steps, MASK: tl.constexpr):
++                 start_m, start_n, num_steps,
++                 Mask, mask_stride_m, mask_stride_n,
++                 MASK_TYPE: tl.constexpr, MASK: tl.constexpr):
 +    offs_m = start_m + tl.arange(0, BLOCK_M2)
 +    offs_n = start_n + tl.arange(0, BLOCK_N2)
 +    offs_k = tl.arange(0, HEAD_DIM)
@@ -9257,10 +9479,19 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +        kT = tl.load(kT_ptrs)
 +        vT = tl.load(vT_ptrs)
 +        qk = tl.dot(q, kT)
-+        p = tl.math.exp2(qk - m)
++        offs_n_blk = curr_n + tl.arange(0, BLOCK_N2)
++        qk_adj = qk
++        if MASK_TYPE == 2:
++            mv = tl.load(Mask + offs_m[:, None] * mask_stride_m
++                         + offs_n_blk[None, :] * mask_stride_n)
++            qk_adj = qk + mv.to(tl.float32) * 1.4426950408889634
++        p = tl.math.exp2(qk_adj - m)
++        if MASK_TYPE == 1:
++            mv = tl.load(Mask + offs_m[:, None] * mask_stride_m
++                         + offs_n_blk[None, :] * mask_stride_n)
++            p = tl.where(mv != 0, p, 0.0)
 +        if MASK:
-+            offs_n = curr_n + tl.arange(0, BLOCK_N2)
-+            mask = (offs_m[:, None] >= offs_n[None, :])
++            mask = (offs_m[:, None] >= offs_n_blk[None, :])
 +            p = tl.where(mask, p, 0.0)
 +        dp = tl.dot(do, vT).to(tl.float32)
 +        ds = p * (dp - Di[:, None])
@@ -9275,10 +9506,11 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +@triton.jit
 +def _attn_bwd(Q, K, V, sm_scale, DO, DQ, DK, DV, M, D,
 +              stride_z, stride_h, stride_tok, stride_d, H, N_CTX,
++              Mask, mask_stride_z, mask_stride_h, mask_stride_m, mask_stride_n,
 +              BLOCK_M1: tl.constexpr, BLOCK_N1: tl.constexpr,
 +              BLOCK_M2: tl.constexpr, BLOCK_N2: tl.constexpr,
 +              BLK_SLICE_FACTOR: tl.constexpr, HEAD_DIM: tl.constexpr,
-+              CAUSAL: tl.constexpr):
++              CAUSAL: tl.constexpr, MASK_TYPE: tl.constexpr):
 +    LN2: tl.constexpr = 0.6931471824645996
 +    bhid = tl.program_id(2)
 +    off_chz = (bhid * N_CTX).to(tl.int64)
@@ -9294,6 +9526,7 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +    DV += adj
 +    M += off_chz
 +    D += off_chz
++    Mask += (bhid // H) * mask_stride_z + (bhid % H) * mask_stride_h
 +
 +    offs_k = tl.arange(0, HEAD_DIM)
 +    start_n = pid * BLOCK_N1
@@ -9309,19 +9542,19 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +        dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
 +                                stride_tok, stride_d, H, N_CTX,
 +                                MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,
-+                                start_n, start_m, num_steps, MASK=True)
++                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, MASK=True)
 +        start_m += num_steps * MASK_BLOCK_M1
 +        num_steps = (N_CTX - start_m) // BLOCK_M1
 +        dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
 +                                stride_tok, stride_d, H, N_CTX,
 +                                BLOCK_M1, BLOCK_N1, HEAD_DIM,
-+                                start_n, start_m, num_steps, MASK=False)
++                                start_n, start_m, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, MASK=False)
 +    else:
 +        num_steps = N_CTX // BLOCK_M1
 +        dk, dv = _attn_bwd_dkdv(dk, dv, Q, k, v, sm_scale, DO, M, D,
 +                                stride_tok, stride_d, H, N_CTX,
 +                                BLOCK_M1, BLOCK_N1, HEAD_DIM,
-+                                start_n, 0, num_steps, MASK=False)
++                                start_n, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, MASK=False)
 +    dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
 +    tl.store(dv_ptrs, dv)
 +    dk *= sm_scale
@@ -9341,17 +9574,17 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +        num_steps = BLOCK_M2 // MASK_BLOCK_N2
 +        dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
 +                          BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,
-+                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, MASK=True)
++                          start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, MASK=True)
 +        end_n -= num_steps * MASK_BLOCK_N2
 +        num_steps = end_n // BLOCK_N2
 +        dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
 +                          BLOCK_M2, BLOCK_N2, HEAD_DIM,
-+                          start_m, end_n - num_steps * BLOCK_N2, num_steps, MASK=False)
++                          start_m, end_n - num_steps * BLOCK_N2, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, MASK=False)
 +    else:
 +        num_steps = N_CTX // BLOCK_N2
 +        dq = _attn_bwd_dq(dq, q, K, V, do, m, D, stride_tok, stride_d, H, N_CTX,
 +                          BLOCK_M2, BLOCK_N2, HEAD_DIM,
-+                          start_m, 0, num_steps, MASK=False)
++                          start_m, 0, num_steps, Mask, mask_stride_m, mask_stride_n, MASK_TYPE, MASK=False)
 +    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
 +    dq *= LN2
 +    tl.store(dq_ptrs, dq)
@@ -9359,12 +9592,14 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +
 +class TritonFlashAttention(torch.autograd.Function):
 +    @staticmethod
-+    def forward(ctx, q, k, v, causal, sm_scale):
++    def forward(ctx, q, k, v, causal, sm_scale, attn_mask, mask_type, mask_strides):
 +        head_dim = q.shape[-1]
 +        o = torch.empty_like(q)
 +        stage = 3 if causal else 1
 +        lse = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
 +        grid = (triton.cdiv(q.shape[2], 64), q.shape[0] * q.shape[1], 1)
++        mz, mh, mm, mn = mask_strides
++        mask_arg = attn_mask if attn_mask is not None else q
 +        _attn_fwd[grid](
 +            q, k, v, sm_scale, lse, o,
 +            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -9372,12 +9607,17 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
 +            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
 +            q.shape[0], q.shape[1], q.shape[2],
++            mask_arg, mz, mh, mm, mn,
 +            HEAD_DIM=head_dim, BLOCK_M=64, BLOCK_N=64, STAGE=stage,
++            MASK_TYPE=mask_type,
 +            num_warps=4, num_stages=1,
 +        )
 +        ctx.save_for_backward(q, k, v, o, lse)
 +        ctx.sm_scale = sm_scale
 +        ctx.causal = causal
++        ctx.attn_mask = attn_mask
++        ctx.mask_type = mask_type
++        ctx.mask_strides = mask_strides
 +        return o
 +
 +    @staticmethod
@@ -9398,23 +9638,26 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +        arg_k = k * (ctx.sm_scale * rcp_ln2)
 +        block_m1, block_n1, block_m2, block_n2 = 32, 128, 128, 32
 +        grid = (n_ctx // block_n1, 1, batch * n_head)
++        mz, mh, mm, mn = ctx.mask_strides
++        mask_arg = ctx.attn_mask if ctx.attn_mask is not None else q
 +        _attn_bwd[grid](
 +            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,
 +            lse, delta,
 +            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
 +            n_head, n_ctx,
++            mask_arg, mz, mh, mm, mn,
 +            BLOCK_M1=block_m1, BLOCK_N1=block_n1,
 +            BLOCK_M2=block_m2, BLOCK_N2=block_n2,
 +            BLK_SLICE_FACTOR=2, HEAD_DIM=q.shape[-1], CAUSAL=ctx.causal,
++            MASK_TYPE=ctx.mask_type,
 +            num_warps=8, num_stages=1,
 +        )
-+        return dq, dk, dv, None, None
++        return dq, dk, dv, None, None, None, None, None
 +
 +
 +def _unsupported(q, k, v, attn_mask, dropout_p):
 +    return (
-+        attn_mask is not None
-+        or dropout_p != 0.0
++        dropout_p != 0.0
 +        or q.dtype != torch.float16
 +        or k.dtype != torch.float16
 +        or v.dtype != torch.float16
@@ -9426,29 +9669,79 @@ index 0000000000000000000000000000000000000000..15ba739df9621ccf6643d72e11de63dc
 +    )
 +
 +
++def _prepare_attn_mask(attn_mask, q, k):
++    """Normalize an SDPA attention mask for the Triton kernel.
++
++    Returns ``(mask, mask_type, strides)`` where ``mask_type`` is 0 (no mask),
++    1 (boolean, stored as uint8) or 2 (additive float32). The mask is broadcast
++    to ``(B, H, Sq, Sk)``; broadcast axes keep stride 0 and the kernel handles
++    them, so no dense mask is materialised for head/batch-broadcast masks.
++    """
++    if attn_mask is None:
++        return None, 0, (0, 0, 0, 0)
++    if attn_mask.dim() == 2:
++        mask = attn_mask[None, None]
++    elif attn_mask.dim() == 3:
++        mask = attn_mask[:, None]
++    elif attn_mask.dim() == 4:
++        mask = attn_mask
++    else:
++        raise ValueError("attn_mask must be 2D, 3D or 4D")
++    if mask.dtype == torch.bool:
++        mask = mask.to(torch.uint8)
++        mask_type = 1
++    elif mask.is_floating_point():
++        mask = mask.to(torch.float32)
++        mask_type = 2
++    else:
++        raise ValueError("attn_mask must be bool or floating point")
++    batch, heads = q.shape[0], q.shape[1]
++    sq, sk = q.shape[2], k.shape[2]
++    try:
++        mask = mask.expand(batch, heads, sq, sk)
++    except RuntimeError as exc:
++        raise ValueError(
++            f"attn_mask of shape {tuple(mask.shape)} is not broadcastable to "
++            f"{(batch, heads, sq, sk)}"
++        ) from exc
++    return mask, mask_type, (
++        mask.stride(0), mask.stride(1), mask.stride(2), mask.stride(3)
++    )
++
++
++def _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa):
++    if k.shape[1] != q.shape[1] and enable_gqa:
++        groups = q.shape[1] // k.shape[1]
++        k = k.repeat_interleave(groups, dim=1)
++        v = v.repeat_interleave(groups, dim=1)
++        enable_gqa = False
++    with sdpa_kernel(SDPBackend.MATH):
++        return F.scaled_dot_product_attention(
++            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
++            is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
++        )
++
++
 +def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
 +                                 is_causal=False, scale=None, enable_gqa=False):
 +    q, k, v = query, key, value
 +    if scale is None:
 +        scale = 1.0 / math.sqrt(q.shape[-1])
 +    if _unsupported(q, k, v, attn_mask, dropout_p):
-+        if k.shape[1] != q.shape[1] and enable_gqa:
-+            groups = q.shape[1] // k.shape[1]
-+            k = k.repeat_interleave(groups, dim=1)
-+            v = v.repeat_interleave(groups, dim=1)
-+            enable_gqa = False
-+        with sdpa_kernel(SDPBackend.MATH):
-+            return F.scaled_dot_product_attention(
-+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
-+                is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
-+            )
++        return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
++    try:
++        mask, mask_type, mask_strides = _prepare_attn_mask(attn_mask, q, k)
++    except (ValueError, TypeError):
++        return _math_sdpa(q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa)
 +    if k.shape[1] != q.shape[1]:
 +        if q.shape[1] % k.shape[1] != 0:
 +            raise ValueError("query heads must be a multiple of key/value heads")
 +        groups = q.shape[1] // k.shape[1]
 +        k = k.repeat_interleave(groups, dim=1)
 +        v = v.repeat_interleave(groups, dim=1)
-+    return TritonFlashAttention.apply(q, k, v, bool(is_causal), float(scale))
++    return TritonFlashAttention.apply(
++        q, k, v, bool(is_causal), float(scale), mask, mask_type, mask_strides,
++    )
 +
 +
 +def _window_mask(sq, sk, causal, window_size, device):
