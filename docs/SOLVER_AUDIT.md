@@ -85,3 +85,31 @@ graph-replay decode with correct GQA flash-decoding: 89.7 tok/s @1k, 72.3 tok/s
   stays the optimum available.
 - CUDA graphs for decode are now the delivery mechanism for the GEMV path
   (see docs/CUDA_GRAPHS_ZLUDA.md).
+## 6. conv2d solver selection (implemented)
+
+Sweep of conv2d candidates on SD/ResNet shapes (fp16 input/weights, 3x3 s1 p1):
+
+| shape | fp16 (MIOpen GemmFwdRest) | fp32 Winograd, weights cached | old workaround (casts both) | winner |
+|---|---|---|---|---|
+| 1x4x64x64 -> 64 | 0.10 ms | 0.11 ms | 0.12 ms | fp16 |
+| 1x64x64x64 -> 64 | 0.16 ms | 0.13 ms | 0.13 ms | fp32 |
+| 1x128x32x32 -> 128 | 0.16 ms | 0.12 ms | 0.14 ms | fp32 |
+| 1x320x16x16 -> 320 | 0.22 ms | 0.15 ms | 0.19 ms | fp32 |
+| 1x64x128x128 -> 64 | 0.58 ms | 0.22 ms | 0.23 ms | fp32 (2.7x) |
+
+Action: `zluda_ops/conv.py` now implements per-shape solver selection with
+- `_W_CACHE`: fp32 copies of weights (keyed by data_ptr/_version, LRU 256), so
+  the fp32 path only pays for the input cast per call;
+- `_SOLVER_CACHE`: first call for a new shape times both candidates once
+  (3 iterations each) and stores the winner; later calls dispatch directly.
+
+Enabled with `ZLUDA_CONV_AUTO=1` (recommended) or forced with
+`ZLUDA_CONV_FP32=1`; `auto.py` installs the F.conv2d patch in either mode.
+Correctness vs the native fp16 convolution: max abs error 2e-3..4e-3 (fp16
+rounding of the fp32 result). Mid/large SD shapes now take the fp32 Winograd
+path (2.7x faster than the previous forced workaround timing on 1x64x128x128),
+while small shapes automatically stay on the fp16 path.
+
+Remaining open items: int4 decoder-shaped GEMV sweep, fused int8 GEMV, and the
+non-LLM library paths (rocFFT/rocSPARSE/RNG) which are not exercised by the
+current workloads.
