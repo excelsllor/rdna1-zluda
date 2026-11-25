@@ -755,3 +755,38 @@ solver is optimal for the measured shapes, the user find-db is already in use,
 and the cold-start cost is process initialisation. The remaining conv win is
 the dtype/solver split handled by the cast-to-fp32 workaround (previous
 section), and possibly the missing channels_last path (measured unusable).
+
+## Fused kernels extension: LayerNorm, GeGLU, fused AdamW (2026-11-25)
+
+Added to `zluda_ops/fused.py` (see the earlier P1-5 section for RMSNorm/RoPE/
+SwiGLU/softmax): exact-erf GeGLU fwd+bwd, LayerNorm fwd+bwd and an in-place
+fused AdamW step. `bench/fused.py` covers all cases. Measured after a clean
+idle-GPU window (fp16, VRAM 85%):
+
+| op | shape | fused | torch eager | speedup |
+|---|---|---|---|---|
+| RMSNorm fwd | 8192x4096 | 0.402 ms | 3.787 ms | **9.4x** |
+| RMSNorm fwd+bwd | 8192x4096 | 4.57 ms | 13.49 ms | **2.95x** |
+| softmax | 8192x4096 | 0.371 ms | 0.870 ms | **2.3x** |
+| RoPE fwd | 1x32x2048x128 | 0.132 ms | 1.433 ms | **10.9x** |
+| RoPE fwd+bwd | 1x32x2048x128 | 0.396 ms | 3.282 ms | **8.3x** |
+| SwiGLU fwd/bwd | 8192x2048 | 0.305/0.935 ms | 0.457/1.397 ms | 1.50x/1.49x |
+| GeGLU fwd/bwd | 8192x2048 | 0.303/0.936 ms | 0.467/1.393 ms | 1.54x/1.49x |
+| LayerNorm fwd | 8192x4096 | 0.405 ms | 0.480 ms | 1.19x |
+| LayerNorm fwd+bwd | 8192x4096 | 4.10 ms | 2.15 ms | **0.53x (slower)** |
+| AdamW step | 4 Mi elements | 0.331 ms | 1.130 ms | **3.4x**, param diff 3e-8 |
+| chunked CE | 4096x16384 | 6.6 ms / 736 MB | 3.5 ms / 1024 MB | 0.52x (memory **-28%**) |
+
+Notes:
+
+- **LayerNorm**: the forward kernel wins slightly, but training is slower than
+  torch's native LayerNorm (the atomic weight/bias gradients dominate), so use
+  `torch.nn.LayerNorm` for training; the Triton version is useful only for
+  inference-style forward-only paths.
+- **Chunked CE** remains a memory-only option (-28% peak memory, slower).
+- GeGLU uses `libdevice.erf` (exact GELU, matches `F.gelu`), not the tanh
+  approximation.
+- Numbers vary run-to-run on this card (clocks cannot be fixed); the table is
+  from a verified idle-GPU window. During this session a concurrent external
+  benchmark had to be stopped and the GPU/driver recovered before the final
+  measurement — benchmarks must not share the GPU with other jobs.

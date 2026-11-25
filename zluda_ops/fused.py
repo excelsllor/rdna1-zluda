@@ -17,6 +17,7 @@ RDNA1 (small hidden sizes, memory-bound pointwise chains). Verify with
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -228,4 +229,188 @@ def chunked_cross_entropy(logits, targets, chunk_size=1024):
     return total / rows
 
 
-__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy"]
+
+
+@triton.jit
+def _layer_norm_fwd(X, W, B, Y, MEAN, RSTD, N: tl.constexpr, eps, BLOCK: tl.constexpr,
+                    HAS_WB: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(X + row * N + offs, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(x, axis=0) / N
+    xc = x - mean
+    var = tl.sum(xc * xc, axis=0) / N
+    rstd = 1.0 / tl.sqrt(var + eps)
+    if HAS_WB:
+        w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(B + offs, mask=mask, other=0.0).to(tl.float32)
+    else:
+        w = x * 0.0 + 1.0
+        b = x * 0.0
+    tl.store(Y + row * N + offs, (xc * rstd * w + b).to(Y.dtype.element_ty), mask=mask)
+    tl.store(MEAN + row, mean)
+    tl.store(RSTD + row, rstd)
+
+
+@triton.jit
+def _layer_norm_bwd(DY, X, W, MEAN, RSTD, DX, DW, DB, N: tl.constexpr,
+                    BLOCK: tl.constexpr, HAS_WB: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(X + row * N + offs, mask=mask, other=0.0).to(tl.float32)
+    dy = tl.load(DY + row * N + offs, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.load(MEAN + row)
+    rstd = tl.load(RSTD + row)
+    xhat = (x - mean) * rstd
+    if HAS_WB:
+        w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+    else:
+        w = tl.zeros((BLOCK,), tl.float32) + 1.0
+    dxhat = dy * w
+    s1 = tl.sum(dxhat, axis=0)
+    s2 = tl.sum(dxhat * xhat, axis=0)
+    dx = rstd * (dxhat - s1 / N - xhat * s2 / N)
+    tl.store(DX + row * N + offs, dx.to(DX.dtype.element_ty), mask=mask)
+    if HAS_WB:
+        tl.atomic_add(DW + offs, dy * xhat, mask=mask)
+        tl.atomic_add(DB + offs, dy, mask=mask)
+
+
+class _LayerNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        rows, n = x.reshape(-1, x.shape[-1]).shape
+        block = triton.next_power_of_2(n)
+        y = torch.empty_like(x)
+        mean = torch.empty(rows, device=x.device, dtype=torch.float32)
+        rstd = torch.empty(rows, device=x.device, dtype=torch.float32)
+        has_wb = weight is not None
+        w = weight if has_wb else x
+        b = bias if bias is not None else x
+        _layer_norm_fwd[(rows,)](x, w, b, y, mean, rstd, n, float(eps),
+                                 BLOCK=block, HAS_WB=has_wb, num_warps=4,
+                                 num_stages=1)
+        ctx.save_for_backward(x, w, mean, rstd)
+        ctx.rows, ctx.n, ctx.block, ctx.has_wb = rows, n, block, has_wb
+        ctxeps = eps
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w, mean, rstd = ctx.saved_tensors
+        dx = torch.empty_like(x)
+        dw = torch.zeros_like(w, dtype=torch.float32)
+        db = torch.zeros_like(w, dtype=torch.float32)
+        _layer_norm_bwd[(ctx.rows,)](dy, x, w, mean, rstd, dx, dw, db, ctx.n,
+                                     BLOCK=ctx.block, HAS_WB=ctx.has_wb,
+                                     num_warps=4, num_stages=1)
+        return dx, dw.to(w.dtype), db.to(w.dtype), None
+
+
+def layer_norm(x, weight=None, bias=None, eps=1e-5):
+    if x.dtype != torch.float16 or not x.is_contiguous() or not x.is_cuda:
+        raise NotImplementedError("layer_norm supports contiguous fp16 CUDA tensors")
+    return _LayerNorm.apply(x, weight, bias, eps)
+
+
+@triton.jit
+def _geglu_fwd(G, U, Y, NUM, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < NUM
+    g = tl.load(G + offs, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(U + offs, mask=mask, other=0.0).to(tl.float32)
+    gelu = 0.5 * g * (1.0 + libdevice.erf(g * 0.7071067811865476))
+    tl.store(Y + offs, (gelu * u).to(Y.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _geglu_bwd(DY, G, U, DG, DU, NUM, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < NUM
+    dy = tl.load(DY + offs, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(G + offs, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(U + offs, mask=mask, other=0.0).to(tl.float32)
+    cdf = 0.5 * (1.0 + libdevice.erf(g * 0.7071067811865476))
+    pdf = tl.exp(-0.5 * g * g) * 0.3989422804014327
+    dgelu = cdf + g * pdf
+    gelu = g * cdf
+    tl.store(DG + offs, (dy * u * dgelu).to(DG.dtype.element_ty), mask=mask)
+    tl.store(DU + offs, (dy * gelu).to(DU.dtype.element_ty), mask=mask)
+
+
+class _GeGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate, up):
+        y = torch.empty_like(gate)
+        num = gate.numel()
+        block = 1024
+        _geglu_fwd[(triton.cdiv(num, block),)](gate, up, y, num, BLOCK=block,
+                                               num_warps=4)
+        ctx.save_for_backward(gate, up)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        gate, up = ctx.saved_tensors
+        dg = torch.empty_like(gate)
+        du = torch.empty_like(up)
+        num = gate.numel()
+        block = 1024
+        _geglu_bwd[(triton.cdiv(num, block),)](dy, gate, up, dg, du, num,
+                                               BLOCK=block, num_warps=4)
+        return dg, du
+
+
+def geglu(gate, up):
+    if gate.dtype != torch.float16 or not gate.is_cuda or not gate.is_contiguous():
+        raise NotImplementedError("geglu supports contiguous fp16 CUDA tensors")
+    return _GeGLU.apply(gate, up)
+
+
+@triton.jit
+def _adamw_kernel(P, G, M, V, NUM, lr, b1, b2, bc1, bc2, eps, wd,
+                  BLOCK: tl.constexpr, HAS_WD: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < NUM
+    p = tl.load(P + offs, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(G + offs, mask=mask, other=0.0).to(tl.float32)
+    m = tl.load(M + offs, mask=mask, other=0.0).to(tl.float32)
+    v = tl.load(V + offs, mask=mask, other=0.0).to(tl.float32)
+    m = m * b1 + g * (1.0 - b1)
+    v = v * b2 + g * g * (1.0 - b2)
+    mhat = m / bc1
+    vhat = v / bc2
+    if HAS_WD:
+        p = p - lr * (mhat / (tl.sqrt(vhat) + eps) + wd * p)
+    else:
+        p = p - lr * (mhat / (tl.sqrt(vhat) + eps))
+    tl.store(P + offs, p.to(P.dtype.element_ty), mask=mask)
+    tl.store(M + offs, m.to(M.dtype.element_ty), mask=mask)
+    tl.store(V + offs, v.to(V.dtype.element_ty), mask=mask)
+
+
+def adamw_step_(param, grad, exp_avg, exp_avg_sq, lr=1e-3, beta1=0.9,
+                beta2=0.999, eps=1e-8, weight_decay=0.01, step=1):
+    """In-place AdamW update for fp32 tensors (matches torch.optim.AdamW)."""
+    if param.dtype != torch.float32 or not param.is_cuda:
+        raise NotImplementedError("adamw_step_ supports fp32 CUDA tensors")
+    if not (param.is_contiguous() and grad.is_contiguous()
+            and exp_avg.is_contiguous() and exp_avg_sq.is_contiguous()):
+        raise NotImplementedError("adamw_step_ needs contiguous tensors")
+    num = param.numel()
+    block = 1024
+    bc1 = 1.0 - beta1 ** step
+    bc2 = 1.0 - beta2 ** step
+    _adamw_kernel[(triton.cdiv(num, block),)](
+        param, grad, exp_avg, exp_avg_sq, num, lr, float(beta1), float(beta2), bc1, bc2, eps,
+        float(weight_decay), BLOCK=block, HAS_WD=weight_decay > 0.0,
+        num_warps=4,
+    )
+    return param
+
+__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
