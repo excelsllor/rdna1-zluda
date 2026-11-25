@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b97057c5e15aa60f8dceda158939942dffee3942
+index 0000000000000000000000000000000000000000..72a327b8f49031576a84036bdc1ab7a8092c156a
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,513 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,11 @@ index 0000000000000000000000000000000000000000..b97057c5e15aa60f8dceda158939942d
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - bf16 emulation works on ZLUDA:** with in-place parameter
++  conversion (bf16 storage -> fp32 compute) the ZLUDA process runs bf16-emul at
++  **5488 tok/s prefill / 29.6 tok/s decode / 2073 MB**, beating both native ZLUDA
++  bf16 (3450/11.1) and ROCm bf16-emul (3812/26.0). The earlier "crash" was a
++  harness invocation without the ZLUDA launcher, not a GPU/VRAM issue.
 +- **2026-11-25 - graph-replayed decode works (zLUDA):** found and fixed the
 +  decode GEMV dispatch bug in `zluda_ops.auto` (decode F.linear gets (1,1,D)
 +  tensors, so the 2-D-only Triton GEMV path never triggered - 0 calls, rocBLAS
@@ -9866,10 +9871,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/CROSS_BACKEND_COMPARISON.md b/docs/CROSS_BACKEND_COMPARISON.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f1a7f1f0a33209ebc1034d6316e77aec60c60103
+index 0000000000000000000000000000000000000000..365e46afce180406afc4089e6629536a7530564f
 --- /dev/null
 +++ b/docs/CROSS_BACKEND_COMPARISON.md
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,127 @@
 +# Cross-backend comparison: Vulkan vs native ROCm vs ZLUDA (gfx1010)
 +
 +Date: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B-Instruct.
@@ -9888,14 +9893,12 @@ index 0000000000000000000000000000000000000000..f1a7f1f0a33209ebc1034d6316e77aec
 +| fp16 + fp16-accum | **7450** | **51.0** | 1123 | 3099 (*) | 19.9 (*) | 1146 |
 +| fp32 | **5418** | **35.5** | 2073 | 1177 | 16.5 | 2096 |
 +| bf16 native | **3450** | **11.1** | 1123 | 2845 | 10.6 | 1146 |
-+| bf16 emulated (bf16 weights -> fp32 compute) | crash (**) | crash | - | 3812 | 26.0 | 2096 |
++| bf16 emulated (bf16 weights -> fp32 compute) | **5488** | **29.6** | 2073 | 3812 | 26.0 | 2096 |
 +
 +(*) The ROCm build ignores `torch._C._set_cublas_allow_fp16_accumulation`; fp16
 +accumulation is a cuBLAS/HPA concept, so ROCm has no equivalent switch and Vulkan
 +has no such concept at all (llama.cpp computes in the model tensor type).
-+(**) ZLUDA bf16-emul process died without producing a report (most likely VRAM:
-+an fp32 copy on top of the bf16 model), so it is not measured.
-+
++The ZLUDA bf16-emul number is now measured too (5488 tok/s prefill, 29.6 decode,\r\n2073 MB) using in-place parameter conversion; the earlier "crash" was a harness\r\ninvocation without the ZLUDA launcher, not a GPU problem.\r\n
 +ROCm bf16-emul is 1.34x faster than native bf16 on ROCm because it routes the
 +GEMMs through the faster fp32 path; on ZLUDA the same trick needs more VRAM than
 +the 85% cap allows on this 8 GB card.
@@ -10002,10 +10005,10 @@ index 0000000000000000000000000000000000000000..f1a7f1f0a33209ebc1034d6316e77aec
 \ No newline at end of file
 diff --git a/docs/CUDA_GRAPHS_ZLUDA.md b/docs/CUDA_GRAPHS_ZLUDA.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..9ae841bce92ca1bf5759e76ad0bad35e544dcc8f
+index 0000000000000000000000000000000000000000..88359dc413585e6b6f888ee9705b7116b88686ca
 --- /dev/null
 +++ b/docs/CUDA_GRAPHS_ZLUDA.md
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,150 @@
 +# CUDA graphs under ZLUDA on gfx1010
 +
 +Status 2026-11-25: **working for PyTorch `torch.cuda.CUDAGraph`** after adding
@@ -10122,13 +10125,7 @@ index 0000000000000000000000000000000000000000..9ae841bce92ca1bf5759e76ad0bad35e
 +   for capture-unsafe behaviour (internal sync, stream handling) so that GEMMs
 +   can be recorded into a graph.
 +
-+### bf16 emulation
-+
-+bf16 emulation (bf16 weights, fp32 compute) works on native ROCm torch
-+(3812 tok/s prefill / 26.0 decode vs 2845/10.6 native bf16) but the ZLUDA
-+process died without a report (most likely VRAM: an fp32 copy of the model on
-+top of the bf16 one). Needs an in-place conversion path and a smaller-VRAM
-+recipe before it can be measured there.
++### bf16 emulation\r\n\r\nbf16 emulation (bf16 weights, fp32 compute) works on both backends with in-place\r\nparameter conversion: ZLUDA 5488 tok/s prefill / 29.6 decode / 2073 MB vs\r\n3812/26.0/2096 MB on native ROCm torch (native bf16: ZLUDA 3450/11.1, ROCm\r\n2845/10.6). The earlier "crash" was a harness run without the ZLUDA launcher,\r\nnot a GPU/VRAM problem.
 +
 +## Graph-replayed decode: measured result
 +
