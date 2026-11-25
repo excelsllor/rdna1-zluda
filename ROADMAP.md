@@ -39,7 +39,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 | **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 | **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **OPEN** | memory/speed | medium | Triton |
-| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **AUDIT DONE / TEST OPEN** | SD/CNN speedup if MIOpen wins | medium | MIOpen; no ZLUDA-native kernels |
+| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | result: MIOpen lowers 3x3 to GEMM (`GemmFwdRest`), no Winograd/implicit-GEMM selected; channels_last unusable; fp16 2-4x slower than fp32; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
 | **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **OPEN** | high if SD is a target | medium-high | measure first |
 | **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | **PARTIAL** | +5–15% | medium | measured, not fused/auto |
 | **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | **OPEN** | +5–20% on kernels | low-medium | benchmarks |
@@ -61,7 +61,7 @@ Status keys: **DONE**, **PARTIAL**, **OPEN**, **BLOCKED**, **REJECTED**, and **A
 | 2 — Attention | **PARTIAL** | causal/non-causal/GQA done; masks/dropout/window/varlen fallback; flash-decoding open |
 | 3 — Quantization | **OPEN** | storage path not implemented; no int8 compute |
 | 4 — Fused kernels | **OPEN** | not started |
-| 5 — Diffusion/MIOpen | **PARTIAL** | Winograd audit done; benchmark and auto-selection open |
+| 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 | 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
 | 7 — Compiler/LLVM/Triton | **OPEN** | WGP/CU and autotune not started |
 | 8 — Integrations/distribution | **PARTIAL** | ComfyUI auto/GGUF works; wheels/CI/other apps open |
@@ -220,6 +220,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   kernels with the Philox mask regenerated from (head, query, key) offsets;
   unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
   s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
+- **2026-11-25 - P1-1 (conv audit):** `bench/conv.py` measures ResNet/SD 3x3
+  convolutions. MIOpen logs prove the selected solver is `GemmFwdRest`
+  (`miopenConvolutionFwdAlgoGEMM`, find 0.1052 ms): 3x3 is lowered to a rocBLAS
+  GEMM on gfx1010, Winograd/implicit-GEMM are not selected. NCHW is the only
+  usable layout (channels_last 10-1000x slower); fp16 conv is 2-4x slower than
+  fp32; the gfx1010 perf-db (`gfx1010_20.HIP.fdb.txt`) is missing and the CK
+  grouped-conv library is unavailable. Decision: no custom Winograd path; the
+  remaining win is the fp16-conv anomaly and shipping a perf-db.
 - **2026-11-25 - P0-4 (GEMV M=16/32):** benchmarked a split-K / tl.dot kernel
   (`bench/gemv_m32.py`) and packed-fp16 product variants. Split-K reaches
   64-81 GB/s at M=32 (mvec 81), packed-fp16 is worse (31-50), so the 70-80%
@@ -273,7 +281,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 
 | # | Action | Priority | Gate/acceptance |
 |---|---|---|---|
-| 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | >=10% vs implicit GEMM or document "not beneficial" |
+| 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | **CLOSED 2026-11-25**: MIOpen selects `GemmFwdRest` (GEMM) for 3x3; Winograd not selected; NCHW-only; fp16 2-4x slower than fp32; perf-db for gfx1010 missing — decision: no custom Winograd path, follow-ups = fp16 conv + perf-db |
 | 2 | Triton dropout for FA | P0 | **CLOSED 2026-11-25**: masks and inverted dropout run in Triton fwd+bwd; window/varlen remain (row 3) |
 | 3 | Triton sliding-window + varlen FA | P0 | **CLOSED 2026-11-25**: window arithmetic in kernel (7.1x @1024), varlen per-sequence Triton; fused packed varlen kernel still open |
 | 4 | GEMV M=16/32 tuning | P0 | **CLOSED 2026-11-25**: M16 176 GB/s (+13% via fp32-product config), M32 83; split-K/tl.dot (64-81) and packed-fp16 (31-50) measured worse; target 70-80% recorded as unreachable, rocBLAS fp32 M=32 kept as fallback |

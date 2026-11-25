@@ -531,3 +531,44 @@ Decisions taken:
   302/331 GB/s (fp16/fp32) with the measurement protocol from P0-5.
 - M=32 keeps the rocBLAS fallback on the auto path (119 GB/s fp32 vs 76-83
   Triton), and the 70-80% target is recorded as unreachable rather than open.
+
+## P1-1 Winograd / MIOpen convolution audit (2026-11-25)
+
+`bench/conv.py` measures 3x3 stride-1 conv2d on ResNet/SD shapes, checks
+correctness against CPU and captures the MIOpen solver choice. Correctness:
+max abs 2.5e-5 (relative 4.8e-7) vs CPU for fp32.
+
+The MIOpen logs (MIOPEN_ENABLE_LOGGING=1, MIOPEN_LOG_LEVEL=6) show that for
+NCHW fp16 3x3 the selected solution is **`GemmFwdRest` with
+`miopenConvolutionFwdAlgoGEMM`** (find time 0.1052 ms): MIOpen lowers the
+convolution to a rocBLAS GEMM. Winograd and HIP implicit-GEMM solvers are not
+selected for gfx1010 here. Additional environment findings:
+
+- `MIOpen: Warning [ParseAndLoadDb] File is unreadable: gfx1010_20.HIP.fdb.txt`
+  — there is no gfx1010 perf-db, so every new shape runs a runtime find.
+- `MIOpen: Warning [OpenRuntimeLibraryForDevice] CK grouped conv library not
+  found for device gfx1010` — the CK grouped-conv path is unavailable.
+
+Performance (NCHW, s=forward, 3x3 s1 p1):
+
+| shape (B,C,H,W,O) | fp32 fwd | fp16 fwd | fp32 fwd+bwd | fp16 fwd+bwd |
+|---|---|---|---|---|
+| 1x64x56x56x64 | 0.08 ms | 0.16 ms | 0.48 ms | 0.67 ms |
+| 8x64x56x56x64 | 0.22 ms | 0.72 ms | 1.16 ms | 2.82 ms |
+| 8x256x14x14x256 | 0.18 ms | 0.96 ms | 0.75 ms | 2.39 ms |
+| 2x256x64x64x256 | 0.67 ms | 2.14 ms | 2.92 ms | 6.24 ms |
+
+Two practical results:
+
+- **channels_last is unusable** on gfx1010: 10-1000x slower than NCHW
+  (e.g. 2x256x64x64 fp32: 546 ms vs 0.67 ms). Keep NCHW.
+- **fp16 convolution is 2-4x slower than fp32** through MIOpen on this card,
+  even though the selected solver is a GEMM in both cases. This matters for
+  fp16 SD/ComfyUI workloads and is a candidate follow-up (e.g. running
+  selected convs in fp32 or forcing a different solver).
+
+Decision for the roadmap: no custom Winograd path. MIOpen already lets its
+find choose among solvers (ZLUDA calls `miopenFindSolutions` and takes the
+fastest), and for gfx1010 it picks the GEMM fallback; Winograd is "not
+beneficial/not selected" rather than an opportunity. The remaining conv win
+would come from the missing gfx1010 perf-db and from the fp16-vs-fp32 anomaly.
