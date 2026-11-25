@@ -772,10 +772,10 @@ index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312
 +- GPU clock/power telemetry on Windows.
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..07811647614cd459e384ae7ab117e29090d2153f
+index 0000000000000000000000000000000000000000..75de5ac2e36413b013712767267abc2ae54b7e64
 --- /dev/null
 +++ b/INTEGRATION.md
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,155 @@
 +# Out-of-the-box acceleration
 +
 +`zluda_ops.auto` patches two PyTorch entry points at runtime:
@@ -841,6 +841,7 @@ index 0000000000000000000000000000000000000000..07811647614cd459e384ae7ab117e290
 +| `ZLUDA_AUTO_BF16_MAX_MB` | 64 | max bf16 weight size for auto emulation; 0 disables |
 +| `ZLUDA_MHA_SLOW=1` | off | force the slow math path for `nn.MultiheadAttention` |
 +| `ZLUDA_FP16_ACC=1` | off | experimental HH fp16 accumulation for training |
++| ZLUDA_CONV_FP32=1 | off | run eligible fp16 3x3 convs through the fp32 Winograd path (1.4-4.3x forward); needs import zluda_ops.auto |
 +| `ZLUDA_VRAM_FRACTION` | 0.85 | per-process VRAM fraction for `run-zluda-train.cmd` |
 +
 +Safety conditions:
@@ -1048,10 +1049,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..5a5faa30216b8ef8db834563e85c01e286b17d8b
+index 0000000000000000000000000000000000000000..a71f5f7c631da488e4bb6d1d48bf0e751d7b3acb
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,692 @@
+@@ -0,0 +1,728 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1744,12 +1745,48 @@ index 0000000000000000000000000000000000000000..5a5faa30216b8ef8db834563e85c01e2
 +memory at 4096x16384 but is slower than torch's fused CE.
 +
 +LayerNorm, GeGLU, fused AdamW/clip and GPU sampling remain open (see ROADMAP).
++
++## P1-1 follow-up: fp16 conv anomaly and the cast-to-fp32 workaround (2026-11-25)
++
++Root cause of the 2-4x fp16 conv slowdown: MIOpen selects **different solver
++families per dtype**. For fp32 3x3 it picks `ConvBinWinogradRxSf2x3g1`
++(miopenConvolutionFwdAlgoWinograd, find time 0.065 ms); for fp16 the same
++shape falls back to `GemmFwdRest` (miopenConvolutionFwdAlgoGEMM). Winograd is
++not selected for fp16 on gfx1010.
++
++Workaround implemented in `zluda_ops/conv.py`: for eligible fp16 3x3 stride-1
++dilation-1 group-1 convolutions, cast inputs and weights to fp32, run the fp32
++Winograd conv and cast the result back. fp16 inputs are exactly representable in
++fp32, so the result equals an fp32 convolution rounded to fp16 (gradients flow
++through the casts). `zluda_ops.auto` patches `F.conv2d` with it when
++`ZLUDA_CONV_FP32=1`.
++
++Measured with the warmed/shuffled protocol (VRAM 85%):
++
++| shape | fwd fp16 | fwd cast | fwd speedup | fwd+bwd fp16 | fwd+bwd cast | bwd speedup |
++|---|---|---|---|---|---|---|
++| 1x64x56x56, 64 | 0.158 ms | 0.112 ms | **1.41x** | 0.478 ms | 0.596 ms | 0.80x |
++| 8x64x56x56, 64 | 0.687 ms | 0.289 ms | **2.37x** | 1.562 ms | 1.532 ms | 1.02x |
++| 8x256x14x14, 256 | 1.013 ms | 0.239 ms | **4.25x** | 1.706 ms | 0.900 ms | **1.90x** |
++| 2x256x64x64, 256 | 2.187 ms | 0.861 ms | **2.54x** | 4.490 ms | 3.471 ms | **1.29x** |
++| 1x320x64x64, 320 | 1.573 ms | 0.690 ms | **2.28x** | 3.173 ms | 2.707 ms | **1.17x** |
++| UNet block 1x256x32x32 | 0.430 ms | 0.250 ms | **1.72x** | - | - | - |
++| UNet block 2x320x64x64 | 3.259 ms | 1.419 ms | **2.30x** | - | - | - |
++
++Forward wins on 5/5 shapes (1.4-4.3x), forward+backward on 4/5 (up to 1.9x);
++the smallest shape is conversion-bound for training (0.80x). Gradient error vs
++the fp32 reference is 2e-8..7e-4 (fp16 accumulation level). `bench/conv_fp16.py`
++reproduces the table.
++
++Caveats: fp32 copies of the conv weights cost memory; the win is shape-dependent
++(conversion cost for tiny convs); only 3x3 stride-1/dilation-1/group-1 is
++eligible, everything else uses the regular path.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..eabf4ce70eface941152c4bab3e310dbc226adc5
+index 0000000000000000000000000000000000000000..502e7fe5d91d5ffcd4063cdf97cac9aa3d1762c9
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,362 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1791,7 +1828,7 @@ index 0000000000000000000000000000000000000000..eabf4ce70eface941152c4bab3e310db
 +| **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 +| **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 +| **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **DONE** | RMSNorm 8.2x fwd / 6.1x bwd, softmax 18.5x, RoPE 5.1-8.8x, SwiGLU 1.2-1.5x vs torch eager; chunked CE -28% peak memory but slower than torch | medium | Triton |
-+| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | result: MIOpen lowers 3x3 to GEMM (`GemmFwdRest`), no Winograd/implicit-GEMM selected; channels_last unusable; fp16 2-4x slower than fp32; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
++| **P1** | Winograd/MIOpen conv audit: solver availability, correctness, workspace, speed on 3x3 stride-1/dilation-1 | **DONE** | fp16 anomaly root-caused: MIOpen picks Winograd (`ConvBinWinogradRxSf2x3g1`) only for fp32, fp16 gets GEMM (`GemmFwdRest`). Workaround `zluda_ops/conv.py`: cast-to-fp32 Winograd conv, **1.4-4.3x fwd / up to 1.9x fwd+bwd**, opt-in `ZLUDA_CONV_FP32=1`; channels_last unusable; no gfx1010 perf-db | medium | MIOpen; no ZLUDA-native kernels |
 +| **P2** | MIOpen solver/perf-db for gfx1010, channels_last+fp16, VAE tiling, GroupNorm+SiLU (SD/ComfyUI) | **OPEN** | high if SD is a target | medium-high | measure first |
 +| **P2** | GEMM epilogues (bias/activation/residual/scale), grouped GEMM (MoE) | **PARTIAL** | +5–15% | medium | measured, not fused/auto |
 +| **P2** | Triton/Inductor autotune configs for RDNA1; WGP vs CU experiment | **OPEN** | +5–20% on kernels | low-medium | benchmarks |
@@ -1972,6 +2009,15 @@ index 0000000000000000000000000000000000000000..eabf4ce70eface941152c4bab3e310db
 +  kernels with the Philox mask regenerated from (head, query, key) offsets;
 +  unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
 +  s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
++- **2026-11-25 - P1-1 follow-up (fp16 conv):** MIOpen logs prove the dtype
++  split — fp32 3x3 uses the Winograd solver `ConvBinWinogradRxSf2x3g1`, fp16
++  falls back to `GemmFwdRest` (GEMM). Implemented `zluda_ops/conv.py`
++  (cast-to-fp32 Winograd path, gradients flow through the casts) and an opt-in
++  `F.conv2d` patch in `zluda_ops.auto` behind `ZLUDA_CONV_FP32=1`. Measured with
++  the warmed/shuffled protocol: **1.41-4.25x forward** on 5/5 SD/ResNet shapes,
++  **1.02-1.90x forward+backward** on 4/5 (the smallest shape is
++  conversion-bound), UNet blocks 1.72x/2.30x, gradient error 2e-8..7e-4.
++  `bench/conv_fp16.py` reproduces it.
 +- **2026-11-25 - P1-5 (fused kernels):** `zluda_ops/fused.py` adds Triton
 +  RMSNorm (fwd+bwd), RoPE rotate-half (fwd+bwd), SwiGLU (fwd+bwd), row softmax
 +  and a memory-saving chunked cross-entropy, with `bench/fused.py` comparing
@@ -2648,6 +2694,183 @@ index 0000000000000000000000000000000000000000..86f45a436ff2512f06fc18d1131affc2
 +    rows = run_matrix(shapes, (torch.float16, torch.float32), (False, True))
 +    probe = solver_probe() if args.solver_probe else None
 +    save_report("conv", {"correctness": corr, "rows": rows, "solver_probe": probe})
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/bench/conv_fp16.py b/bench/conv_fp16.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..da17e325af29213751f39922122e11088acfa665
+--- /dev/null
++++ b/bench/conv_fp16.py
+@@ -0,0 +1,171 @@
++"""Cast-to-fp32 convolution workaround for gfx1010 (Winograd).
++
++MIOpen picks a fp32 Winograd solver (`ConvBinWinogradRxSf2x3g1`) for 3x3
++convolutions, but fp16 falls back to `GemmFwdRest` (a rocBLAS GEMM). Casting
++fp16 inputs/weights to fp32, running the fp32 Winograd conv and casting the
++result back (`zluda_ops.conv.conv2d`) is faster and at least as accurate.
++
++Timing uses a warmed GPU and shuffled interleaved rounds (the clocks cannot be
++fixed on this card, so a naive sequential loop overestimates later variants).
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\conv_fp16.py --quick
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\conv_fp16.py
++"""
++
++import argparse
++import random
++import sys
++import time
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from zluda_ops import conv as zconv
++from bench.common import save_report
++
++
++def timed_shuffled(fns, warm_seconds=1.5, rounds=5, iters=8):
++    t0 = time.perf_counter()
++    while time.perf_counter() - t0 < warm_seconds:
++        for fn in fns.values():
++            fn()
++        torch.cuda.synchronize()
++    rng = random.Random(7)
++    samples = {name: [] for name in fns}
++    for _ in range(rounds):
++        order = list(fns)
++        rng.shuffle(order)
++        for name in order:
++            fn = fns[name]
++            for _ in range(2):
++                fn()
++            torch.cuda.synchronize()
++            t = time.perf_counter()
++            for _ in range(iters):
++                fn()
++            torch.cuda.synchronize()
++            samples[name].append((time.perf_counter() - t) / iters * 1000)
++    return {name: sorted(v)[len(v) // 2] for name, v in samples.items()}
++
++
++def compare_shape(shape, device="cuda"):
++    b, c, h, w, o, k = shape
++    torch.manual_seed(0)
++    x16 = torch.randn(b, c, h, w, device=device, dtype=torch.float16)
++    w16 = torch.randn(o, c, k, k, device=device, dtype=torch.float16)
++    b16 = torch.randn(o, device=device, dtype=torch.float16)
++    ref32 = F.conv2d(x16.float(), w16.float(), b16.float(), padding=k // 2)
++    out = zconv.conv2d(x16, w16, b16, padding=k // 2)
++    fwd_err = (out.float() - ref32).abs().max().item()
++
++    # gradient correctness against the fp32 reference
++    xg = x16.clone().requires_grad_(True)
++    wg = w16.clone().requires_grad_(True)
++    bg = b16.clone().requires_grad_(True)
++    zconv.conv2d(xg, wg, bg, padding=k // 2).float().mean().backward()
++    xr = x16.float().clone().requires_grad_(True)
++    wr = w16.float().clone().requires_grad_(True)
++    br = b16.float().clone().requires_grad_(True)
++    F.conv2d(xr, wr, br, padding=k // 2).mean().backward()
++    grad_err = max(
++        (xg.grad.float() - xr.grad).abs().max().item(),
++        (wg.grad.float() - wr.grad).abs().max().item(),
++        (bg.grad.float() - br.grad).abs().max().item(),
++    )
++
++    fwd_ms = timed_shuffled({
++        "fp16": lambda: F.conv2d(x16, w16, b16, padding=k // 2),
++        "cast": lambda: zconv.conv2d(x16, w16, b16, padding=k // 2),
++    })
++
++    # training path: fp16 params vs fp32 master weights (cast each step)
++    xg16 = x16.clone().requires_grad_(True)
++    w32u = w16.detach().float().requires_grad_(True)
++    b32u = b16.detach().float().requires_grad_(True)
++
++    def fb_fp16():
++        y = F.conv2d(xg16, w16, b16, padding=k // 2)
++        y.float().mean().backward()
++        xg16.grad = None
++
++    def fb_cast():
++        y = F.conv2d(xg16.float(), w32u, b32u, padding=k // 2).half()
++        y.float().mean().backward()
++        xg16.grad = w32u.grad = b32u.grad = None
++
++    fb_ms = timed_shuffled({"fp16": fb_fp16, "cast": fb_cast}, rounds=4, iters=5)
++    print(f"{shape}: fwd fp16 {fwd_ms['fp16']:.3f} vs cast {fwd_ms['cast']:.3f} ms "
++          f"({fwd_ms['fp16'] / fwd_ms['cast']:.2f}x) | fwd+bwd fp16 {fb_ms['fp16']:.3f} "
++          f"vs cast {fb_ms['cast']:.3f} ms ({fb_ms['fp16'] / fb_ms['cast']:.2f}x) | "
++          f"err vs fp32 {fwd_err:.4f}, grad err {grad_err:.2e}", flush=True)
++    return {
++        "shape": shape,
++        "fwd_fp16_ms": fwd_ms["fp16"], "fwd_cast_ms": fwd_ms["cast"],
++        "fwd_speedup": fwd_ms["fp16"] / fwd_ms["cast"],
++        "fwd_bwd_fp16_ms": fb_ms["fp16"], "fwd_bwd_cast_ms": fb_ms["cast"],
++        "fwd_bwd_speedup": fb_ms["fp16"] / fb_ms["cast"],
++        "fwd_err_vs_fp32": fwd_err, "grad_err": grad_err,
++    }
++
++
++def unet_block(batch, ch, hw, device="cuda"):
++    torch.manual_seed(0)
++    x = torch.randn(batch, ch, hw, hw, device=device, dtype=torch.float16)
++    conv_w = torch.randn(ch, ch, 3, 3, device=device, dtype=torch.float16)
++    conv_b = torch.randn(ch, device=device, dtype=torch.float16)
++    gn_w = torch.ones(ch, device=device, dtype=torch.float16)
++    gn_b = torch.zeros(ch, device=device, dtype=torch.float16)
++
++    def run_fp16():
++        h = F.silu(F.group_norm(x, 32, gn_w, gn_b))
++        return F.conv2d(h, conv_w, conv_b, padding=1) + x
++
++    def run_cast():
++        h = F.silu(F.group_norm(x, 32, gn_w, gn_b))
++        return zconv.conv2d(h, conv_w, conv_b, padding=1) + x
++
++    ms = timed_shuffled({"fp16": run_fp16, "cast": run_cast})
++    diff = (run_fp16().float() - run_cast().float()).abs().max().item()
++    print(f"unet block {batch}x{ch}x{hw}x{hw}: fp16 {ms['fp16']:.3f} vs "
++          f"cast {ms['cast']:.3f} ms ({ms['fp16'] / ms['cast']:.2f}x), diff {diff:.5f}",
++          flush=True)
++    return {"batch": batch, "ch": ch, "hw": hw, "fp16_ms": ms["fp16"],
++            "cast_ms": ms["cast"], "speedup": ms["fp16"] / ms["cast"],
++            "diff": diff}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--quick", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    args = parser.parse_args()
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    print(f"VRAM fraction {args.vram_fraction}", flush=True)
++
++    shapes = [
++        (1, 64, 56, 56, 64, 3),
++        (8, 64, 56, 56, 64, 3),
++        (8, 256, 14, 14, 256, 3),
++        (2, 256, 64, 64, 256, 3),
++        (1, 320, 64, 64, 320, 3),
++    ]
++    if args.quick:
++        shapes = shapes[:2]
++    rows = [compare_shape(s) for s in shapes]
++    blocks = [unet_block(1, 256, 32)]
++    if not args.quick:
++        blocks.append(unet_block(2, 320, 64))
++    save_report("conv_fp16", {"rows": rows, "blocks": blocks})
++    wins = sum(1 for r in rows if r["fwd_speedup"] > 1.0)
++    print(f"cast path faster on {wins}/{len(rows)} shapes (fwd)", flush=True)
 +    return 0
 +
 +
@@ -6662,10 +6885,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..eace3f33116c5be9db9de558d9af58e6fb0e5056
+index 0000000000000000000000000000000000000000..7be4c02afc324698579e703720eff411daaf0e25
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,362 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -6951,6 +7174,7 @@ index 0000000000000000000000000000000000000000..eace3f33116c5be9db9de558d9af58e6
 +run-zluda.cmd venv\Scripts\python.exe bench\fa_window.py --s 512 --bench
 +run-zluda.cmd venv\Scripts\python.exe bench\gemv_m32.py --n 4096 --k 4096 --mvec
 +run-zluda.cmd venv\Scripts\python.exe bench\conv.py --quick
++run-zluda.cmd venv\Scripts\python.exe bench\conv_fp16.py --quick
 +run-zluda.cmd venv\Scripts\python.exe bench\flash_decode.py --quick
 +run-zluda.cmd venv\Scripts\python.exe bench\quant.py --quick
 +run-zluda.cmd venv\Scripts\python.exe bench\fused.py --quick
@@ -10685,10 +10909,10 @@ index 0000000000000000000000000000000000000000..a3bc59bd3e14dabc2136a40237a49c10
 +__all__ = ["bf16", "fp16acc", "mha", "FlashAttention", "TritonFlashAttention", "attention", "flash_attn_func", "flash_attn_varlen_func", "scaled_dot_product_attention", "flash_decode_attn"]
 diff --git a/zluda_ops/auto.py b/zluda_ops/auto.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..caf7e6e2ce8b00bc507b46b7012cf7fbccb1db62
+index 0000000000000000000000000000000000000000..ef94ad1a89d5ab1c2850b21f80490c851893446f
 --- /dev/null
 +++ b/zluda_ops/auto.py
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,131 @@
 +import os
 +
 +import torch
@@ -10696,6 +10920,7 @@ index 0000000000000000000000000000000000000000..caf7e6e2ce8b00bc507b46b7012cf7fb
 +from torch.nn.attention import SDPBackend, sdpa_kernel
 +
 +from . import bf16 as _bf16
++from . import conv as _conv
 +from . import flash_attention as _fa
 +from . import flash_decode as _flash_decode
 +from . import gemv as _gemv
@@ -10792,6 +11017,8 @@ index 0000000000000000000000000000000000000000..caf7e6e2ce8b00bc507b46b7012cf7fb
 +    _orig_sdpa = F.scaled_dot_product_attention
 +    F.linear = _linear
 +    F.scaled_dot_product_attention = _sdpa
++    if os.environ.get("ZLUDA_CONV_FP32") == "1":
++        _conv.install()
 +    return True
 +
 +
@@ -10803,6 +11030,7 @@ index 0000000000000000000000000000000000000000..caf7e6e2ce8b00bc507b46b7012cf7fb
 +    F.scaled_dot_product_attention = _orig_sdpa
 +    _orig_linear = None
 +    _orig_sdpa = None
++    _conv.uninstall()
 +    _mha.uninstall()
 +    return True
 +
@@ -10842,6 +11070,105 @@ index 0000000000000000000000000000000000000000..8db2e10b78e555c4ce5243c81ed38707
 +
 +
 +__all__ = ["matmul", "linear"]
+diff --git a/zluda_ops/conv.py b/zluda_ops/conv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..024c0f3a3bdfec8526b917af5aa1ccd844fe3368
+--- /dev/null
++++ b/zluda_ops/conv.py
+@@ -0,0 +1,93 @@
++"""Cast-to-fp32 convolution workaround for gfx1010 (Winograd).
++
++On this stack MIOpen picks a Winograd solver for fp32 3x3 convolutions
++(`ConvBinWinogradRxSf2x3g1`), but fp16 3x3 falls back to a rocBLAS GEMM
++(`GemmFwdRest`), which is 1.4-2.7x slower for forward and up to 1.9x slower for
++forward+backward on SD/ResNet shapes. Casting the fp16 inputs (and weights) to
++fp32, running the fp32 Winograd convolution and casting the result back is
++faster and at least as accurate: fp16 inputs are exactly representable in fp32,
++so the result equals an fp32 convolution rounded to fp16.
++
++`conv2d` mirrors `torch.nn.functional.conv2d` for the eligible subset (fp16,
++3x3, stride 1, dilation 1, groups 1, CUDA). Gradients flow through the casts, so
++it is usable for both inference and training. `install()`/`uninstall()` patch
++`F.conv2d` behind the `ZLUDA_CONV_FP32=1` environment variable.
++
++Limitations: fp32 copies of the weights cost memory (conv weights are small
++relative to a model, but this is not free); the win depends on the shape (small
++convolutions are conversion-bound, large ones win up to ~2.7x forward); only
++the 3x3 stride-1/dilation-1/group-1 case benefits, everything else uses the
++regular path.
++"""
++
++import os
++import torch
++import torch.nn.functional as F
++
++_eligible_cache = {}
++_orig_conv2d = None
++
++
++def _normalize_pair(value):
++    if isinstance(value, (tuple, list)):
++        return tuple(value)
++    return (value, value)
++
++
++def is_eligible(x, weight, stride, padding, dilation, groups):
++    if not (x.is_cuda and x.dtype == torch.float16 and weight.dtype == torch.float16):
++        return False
++    if not (x.is_contiguous() and weight.is_contiguous()):
++        return False
++    if weight.dim() != 4 or weight.shape[-2:] != (3, 3):
++        return False
++    if _normalize_pair(stride) != (1, 1) or _normalize_pair(dilation) != (1, 1):
++        return False
++    if groups != 1:
++        return False
++    return True
++
++
++def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1,
++           fp32_winograd=None):
++    """Drop-in conv2d that uses the fp32 Winograd path for eligible fp16 3x3."""
++    if fp32_winograd is None:
++        fp32_winograd = is_eligible(x, weight, stride, padding, dilation, groups)
++    if not fp32_winograd:
++        original = _orig_conv2d if _orig_conv2d is not None else F.conv2d
++        return original(x, weight, bias, stride=stride, padding=padding,
++                        dilation=dilation, groups=groups)
++    y = F.conv2d(x.float(), weight.float(),
++                 None if bias is None else bias.float(),
++                 stride=stride, padding=padding, dilation=dilation, groups=groups)
++    return y.to(x.dtype)
++
++
++def install():
++    """Patch F.conv2d to use the fp32 Winograd path (env-gated in practice)."""
++    global _orig_conv2d
++    if _orig_conv2d is not None:
++        return
++    _orig_conv2d = F.conv2d
++
++    def _conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1,
++                groups=1):
++        return conv2d(input, weight, bias, stride=stride, padding=padding,
++                      dilation=dilation, groups=groups)
++
++    F.conv2d = _conv2d
++
++
++def uninstall():
++    global _orig_conv2d
++    if _orig_conv2d is None:
++        return
++    F.conv2d = _orig_conv2d
++    _orig_conv2d = None
++
++
++def installed():
++    return _orig_conv2d is not None
++
++
++__all__ = ["conv2d", "install", "uninstall", "installed", "is_eligible"]
 diff --git a/zluda_ops/flash_attention.py b/zluda_ops/flash_attention.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..60cf1391f4b9ca868c737e6cf7268579911335b3
