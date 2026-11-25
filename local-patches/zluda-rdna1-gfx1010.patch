@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b414ac24db23b464178b36f0e1ade5b77d316f3b
+index 0000000000000000000000000000000000000000..0650b53f556b788eb8823419bf87d8dcb859e898
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,562 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,21 @@ index 0000000000000000000000000000000000000000..b414ac24db23b464178b36f0e1ade5b7
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - Triton optimality + custom HIP kernels audit:** Triton GEMV
++  reaches 15-40% of bandwidth on per-layer decode matvecs (68-181 GB/s of
++  448 GB/s) and flash-decoding wastes 7x KV bandwidth on GQA; FA prefill (33%
++  of fp16 peak) and fused kernels are near practical limits. A custom HIP
++  warp-per-row fp16 GEMV prototype (clang 20 -> gfx1010 DLL, launched from
++  Python via ctypes) is 1.1-4.8x faster than Triton (qkv 4.9 vs 23.5 us, gate
++  27.6 vs 48.2, down 29.9 vs 49.7, lm_head 751 vs 820 us; 292-362 GB/s), which
++  would cut ~3.3 ms/token (~30%) from the graph-decode step. Integration caveat:
++  raw HIP launches on stream 0 are not ordered with ZLUDA streams (races, hang)
++  and per-call device sync costs ~140 us; CUDA-graph capture of external HIP
++  launches is unverified. Recommendation: do not replace the stack; focus on
++  Triton GQA KV-reuse + fused QKV/gate-up + multi-row GEMV, and only build a HIP
++  GEMV library once ZLUDA exposes proper stream/graph integration. Custom GEMM
++  is not worth it (rocBLAS+Tensile at 84% of fp32 peak). Docs:
++  docs/TRITON_HIP_AUDIT.md; prototype: tools/hip_proto/.
 +- **2026-11-25 - int4 solver audit:** decode-shape comparison of the fused int4
 +  GEMV vs dequant-once + tuned fp16 GEMV (M=1, group 64): dequant-once wins on
 +  every shape (43 vs 63 us qkv, 70 vs 120 gate/up, 75 vs 87 down, 832 vs 2329 us
@@ -10910,6 +10925,119 @@ index 0000000000000000000000000000000000000000..636a04d54cc6d6b12db348899fa35397
 +VRAM-bound, and expose the dequant-once path when throughput matters and the
 +2x fp16 copy fits. For prefill (M>=32) the fused tiled int4 GEMM remains faster
 +than dequant-once (measured earlier: 0.61-2.06 ms vs 2.67-3.79 ms at 4096).
+diff --git a/docs/TRITON_HIP_AUDIT.md b/docs/TRITON_HIP_AUDIT.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..aaa31b05bf5d97e9bac1f9ee66dbfcd6d87e6db8
+--- /dev/null
++++ b/docs/TRITON_HIP_AUDIT.md
+@@ -0,0 +1,106 @@
++# Triton optimality audit and custom HIP/rocBLAS kernels (gfx1010)
++
++Date: 2026-11-25. Goal: check whether the Triton kernels are optimal, and
++whether writing custom HIP/rocBLAS kernels makes sense.
++
++## 1. Triton kernels vs roofline
++
++Hardware peaks (RX 5700 XT, gfx1010): FP32 9.75 TF, FP16 19.51 TF, memory
++bandwidth 448 GB/s (paper). Measured achieved rates:
++
++| kernel (shape) | time | achieved | % of peak | notes |
++|---|---|---|---|---|
++| GEMV 896x896 (qkv/o) | 23.5 us | 68 GB/s | 15% | launch/loop-bound, masked tail |
++| GEMV 4864x896 (gate/up) | 48.2 us | 181 GB/s | 40% | memory-bound |
++| GEMV 896x4864 (down) | 49.7 us | 176 GB/s | 39% | memory-bound |
++| GEMV 151936x896 (lm_head) | 820 us | 332 GB/s | 74% | bandwidth-bound, good |
++| FlashAttention prefill, S=2048, 14 heads, D=64 | 4.71 ms | 6.4 TF | 33% | solid for Triton FA |
++| Flash-decoding, KV=8192, GQA 14/2 | 280.6 us | ~29 MB KV reads (7x redundancy) -> 104 GB/s | 23% | GQA reads KV per query head |
++| fused RMSNorm / SwiGLU / GeGLU / RoPE / AdamW | - | bandwidth-bound, 1.5-10.9x faster than torch | near peak | already good |
++
++Verdict: **Triton is not optimal for small matvecs (decode)**: 15-40% of peak
++bandwidth on the per-layer GEMVs, and flash-decoding wastes 7x KV bandwidth
++because the GQA factor is not exploited (query heads sharing KV heads). Fast
++paths (lm_head, FA prefill, fused elementwise kernels) are near their practical
++limits.
++
++Triton-only improvements tried: a padded-K variant (BLOCK_K = next power of two,
++mask-free single-layer reduce) gives only 1.2-1.4x (44.3 us qkv, 57.7 us
++gate/up, 68.4 us down, 807 us lm_head) - still 2-4x behind the HIP prototype.
++The row-per-program structure of Triton has inherent launch/ILP overhead.
++
++## 2. Custom HIP kernels: feasibility and prototype
++
++Feasibility verified end-to-end:
++
++- compiler: ROCm 6.4 `clang++.exe` (LLVM 20) targets gfx1010 directly
++  (`-x hip --offload-arch=gfx1010`), no CUDA needed; VS 2022 is the host
++  toolchain (VS 2026 headers conflict with ROCm clang's HIP headers);
++- a `__global__` HIP kernel plus an exported C launcher compiles into a DLL
++  (`clang++ -shared -o gemv_fp16.dll ... -lamdhip64`);
++- the DLL loads into the ZLUDA Python process via `ctypes` and launches on
++  `hipDeviceSynchronize`-verified data; torch tensors are usable directly via
++  `data_ptr()` (same HIP device memory).
++
++Prototype: warp-per-row fp16 GEMV (`tools/hip_proto/gemv_fp16.cpp`), 4 warps per
++block, half2 vectorized loads, warp shuffle reduction. Measured with warmups:
++
++| shape (N x K) | HIP prototype | Triton (current) | speedup | HIP bandwidth |
++|---|---|---|---|---|
++| 896 x 896 (qkv/o) | 4.9 us | 23.5 us | **4.76x** | 325 GB/s |
++| 4864 x 896 (gate/up) | 27.6 us | 48.2 us | **1.74x** | 316 GB/s |
++| 896 x 4864 (down) | 29.9 us | 49.7 us | **1.66x** | 292 GB/s |
++| 151936 x 896 (lm_head) | 751 us | 820 us | **1.09x** | 362 GB/s |
++
++Correctness vs rocBLAS reference: max abs error 1e-5..2e-3 (fp16 reduction
++order), which is at the fp16 noise level.
++
++## 3. Is it worth it?
++
++Kernel level: yes - the HIP GEMV reaches 65-81% of peak bandwidth instead of
++15-74%, and the per-token estimate is ~135 us saved per layer (qkv 4x18.6 us +
++gate/up 2x20.6 us + down 19.8 us) plus ~69 us on lm_head = **~3.3 ms/token of a
++~11 ms graph-decode step (~30% faster decode, ~124 -> ~160 tok/s at 1k ctx)**.
++
++Integration level: non-trivial, and this is the deciding factor:
++
++1. **Streams**: ZLUDA maps CUDA streams to HIP streams, but launching from a
++   raw HIP DLL on `hipStream 0` is *not ordered* with ZLUDA's streams - the
++   first benchmark produced races (wrong results) and a hang; correctness
++   required `hipDeviceSynchronize` inside the wrapper (which adds ~140 us per
++   call and would defeat the gain). A proper solution needs the actual HIP
++   stream handle that ZLUDA uses (unverified; passing torch's CUDA stream id
++   hung the process) or a ZLUDA-side hook.
++2. **CUDA graphs**: our graph-replayed decode captures the whole step; external
++   HIP launches would need to be captured into the same HIP graph or run
++   outside it. Unverified, and if they run outside the graph the launch savings
++   disappear.
++3. **Distribution**: a DLL per kernel family, ctypes dispatch, alignment/edge
++   cases (K%2, N%ROW, fp16 reduce order) and no PyTorch custom-op machinery
++   (the CUDA build of PyTorch cannot compile HIP extensions).
++4. **Upstream/maintenance**: rocBLAS/Tensile already covers GEMM well (see
++   below); a custom GEMV library duplicates a lot of work for one card family.
++
++Recommendation:
++- **Do not replace the full stack with custom HIP kernels.** Keep Triton for
++  attention/fused kernels (it integrates with torch, autograd and graph
++  capture).
++- **Worth doing**: a small HIP (or better, Triton-plus-ZLUDA-hook) GEMV library
++  for the 4 decode shapes, but only after a ZLUDA-side way to launch custom HIP
++  kernels on the same HIP stream and inside CUDA-graph capture exists - then the
++  estimated gain is ~30% decode. Next-cheapest alternatives in Triton:
++  GQA KV-reuse in flash-decoding (up to ~2-3x on long-context decode
++  attention), fusing QKV and gate+up GEMVs (fewer launches), and a multi-row
++  per-program GEMV with vectorized loads.
++- **Not worth it**: custom GEMM/Tensile replacements - rocBLAS 7.1.1 with the
++  tuned gfx1010 Tensile overrides already reaches 8.18 TF of the 9.75 TF fp32
++  peak (84%), and native ROCm torch (without overrides) is 4.6x slower.
++
++## 4. Artifacts
++
++- `tools/hip_proto/gemv_fp16.cpp`, `tools/hip_proto/build_gemv.cmd` - HIP GEMV
++  prototype and build recipe (needs `build-env.cmd` with VS 2022 and ROCm
++  clang).
++- `bench/hip_gemv_proto.py` - benchmark harness if the DLL is built (loads via
++  ctypes, compares with Triton and rocBLAS, checks correctness). Not wired into
++  the model path; it exists to keep the measurement reproducible.
+\ No newline at end of file
 diff --git a/docs/comfy-freeze.txt b/docs/comfy-freeze.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..6c3369aaf97348f7df7750daccdd46200301148e
@@ -13849,6 +13977,62 @@ index 0000000000000000000000000000000000000000..b71d08980d5efe7a95fd31ed62ee8eba
 +
 +Write-Watch "END reason=$reason"
 +exit 0
+diff --git a/tools/hip_proto/build_gemv.cmd b/tools/hip_proto/build_gemv.cmd
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa61c1bcb780f34fcf9f2c18eaf849b20dc88aa0
+--- /dev/null
++++ b/tools/hip_proto/build_gemv.cmd
+@@ -0,0 +1,8 @@
++@echo off
++rem Build the HIP GEMV prototype (gfx1010). Requires the portable VS 2022 env
++rem and the ROCm clang. Usage: build-env.cmd tools\hip_proto\build_gemv.cmd
++set "CLANG=G:\rocm64\bin\clang++.exe"
++set "SRC=%~dp0gemv_fp16.cpp"
++set "OUT=%~dp0gemv_fp16.dll"
++"%CLANG%" -x hip --offload-arch=gfx1010 -O3 -shared -o "%OUT%" "%SRC%" -I"G:\zluda\hip\include" -L"G:\zluda\hip\lib" -lamdhip64
++echo BUILD_EXIT=%ERRORLEVEL%
+\ No newline at end of file
+diff --git a/tools/hip_proto/gemv_fp16.cpp b/tools/hip_proto/gemv_fp16.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..80c0aa53050f29877839da17fe30503f3c8e48b4
+--- /dev/null
++++ b/tools/hip_proto/gemv_fp16.cpp
+@@ -0,0 +1,34 @@
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++template <int WARPS>
++__global__ void gemv_fp16_kernel(const __half* __restrict__ x,
++                                 const __half* __restrict__ W,
++                                 __half* __restrict__ y,
++                                 int N, int K) {
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int row = blockIdx.x * WARPS + warp;
++    if (row >= N) return;
++    const __half* w = W + (long)row * K;
++    float acc = 0.f;
++    for (int k = lane * 2; k < K; k += 64) {
++        __half2 xh = *reinterpret_cast<const __half2*>(x + k);
++        __half2 wh = *reinterpret_cast<const __half2*>(w + k);
++        float2 xf = __half22float2(xh);
++        float2 wf = __half22float2(wh);
++        acc += xf.x * wf.x + xf.y * wf.y;
++    }
++    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
++    if (lane == 0) y[row] = __float2half(acc);
++}
++extern "C" __declspec(dllexport) int hip_gemv_bench(const void* x, const void* W, void* y,
++                                                    int N, int K, int iters) {
++    const int warps = 4;
++    for (int it = 0; it < iters; ++it) {
++        gemv_fp16_kernel<4><<<dim3((N + warps - 1) / warps), dim3(32 * warps), 0, 0>>>(
++            (const __half*)x, (const __half*)W, (__half*)y, N, K);
++    }
++    hipError_t e = hipGetLastError();
++    if (e != hipSuccess) return (int)e;
++    return (int)hipDeviceSynchronize();
++}
+\ No newline at end of file
 diff --git a/tools/install_auto.py b/tools/install_auto.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..4a9f9d08cc94a3ce295146211da873edf4766695
