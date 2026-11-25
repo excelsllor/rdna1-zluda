@@ -35,7 +35,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **CLOSED** | decode (LLM inference) | medium | M16 176 GB/s (39%), M32 83 (19%); target 70-80% unreachable with split-K/tl.dot/packed-fp16 (all measured worse); rocBLAS fp32 M=32 fallback kept |
 | **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **DONE** | training + inference | medium | masks/dropout/window in Triton; varlen uses per-sequence Triton (fused packed kernel open) |
 | **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **DONE** | 3.2–4.5x decode vs math at 1k–4k, rel err <5e-4 | medium | `zluda_ops/flash_decode.py` + auto dispatch |
-| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **PARTIAL** | 4x/2x compression (7B: 3.5/7 GB), fused int4 GEMV tuned to **1.92x** vs fp16 decode (M=1); hypotheses H1/H3/H2 ablated; 70-80% bandwidth not reachable with this structure; GPTQ/AWQ exact loading + prefill GEMM open | high | GEMV/GEMM |
+| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **PARTIAL** | 4x/2x compression (7B: 3.5/7 GB); decode fused GEMV **1.92x** vs fp16 / 4.6x vs fp16-weight GEMM at M=1; fused prefill GEMM at parity with cached fp16 at M=64, 0.75x at M=128-256 (int4 memory kept); dequant-per-call 1.8-4.6x slower; GPTQ/AWQ exact loading open | high | GEMV/GEMM |
 | **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 | **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 | **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **DONE** | RMSNorm 8.2x fwd / 6.1x bwd, softmax 18.5x, RoPE 5.1-8.8x, SwiGLU 1.2-1.5x vs torch eager; chunked CE -28% peak memory but slower than torch | medium | Triton |
@@ -59,7 +59,7 @@ Status keys: **DONE**, **PARTIAL**, **OPEN**, **BLOCKED**, **REJECTED**, and **A
 | 0 — Foundation | **PARTIAL** | roofline/regression done; clocks/power blocked |
 | 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
 | 2 — Attention | **PARTIAL** | masks/dropout/window in Triton, varlen per-sequence, flash-decoding done; fused decode/backward integration open |
-| 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (`zluda_ops/quant.py`); exact GPTQ/AWQ loading and prefill GEMM open; no int8 compute |
+| 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (decode) and fused dequant-GEMM (prefill) in `zluda_ops/quant.py`; exact GPTQ/AWQ loading open; no int8 compute |
 | 4 — Fused kernels | **PARTIAL** | Triton RMSNorm/RoPE/SwiGLU/GeGLU/softmax/AdamW implemented and faster (`zluda_ops/fused.py`); LayerNorm fwd-only win (training slower); chunked CE memory-only; sampling open |
 | 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 | 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
@@ -248,6 +248,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - P1-3 prefill extension:** added `quant.int4_matmul` (fused
+  dequant-GEMM, weights never materialised as fp16) and
+  `quant.int4_prefill_linear` (dequant-once reference). At N=K=4096 the fused
+  GEMM is 1.8-4.6x faster than dequantize-per-call and 1.00-0.75x of cached
+  fp16 weights (parity at M=64, 25-30% slower at M=128-256) while keeping the
+  4x memory saving; decode remains 4.6x faster than fp16 weights. Tiled int4
+  GEMV (+6%, inside clock variance) is not adopted. `bench/quant_prefill.py`
+  reproduces the table.
 - **2026-11-25 - fused kernels extension:** added exact-erf GeGLU fwd+bwd,
   LayerNorm fwd+bwd and an in-place fused AdamW to `zluda_ops/fused.py`. Clean
   measurements: RMSNorm 9.4x fwd / 2.95x fwd+bwd, softmax 2.3x, RoPE 10.9x/8.3x,

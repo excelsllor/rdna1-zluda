@@ -204,7 +204,79 @@ def linspace_reference(x, packed, scales, bias=None, group_size=64):
     return torch.nn.functional.linear(x, w, bias)
 
 
+
+
+@triton.jit
+def _int4_gemm_kernel(X, Wq, SC, B, Y, M, N, K,
+                      GROUP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                      BK: tl.constexpr, HAS_BIAS: tl.constexpr):
+    """Prefill path: dequantize int4 weights on the fly inside a GEMM tile."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    ngroups = K // GROUP
+    ngrp_bk: tl.constexpr = BK // GROUP
+    for k0 in range(0, K, BK):
+        x = tl.load(X + offs_m[:, None] * K + (k0 + offs_k)[None, :],
+                    mask=offs_m[:, None] < M, other=0.0)
+        offs_b = k0 // 2 + tl.arange(0, BK // 2)
+        packed = tl.load(Wq + offs_n[:, None] * (K // 2) + offs_b[None, :],
+                         mask=offs_n[:, None] < N, other=0).to(tl.int32)
+        lo = ((packed & 0xF) ^ 8) - 8
+        hi = (((packed >> 4) & 0xF) ^ 8) - 8
+        sc_g = tl.load(SC + offs_n[:, None] * ngroups
+                       + (k0 // GROUP + tl.arange(0, ngrp_bk))[None, :],
+                       mask=offs_n[:, None] < N, other=0.0)
+        sf = tl.reshape(
+            tl.broadcast_to(sc_g[:, :, None], (BN, ngrp_bk, GROUP // 2)),
+            (BN, BK // 2),
+        ).to(tl.float16)
+        wlo = lo.to(tl.float16) * sf
+        whi = hi.to(tl.float16) * sf
+        # interleave even/odd nibbles back into K order: (BN, BK/2, 2) -> (BN, BK)
+        w = tl.reshape(tl.join(wlo, whi), (BN, BK))
+        acc = tl.dot(x, tl.trans(w), acc)
+    if HAS_BIAS:
+        b = tl.load(B + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        acc += b[None, :]
+    out = Y + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out, acc.to(Y.dtype.element_ty), mask=mask)
+
+
+def int4_matmul(x, packed, scales, bias=None, group_size=64,
+                block_m=64, block_n=64, block_k=64):
+    """Fused int4-dequant + GEMM for prefill (any M). Returns fp16 or None."""
+    if not x.is_cuda or x.dtype != torch.float16 or not x.is_contiguous():
+        return None
+    if packed.dtype != torch.uint8 or scales.dtype != torch.float16:
+        return None
+    m, k = x.shape
+    n = packed.shape[0]
+    if k != packed.shape[1] * 2:
+        return None
+    if k % group_size or block_k % group_size or k % block_k:
+        return None
+    y = torch.empty(m, n, device=x.device, dtype=torch.float16)
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+    _int4_gemm_kernel[grid](
+        x, packed, scales, bias if bias is not None else y, y, m, n, k,
+        GROUP=group_size, BM=block_m, BN=block_n, BK=block_k,
+        HAS_BIAS=bias is not None, num_warps=4, num_stages=1,
+    )
+    return y
+
+
+def int4_prefill_linear(x, packed, scales, bias=None, group_size=64):
+    """Prefill reference path: dequantize once, then a regular fp16 GEMM."""
+    n, k = packed.shape[0], packed.shape[1] * 2
+    w = dequantize_int4(packed, scales, (n, k), group_size)
+    return torch.nn.functional.linear(x, w, bias)
+
 __all__ = [
     "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
-    "int4_linear", "linspace_reference", "CONFIGS",
+    "int4_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 ]
