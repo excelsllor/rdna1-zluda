@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7a5c86615c63bb43eaa130524e8d996354be9495
+index 0000000000000000000000000000000000000000..b414ac24db23b464178b36f0e1ade5b77d316f3b
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,547 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,14 @@ index 0000000000000000000000000000000000000000..7a5c86615c63bb43eaa130524e8d9963
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - int4 solver audit:** decode-shape comparison of the fused int4
++  GEMV vs dequant-once + tuned fp16 GEMV (M=1, group 64): dequant-once wins on
++  every shape (43 vs 63 us qkv, 70 vs 120 gate/up, 75 vs 87 down, 832 vs 2329 us
++  lm_head, i.e. up to 2.8x), while fused int4 stays the memory-optimal choice
++  (4x smaller weights). For prefill the fused tiled int4 GEMM remains faster
++  than dequant-once. Recommendation documented in docs/SOLVER_AUDIT.md.
++- **2026-11-25 - auto conv gate fixed:** auto.py installs the F.conv2d patch for
++  ZLUDA_CONV_AUTO=1 as well (line-based edit after CRLF mismatch).
 +- **2026-11-25 - conv solver selection:** implemented per-shape solver
 +  auto-selection in `zluda_ops/conv.py` (fp32 winograd weights cached by
 +  data_ptr/_version, one-time timing of fp16 vs fp32 candidates per shape,
@@ -10763,10 +10771,10 @@ index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb9
 +ones and uninitialized buffers are not representative.
 diff --git a/docs/SOLVER_AUDIT.md b/docs/SOLVER_AUDIT.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..2ccfbad0c4d84f29b5d41980b9b38140dba84755
+index 0000000000000000000000000000000000000000..636a04d54cc6d6b12db348899fa35397d27b5dfb
 --- /dev/null
 +++ b/docs/SOLVER_AUDIT.md
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,135 @@
 +# Solver / kernel audit (RDNA1, 2026-11-25)
 +
 +Goal: go through every computation in the stack, check which solver/kernel is
@@ -10882,6 +10890,26 @@ index 0000000000000000000000000000000000000000..2ccfbad0c4d84f29b5d41980b9b38140
 +Remaining open items: int4 decoder-shaped GEMV sweep, fused int8 GEMV, and the
 +non-LLM library paths (rocFFT/rocSPARSE/RNG) which are not exercised by the
 +current workloads.
++
++## 7. int4 quantization solver (decode shapes)
++
++Two available solvers: the fused int4 GEMV (dequantises inside the kernel, 4x
++weight memory saving) and dequant-once to fp16 followed by the tuned fp16 GEMV
++(2x memory for the cached copy). M=1, group 64, fp16 activations:
++
++| shape (N x K) | fused int4 | dequant-once + tuned GEMV | winner |
++|---|---|---|---|
++| 896 x 896 (qkv/o) | 62.8 us | 42.8 us | dequant |
++| 4864 x 896 (gate/up) | 120.3 us | 70.1 us | dequant |
++| 896 x 4864 (down) | 86.7 us | 74.7 us | dequant |
++| 151936 x 896 (lm_head) | 2329 us | 831.5 us | dequant (2.8x) |
++
++Verdict: for **compute** at decode the dequant-once + tuned fp16 GEMV is optimal
++(up to 2.8x faster); the fused int4 kernel is the **memory**-optimal choice
++(4x less weight storage). Recommendation: keep fused int4 as the default when
++VRAM-bound, and expose the dequant-once path when throughput matters and the
++2x fp16 copy fits. For prefill (M>=32) the fused tiled int4 GEMM remains faster
++than dequant-once (measured earlier: 0.61-2.06 ms vs 2.67-3.79 ms at 4096).
 diff --git a/docs/comfy-freeze.txt b/docs/comfy-freeze.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..6c3369aaf97348f7df7750daccdd46200301148e
@@ -15151,10 +15179,10 @@ index 0000000000000000000000000000000000000000..a6c16c402b227657444e5c1dfdab2d9f
 +from . import graph_decode  # noqa: F401
 diff --git a/zluda_ops/auto.py b/zluda_ops/auto.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3879a19ead0031be0bc0b3b68fa0b7673f25a73e
+index 0000000000000000000000000000000000000000..093c2cc880e1add0b7e256cd6694e9c70e21404d
 --- /dev/null
 +++ b/zluda_ops/auto.py
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,133 @@
 +import os
 +
 +import torch
@@ -15273,21 +15301,9 @@ index 0000000000000000000000000000000000000000..3879a19ead0031be0bc0b3b68fa0b767
 +    _orig_sdpa = F.scaled_dot_product_attention
 +    F.linear = _linear
 +    F.scaled_dot_product_attention = _sdpa
-+    if os.environ.get("ZLUDA_CONV_FP32") == "1":
++    if (os.environ.get("ZLUDA_CONV_FP32") == "1"
++            or os.environ.get("ZLUDA_CONV_AUTO") == "1"):
 +        _conv.install()
-+    return True
-+
-+
-+def uninstall():
-+    global _orig_linear, _orig_sdpa
-+    if not installed():
-+        return False
-+    F.linear = _orig_linear
-+    F.scaled_dot_product_attention = _orig_sdpa
-+    _orig_linear = None
-+    _orig_sdpa = None
-+    _conv.uninstall()
-+    _mha.uninstall()
 +    return True
 +
 +
