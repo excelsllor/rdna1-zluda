@@ -248,6 +248,18 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - llama.cpp under ZLUDA (patch attempt):** ZLUDA's
+  `launch_kernel_ex` rejected PDL launch attributes; patched
+  `zluda/src/impl/driver.rs` to accept launch-time attributes (serialized
+  execution is semantically correct) and rebuilt `nvcuda.dll`. llama.cpp (b12721,
+  CUDA 12.4) then loads under ZLUDA and sees the GPU; `-ngl 0` works through the
+  CUDA backend (pp16 124 tok/s, tg2 17.4), but `-ngl >= 1` hangs with every
+  workaround (graphs off, no pinned memory, no fusion, force-MMQ, PDL off) and
+  the pre-PDL build b9802 errors in `ggml-cuda.cu`. Blocker is now ZLUDA's
+  execution/JIT of llama.cpp's CUDA kernels (async-copy pipeline / cp.async),
+  not the launch API - requires extending the ptx/llvm_zluda support. Same-engine
+  Vulkan-vs-ZLUDA comparison stays blocked; the cross-engine table in
+  ENGINE_COMPARISON.md is labelled accordingly.
 - **2026-11-25 - engine comparison, final pass:** Vulkan (Ollama, 100% GPU)
   Q4_K_M: 4531/2741/946 tok/s prefill and 150.8/135.2/104.8 tok/s decode at
   2k/8k/32k; F16 clamped to 8192 context by Ollama on 8 GB. ZLUDA/PyTorch fp16:
