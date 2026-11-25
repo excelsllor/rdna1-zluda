@@ -32,3 +32,4 @@ smoke/local/
 # Local model files and downloaded engine binaries (not part of the fork)
 models/
 tools/llamacpp-cuda/
+tools/llamacpp-cuda-old/
