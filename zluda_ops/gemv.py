@@ -11,6 +11,25 @@ CONFIGS = {
     32: (4096, 4),
 }
 
+# Shape-aware (BK, num_warps) overrides tuned on gfx1010 for M=1 decode
+# (2026-11-25 sweep): qkv/o 896x896 (512,2) 2.07x rocBLAS, gate/up 4864x896
+# (1024,2) 2.01x, down 896x4864 (512,4) 5.29x, lm_head 151936x896 (1024,2)
+# 12.2x. Falls back to CONFIGS[m] for other shapes.
+TUNED_M1 = {
+    (896, 896): (512, 2),
+    (4864, 896): (1024, 2),
+    (896, 4864): (512, 4),
+    (151936, 896): (1024, 2),
+}
+
+
+def _config(m, n, k):
+    if m == 1:
+        cfg = TUNED_M1.get((n, k))
+        if cfg is not None:
+            return cfg
+    return CONFIGS[m]
+
 
 @triton.jit
 def _gemv_kernel(w_ptr, x_ptr, b_ptr, y_ptr, N, K, M: tl.constexpr, BK: tl.constexpr,
@@ -51,7 +70,7 @@ def linear(x, w, bias=None, accurate=True):
         return None
     n, k = w.shape
     m = x.shape[0]
-    bk, warps = CONFIGS[m]
+    bk, warps = _config(m, n, k)
     y = torch.empty(m, n, device=x.device, dtype=x.dtype)
     _gemv_kernel[(n,)](w, x, bias if bias is not None else y, y, n, k, M=m, BK=bk,
                        HAS_BIAS=bias is not None, PROD_F16=not accurate,

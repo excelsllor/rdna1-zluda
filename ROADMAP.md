@@ -248,6 +248,15 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - solver/kernel audit (first pass):** GEMV configs were a single
+  fixed (4096,4) - swept and replaced with a shape-aware TUNED_M1 table
+  (qkv 28.5 us 2.07x vs rocBLAS, gate/up 40.1 us 2.01x, down_proj 53.7 us
+  5.29x, lm_head 798 us 12.2x). FA prefill config swept at 512..8192: current
+  config already optimal (<=1.05x). Flash-decode SPLITS heuristic already
+  optimal (1.00x) and 2.5-6.8x faster than math SDPA, but GQA was unsupported -
+  added native GQA indexing and dispatch (correctness 3e-5); graph decode now
+  89.7 tok/s @1k / 72.3 @2k. Remaining: conv solver selection, int4 decode
+  shapes, fused int8. Details: docs/SOLVER_AUDIT.md.
 - **2026-11-25 - reusable graph decoder:** added `zluda_ops/graph_decode.py`
   (`GraphDecoder`: StaticCache prefill + CApture of one decode step + replay,
   token/position buffers updated outside the graph). Replay-only decode:
