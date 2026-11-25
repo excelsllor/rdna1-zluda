@@ -35,7 +35,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **CLOSED** | decode (LLM inference) | medium | M16 176 GB/s (39%), M32 83 (19%); target 70-80% unreachable with split-K/tl.dot/packed-fp16 (all measured worse); rocBLAS fp32 M=32 fallback kept |
 | **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **DONE** | training + inference | medium | masks/dropout/window in Triton; varlen uses per-sequence Triton (fused packed kernel open) |
 | **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **DONE** | 3.2–4.5x decode vs math at 1k–4k, rel err <5e-4 | medium | `zluda_ops/flash_decode.py` + auto dispatch |
-| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
+| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **PARTIAL** | 4x/2x compression (7B: 3.5/7 GB), fused int4 GEMV 1.44-1.63x vs fp16 decode; 70-80% bandwidth not met; GPTQ/AWQ exact loading + prefill GEMM open | high | GEMV/GEMM |
 | **P1** | GGUF k-quants (Q4_K/Q5_K/Q6_K) dequant-to-fp16 for llama.cpp HIP; no int8 dot/MMQ acceleration | **OPEN** | LLM on 5700 XT | high | outside ZLUDA |
 | **P1** | bf16 emulation: convert once per tile, high-half mask | **DONE** | 4.4→7.92 TF | medium | `zluda_ops.bf16` |
 | **P1** | Fused kernels: RMSNorm/LayerNorm (fwd+bwd), RoPE, SwiGLU/GeGLU, softmax, chunked cross-entropy | **OPEN** | memory/speed | medium | Triton |
@@ -59,7 +59,7 @@ Status keys: **DONE**, **PARTIAL**, **OPEN**, **BLOCKED**, **REJECTED**, and **A
 | 0 — Foundation | **PARTIAL** | roofline/regression done; clocks/power blocked |
 | 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
 | 2 — Attention | **PARTIAL** | masks/dropout/window in Triton, varlen per-sequence, flash-decoding done; fused decode/backward integration open |
-| 3 — Quantization | **OPEN** | storage path not implemented; no int8 compute |
+| 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (`zluda_ops/quant.py`); exact GPTQ/AWQ loading and prefill GEMM open; no int8 compute |
 | 4 — Fused kernels | **OPEN** | not started |
 | 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 | 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
@@ -220,6 +220,17 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   kernels with the Philox mask regenerated from (head, query, key) offsets;
   unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
   s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
+- **2026-11-25 - P1-3 (quantization storage):** `zluda_ops/quant.py` implements
+  groupwise symmetric int4/int8 weight-only storage (groups 32/64/128, fp16
+  scales, two nibbles per byte) plus reference dequantizers and a fused Triton
+  int4 dequant-GEMV that never materialises fp16 weights. Compression 4x/2x
+  (7B: 3.5/7 GB vs 14 GB); fused GEMV matches the fp32 reference within 2.4e-4
+  and is 1.44-1.63x faster than the fp16 GEMV at M=1 (0.078 vs 0.113 ms),
+  0.89x at M=8 after fixing register spills (smaller BK, contiguous x pair
+  loads). The 70-80% packed-bandwidth target is not met (114-128 GB/s packed):
+  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
+  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
+  order/zero-point loading and the prefill dequant-GEMM remain open.
 - **2026-11-25 - P1-2 (flash-decoding):** `zluda_ops/flash_decode.py`
   splits the KV cache into up to 16 chunks per (batch, head), computes partial
   (acc, m, l) and merges with the standard log-sum-exp formula. Decode shapes
