@@ -662,7 +662,7 @@ index 0749ad9edbf77d9343230a23373d840d97afab2e..40bc14045042e540082ffd446092593b
 +/hh_*.pt
 diff --git a/BEFORE_AFTER.md b/BEFORE_AFTER.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..3fc22424edf7544fc2270ecbac3097cadc531586
+index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312343ded85
 --- /dev/null
 +++ b/BEFORE_AFTER.md
 @@ -0,0 +1,104 @@
@@ -721,8 +721,8 @@ index 0000000000000000000000000000000000000000..3fc22424edf7544fc2270ecbac3097ca
 +| 1 | 114 GB/s | 294 GB/s | 2.58x | 66% |
 +| 4 | 107 GB/s | 278 GB/s | 2.60x | 62% |
 +| 8 | 109 GB/s | 242 GB/s | 2.22x | 54% |
-+| 16 | 108 GB/s | 155 GB/s | 1.44x | 35% |
-+| 32 | 76 GB/s | 78 GB/s | 1.03x | 17% |
++| 16 | 108 GB/s | 176 GB/s | 1.63x | 39% |
++| 32 | 76 GB/s | 83 GB/s | 1.09x | 19% |
 +
 +`torch.mv`/`cublasSgemv` is unsupported for fp32, so GEMV had no usable cuBLAS
 +path before. M=1/4/8 reach 78–82% of the measured 377 GB/s copy ceiling.
@@ -1046,10 +1046,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..4aa2581762e3e1e8da3774276a16fce4e8aaba06
+index 0000000000000000000000000000000000000000..202189e318420bebc688a19d9c992b289a2a7b52
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,533 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1229,8 +1229,8 @@ index 0000000000000000000000000000000000000000..4aa2581762e3e1e8da3774276a16fce4
 +| fp16 | 1 | 0.114 ms / 294 GB/s | 0.296 ms / 114 GB/s | 66% |
 +| fp16 | 4 | 0.121 ms / 278 GB/s | 0.315 ms / 107 GB/s | 62% |
 +| fp16 | 8 | 0.139 ms / 242 GB/s | 0.309 ms / 109 GB/s | 54% |
-+| fp16 | 16 | 0.218 ms / 155 GB/s | 0.312 ms / 108 GB/s | 35% |
-+| fp16 | 32 | 0.435 ms / 78 GB/s | 0.447 ms / 76 GB/s | 17% |
++| fp16 | 16 | 0.192 ms / 176 GB/s | 0.276 ms / 122 GB/s | 39% |
++| fp16 | 32 | 0.410 ms / 83 GB/s | 0.408 ms / 84 GB/s | 19% |
 +| fp32 | 1 | 0.216 ms / 311 GB/s | 0.433 ms / 155 GB/s | 69% |
 +| fp32 | 4 | 0.236 ms / 284 GB/s | 0.453 ms / 148 GB/s | 63% |
 +| fp32 | 8 | 0.230 ms / 292 GB/s | 0.446 ms / 151 GB/s | 65% |
@@ -1558,12 +1558,37 @@ index 0000000000000000000000000000000000000000..4aa2581762e3e1e8da3774276a16fce4
 +preprocess kernel assumes a contiguous (B,H,N,D) layout, so the Triton path now
 +makes inputs contiguous (a no-op for normal calls) — this also fixes varlen
 +gradients through transposed views.
++
++## P0-4 GEMV M=16/32 (2026-11-25)
++
++The M=16/32 target (70-80% of 448 GB/s) is not reachable with the reduction
++patterns available on gfx1010. Measured at N=K=4096, fp16 weights:
++
++| approach | M=16 | M=32 |
++|---|---|---|
++| row-per-program kernel (`_gemv_mvec`), best config | **176.5 GB/s (39%)** | **83.1 GB/s (19%)** |
++| split-K + `tl.dot`, best of 6 configs | 81.5 | 80.5 |
++| packed-fp16 products (PROD_F16) | 151.7 | 31-50 |
++| fp32 rocBLAS (`F.linear`) reference | 159.6 | 118.6 |
++
++`bench/gemv_m32.py` implements the split-K/`tl.dot` variant and the config sweep.
++The `tl.dot` path is slower because small M tiles do not provide enough
++parallelism and the atomic reduction adds traffic; packed-fp16 products reduce
++precision and throughput at these shapes.
++
++Decisions taken:
++
++- `bench/gemv.py` now uses fp32 products for M=16 (better accuracy and
++  **+13%** throughput, 176 vs 155 GB/s); peak numbers for M=1 improved to
++  302/331 GB/s (fp16/fp32) with the measurement protocol from P0-5.
++- M=32 keeps the rocBLAS fallback on the auto path (119 GB/s fp32 vs 76-83
++  Triton), and the 70-80% target is recorded as unreachable rather than open.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..94a0e2f9f67285dd4737ec2c7adaaa54db3e3a90
+index 0000000000000000000000000000000000000000..da05141b71f65faa5808bb67db45700a9204f531
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,318 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1598,7 +1623,7 @@ index 0000000000000000000000000000000000000000..94a0e2f9f67285dd4737ec2c7adaaa54
 +| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** (protocol done, clocks blocked) | basis for all decisions | low | ADL live status NOT_SUPPORTED |
 +| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
 +| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
-+| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
++| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **CLOSED** | decode (LLM inference) | medium | M16 176 GB/s (39%), M32 83 (19%); target 70-80% unreachable with split-K/tl.dot/packed-fp16 (all measured worse); rocBLAS fp32 M=32 fallback kept |
 +| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **DONE** | training + inference | medium | masks/dropout/window in Triton; varlen uses per-sequence Triton (fused packed kernel open) |
 +| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
 +| **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
@@ -1745,7 +1770,7 @@ index 0000000000000000000000000000000000000000..94a0e2f9f67285dd4737ec2c7adaaa54
 +  rocm-smi/amd-smi on Windows.
 +- **2026-11-24 - Stage 1 (baseline complete):** `bench/gemv.py` adds a Triton
 +  GEMV/skinny kernel for M=1..32. M=1 294/311 GB/s fp16/fp32 (66/69%), M=4 278,
-+  M=8 242 (fp16), M=16/32 are compute-bound (155/78); rocBLAS linear is
++  M=8 242 (fp16), M=16/32 are compute-bound (176/83); rocBLAS linear is
 +  108-155 GB/s and `cublasSgemv` fp32 is unsupported. `bench/stage1.py`
 +  records the GEMM shape grid (fp32 8.16, fp16 6.92, bf16 4.40 TF at 4096),
 +  batched/strided GEMM (7.5/6.9 TF), bias/residual/GELU epilogues, bf16 fp32
@@ -1786,6 +1811,14 @@ index 0000000000000000000000000000000000000000..94a0e2f9f67285dd4737ec2c7adaaa54
 +  kernels with the Philox mask regenerated from (head, query, key) offsets;
 +  unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
 +  s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
++- **2026-11-25 - P0-4 (GEMV M=16/32):** benchmarked a split-K / tl.dot kernel
++  (`bench/gemv_m32.py`) and packed-fp16 product variants. Split-K reaches
++  64-81 GB/s at M=32 (mvec 81), packed-fp16 is worse (31-50), so the 70-80%
++  bandwidth target is recorded as unreachable on this reduction pattern. Best
++  remaining win: M=16 with fp32 products, **176 GB/s (39%, +13%)**, now the
++  default benchmark config; M=32 stays at 83 GB/s (19%), where fp32 rocBLAS
++  (119 GB/s) remains the auto-path fallback. Peak GEMV M=1 improved to
++  302 GB/s / 331 GB/s (fp16/fp32).
 +- **2026-11-25 - P0-3 (window/varlen):** sliding window is implemented
 +  arithmetically in the Triton fwd+bwd kernels (block-range skipping, no dense
 +  mask; `lo` aligned down to `BLOCK_N` before advancing block pointers).
@@ -1815,7 +1848,7 @@ index 0000000000000000000000000000000000000000..94a0e2f9f67285dd4737ec2c7adaaa54
 +| Tensile HH | **DONE** | existing 110 kernels; 16.73/17.94 TF with override |
 +| Tensile SS/HPA | **CLOSED** | 8.16/6.94 TF on random data = practical ceiling (84% of peak); old 9.2/7.2 TF numbers were zero-data artifacts; 325/302 solutions enumerated, default already best |
 +| GEMV M1-8 / auto M<=32 | **DONE** | ~2x rocBLAS; inference only |
-+| GEMV M16-32 target | **PARTIAL** | 155/78 GB/s; target 70-80% not met |
++| GEMV M16-32 target | **CLOSED** | 176/83 GB/s (39%/19%); 70-80% target not reachable; split-K/tl.dot/packed-fp16 measured worse; rocBLAS fp32 M=32 stays the fallback |
 +| FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
 +| FA masks | **DONE** | bool/additive 2D/3D/4D broadcast masks, causal+mask, fwd+bwd in Triton; fwd err ≤1e-3, grad err ≤4e-3; masked causal 1024 is 1.67x math |
 +| FA dropout | **DONE** | inverted dropout in Triton fwd+bwd, unbiased (z<1), deterministic per seed, fwd+bwd errors unchanged; causal 1024 1.90x math |
@@ -1834,7 +1867,7 @@ index 0000000000000000000000000000000000000000..94a0e2f9f67285dd4737ec2c7adaaa54
 +| 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | >=10% vs implicit GEMM or document "not beneficial" |
 +| 2 | Triton dropout for FA | P0 | **CLOSED 2026-11-25**: masks and inverted dropout run in Triton fwd+bwd; window/varlen remain (row 3) |
 +| 3 | Triton sliding-window + varlen FA | P0 | **CLOSED 2026-11-25**: window arithmetic in kernel (7.1x @1024), varlen per-sequence Triton; fused packed varlen kernel still open |
-+| 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
++| 4 | GEMV M=16/32 tuning | P0 | **CLOSED 2026-11-25**: M16 176 GB/s (+13% via fp32-product config), M32 83; split-K/tl.dot (64-81) and packed-fp16 (31-50) measured worse; target 70-80% recorded as unreachable, rocBLAS fp32 M=32 kept as fallback |
 +| 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
 +| 6 | Clock/power monitoring | P0 | **DONE 2026-11-25**: protocol (random data, shuffled rounds, median) enforced in `bench/common.save_report`; utilization/VRAM via Windows PDH; sclk/mclk/temp are a documented blocker (`bench/gpu_clocks.py`: ADL adapters enumerate but OverdriveN/6/5 return ADL_ERR_NOT_SUPPORTED = -8) |
 +| 7 | Flash-decoding split-KV | P1 | >=1.5x decode at 4k |
@@ -2900,7 +2933,7 @@ index 0000000000000000000000000000000000000000..bfe293b2fb732c81eb04779c91cff2f3
 +    main()
 diff --git a/bench/gemv.py b/bench/gemv.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..101e2557be14d402e5a7139b37699cf639e86316
+index 0000000000000000000000000000000000000000..9c5f5609f080fd02d1e5069efa2fbf4b3ac5d2c1
 --- /dev/null
 +++ b/bench/gemv.py
 @@ -0,0 +1,93 @@
@@ -2939,7 +2972,7 @@ index 0000000000000000000000000000000000000000..101e2557be14d402e5a7139b37699cf6
 +    2: (4096, 4, True),
 +    4: (2048, 8, True),
 +    8: (4096, 8, True),
-+    16: (4096, 4, True),
++    16: (4096, 4, False),
 +    32: (4096, 4, False),
 +}
 +
@@ -2997,6 +3030,183 @@ index 0000000000000000000000000000000000000000..101e2557be14d402e5a7139b37699cf6
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/bench/gemv_m32.py b/bench/gemv_m32.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f8a3969ea89d2254bf4380028c46b51585f35bf
+--- /dev/null
++++ b/bench/gemv_m32.py
+@@ -0,0 +1,171 @@
++"""Split-K / tl.dot GEMV kernel for M=16..32.
++
++The existing row-per-program kernel (bench/gemv.py, `_gemv_mvec`) is
++compute-bound at M=16/32: 155/78 GB/s instead of the 70-80% bandwidth target.
++This script benchmarks a tl.dot based kernel with K-splitting so the fully
++unrolled fp16 dot products run as small GEMMs and the K dimension is spread
++over the CUs.
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\gemv_m32.py --n 2048 --k 2048
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\gemv_m32.py --n 4096 --k 4096 --sweep
++"""
++
++import argparse
++import sys
++from pathlib import Path
++
++import torch
++import triton
++import triton.language as tl
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from common import bench_median, save_report
++
++PEAK_BW_GBS = 448.0
++
++
++@triton.jit
++def _gemv_splitk(w_ptr, x_ptr, b_ptr, y_ptr, N, M,
++                 K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
++                 BK: tl.constexpr, SPLIT_K: tl.constexpr):
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    offs_m = tl.arange(0, BM)
++    offs_n = pid_n * BN + tl.arange(0, BN)
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    k_per = K // SPLIT_K
++    k_start = pid_k * k_per
++    for k0 in range(k_start, k_start + k_per, BK):
++        offs_k = k0 + tl.arange(0, BK)
++        x = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :],
++                    mask=offs_m[:, None] < M, other=0.0)
++        w = tl.load(w_ptr + offs_n[:, None] * K + offs_k[None, :],
++                    mask=offs_n[:, None] < N, other=0.0)
++        acc = tl.dot(x, tl.trans(w), acc)
++    if pid_k == 0:
++        acc += tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :].to(tl.float32)
++    out = y_ptr + offs_m[:, None] * N + offs_n[None, :]
++    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    if SPLIT_K == 1:
++        tl.store(out, acc.to(y_ptr.dtype.element_ty), mask=mask)
++    else:
++        tl.atomic_add(out, acc, mask=mask)
++
++
++def run_splitk(w, x, bias, bn=128, bk=64, split_k=4, num_warps=4):
++    n, k = w.shape
++    m = x.shape[0]
++    bm = 16 if m <= 16 else 32
++    grid = (triton.cdiv(n, bn), split_k)
++    if split_k == 1:
++        y = torch.empty(m, n, device=w.device, dtype=w.dtype)
++        _gemv_splitk[grid](w, x, bias, y, n, m, K=k, BM=bm, BN=bn, BK=bk,
++                           SPLIT_K=1, num_warps=num_warps, num_stages=1)
++        return y
++    y32 = torch.zeros(m, n, device=w.device, dtype=torch.float32)
++    _gemv_splitk[grid](w, x, bias, y32, n, m, K=k, BM=bm, BN=bn, BK=bk,
++                       SPLIT_K=split_k, num_warps=num_warps, num_stages=1)
++    return y32.to(w.dtype)
++
++
++def traffic_bytes(n, k, m, elem_size, out_size=2):
++    return (n * k * elem_size + m * k * elem_size + m * n * out_size
++            + n * elem_size)
++
++
++def measure(w, x, bias, config, typ, iters=3):
++    bn, bk, split_k, warps = config
++    run = lambda: run_splitk(w, x, bias, bn, bk, split_k, warps)
++    y = run()
++    ref = (x.float() @ w.float().t() + bias.float())
++    err = (y.float() - ref).abs().max().item()
++    ms = bench_median(run, rounds=3, iters=iters)
++    n, k = w.shape
++    m = x.shape[0]
++    gbs = traffic_bytes(n, k, m, w.element_size()) / (ms / 1000.0) / 1e9
++    return {"m": m, "config": list(config), "ms": ms, "gbs": gbs,
++            "pct_peak": gbs / PEAK_BW_GBS * 100.0, "max_abs": err}
++
++
++def measure_mvec(w, x, bias, bk, prod_f16, warps, iters=3):
++    from gemv import _gemv_mvec
++
++    n, k = w.shape
++    m = x.shape[0]
++    y = torch.empty(m, n, device=w.device, dtype=w.dtype)
++    run = lambda: _gemv_mvec[(n,)](w, x, bias, y, n, K=k, M=m, BK=bk,
++                                  PROD_F16=prod_f16, num_warps=warps,
++                                  num_stages=1)
++    run()
++    ref = x.float() @ w.float().t() + bias.float()
++    err = (y.float() - ref).abs().max().item()
++    ms = bench_median(run, rounds=3, iters=iters)
++    gbs = traffic_bytes(n, k, m, w.element_size()) / (ms / 1000.0) / 1e9
++    return {"m": m, "config": ["mvec", bk, prod_f16, warps], "ms": ms,
++            "gbs": gbs, "pct_peak": gbs / PEAK_BW_GBS * 100.0, "max_abs": err}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--n", type=int, default=4096)
++    parser.add_argument("--k", type=int, default=4096)
++    parser.add_argument("--ms", type=str, default="16,32")
++    parser.add_argument("--sweep", action="store_true")
++    parser.add_argument("--mvec", action="store_true")
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    args = parser.parse_args()
++
++    torch.manual_seed(0)
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    print(f"VRAM fraction {args.vram_fraction}", flush=True)
++
++    n, k = args.n, args.k
++    ms = [int(v) for v in args.ms.split(",") if v]
++    w = torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.02
++    bias = torch.randn(n, device="cuda", dtype=torch.float16) * 0.02
++
++    configs = [(64, 64, 4, 4)]
++    if args.sweep:
++        configs = [(64, 64, 4, 4), (64, 64, 8, 4), (32, 64, 8, 4),
++                   (64, 128, 8, 4), (128, 64, 8, 8), (32, 128, 8, 4)]
++    rows = []
++    for m in ms:
++        x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.1
++        for cfg in configs:
++            try:
++                row = measure(w, x, bias, cfg, "splitk")
++            except Exception as exc:
++                print(f"m={m} cfg={cfg} failed: {type(exc).__name__}: {str(exc)[:120]}", flush=True)
++                continue
++            rows.append(row)
++            print(f"m={row['m']:2d} bn,bk,split,warps={cfg}: {row['ms']:8.3f} ms "
++                  f"{row['gbs']:7.1f} GB/s ({row['pct_peak']:5.1f}%) err={row['max_abs']:.4f}",
++                  flush=True)
++        # reference: existing row-per-program kernel
++        try:
++            from gemv import run_gemv
++            ref_ms = bench_median(lambda: run_gemv(w, x, bias), rounds=3, iters=3)
++            ref_gbs = traffic_bytes(n, k, m, w.element_size()) / (ref_ms / 1000.0) / 1e9
++            print(f"m={m:2d} mvec reference: {ref_ms:8.3f} ms {ref_gbs:7.1f} GB/s "
++                  f"({ref_gbs / PEAK_BW_GBS * 100:5.1f}%)", flush=True)
++        except Exception as exc:
++            print(f"mvec reference failed: {exc}", flush=True)
++        if args.mvec:
++            for bk, prod, warps in ((4096, True, 4), (4096, False, 4),
++                                    (2048, True, 8), (4096, True, 8)):
++                try:
++                    row = measure_mvec(w, x, bias, bk, prod, warps)
++                except Exception as exc:
++                    print(f"m={m} mvec cfg failed: {exc}", flush=True)
++                    continue
++                rows.append(row)
++                print(f"m={row['m']:2d} mvec bk={bk} prod16={prod} warps={warps}: "
++                      f"{row['ms']:8.3f} ms {row['gbs']:7.1f} GB/s "
++                      f"({row['pct_peak']:5.1f}%) err={row['max_abs']:.4f}", flush=True)
++    save_report("gemv_m32", {"n": n, "k": k, "rows": rows})
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/gpu_clocks.py b/bench/gpu_clocks.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..8641d0b3d336d4f4b9a9ea5f5aa76f7295c9f872
@@ -5517,10 +5727,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..8163a0594169582d41f7784d5a4dab8d82b38240
+index 0000000000000000000000000000000000000000..ff68bc4bd8ab51ceff286dc927f9b6850bdf8f13
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,357 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -5804,6 +6014,7 @@ index 0000000000000000000000000000000000000000..8163a0594169582d41f7784d5a4dab8d
 +run-zluda.cmd venv\Scripts\python.exe bench\fa_mask.py --s 512 --bench
 +run-zluda.cmd venv\Scripts\python.exe bench\fa_dropout.py --s 256 --bench
 +run-zluda.cmd venv\Scripts\python.exe bench\fa_window.py --s 512 --bench
++run-zluda.cmd venv\Scripts\python.exe bench\gemv_m32.py --n 4096 --k 4096 --mvec
 +```
 +
 +Expected reference numbers are in `RESULTS_RDNA1.md`.
