@@ -21,47 +21,75 @@ import triton
 import triton.language as tl
 
 
-# BK = number of weights processed per loop iteration (must divide K).
-# M>=4 uses a smaller BK to keep the (M, BK/2) fp32 temporaries in registers.
+# Tuned on gfx1010 (N=K=4096, GROUP=64): (BK, SPLIT_K, ACC_MODE, num_warps).
+# ACC_MODE: 0 = fp32 products+acc, 1 = fp16 products + fp32 acc (fastest),
+# 2 = fully fp16 accumulation (same speed, worse accuracy -> not used).
+# SPLIT_K=1 wins: the atomic-add reduction costs more than the extra parallelism.
 CONFIGS = {
-    1: (2048, 4),
-    2: (1024, 4),
-    4: (512, 4),
-    8: (512, 4),
-    16: (512, 8),
+    1: (4096, 1, 1, 4),
+    2: (1024, 1, 1, 4),
+    4: (1024, 1, 1, 4),
+    8: (1024, 1, 1, 4),
+    16: (512, 1, 1, 4),
 }
 
 
 @triton.jit
 def _gemv_int4_kernel(wq_ptr, sc_ptr, x_ptr, b_ptr, y_ptr, N, K,
                       M: tl.constexpr, GROUP: tl.constexpr, BK: tl.constexpr,
+                      SPLIT_K: tl.constexpr, ACC_MODE: tl.constexpr,
                       HAS_BIAS: tl.constexpr):
     row = tl.program_id(0)
+    pid_k = tl.program_id(1)
     ncols = tl.arange(0, M)
     acc = tl.zeros((M,), tl.float32)
+    acc16 = tl.zeros((M,), tl.float16)
     ngroups = K // GROUP
-    for k0 in range(0, K, BK):
+    ngrp_chunk: tl.constexpr = BK // GROUP
+    k_per = K // SPLIT_K
+    for k0 in range(pid_k * k_per, (pid_k + 1) * k_per, BK):
         offs_b = k0 // 2 + tl.arange(0, BK // 2)
         packed = tl.load(wq_ptr + row * (K // 2) + offs_b).to(tl.int32)
-        lo = (packed & 0xF) ^ 8
-        hi = ((packed >> 4) & 0xF) ^ 8
-        lo = lo - 8
-        hi = hi - 8
-        # Both nibbles of a byte belong to the same group for even GROUP.
-        g = (2 * offs_b) // GROUP
-        scale = tl.load(sc_ptr + row * ngroups + g).to(tl.float32)
-        wlo = lo.to(tl.float32) * scale
-        whi = hi.to(tl.float32) * scale
-        # Load the x chunk contiguously and split adjacent fp16 pairs instead of
-        # two strided loads: fewer memory transactions, no stride-2 access.
+        lo = ((packed & 0xF) ^ 8) - 8
+        hi = (((packed >> 4) & 0xF) ^ 8) - 8
+        # One scale load per group, broadcast to bytes instead of a per-byte
+        # gather (32x fewer loads for GROUP=64).
+        sc_g = tl.load(sc_ptr + row * ngroups + (k0 // GROUP + tl.arange(0, ngrp_chunk)))
+        sc_vec = tl.reshape(
+            tl.broadcast_to(sc_g[:, None], (ngrp_chunk, GROUP // 2)),
+            (BK // 2,),
+        )
         xc = tl.load(x_ptr + ncols[:, None] * K + (k0 + tl.arange(0, BK))[None, :])
         xr = tl.reshape(xc, (M, BK // 2, 2))
         xlo, xhi = tl.split(xr)
-        acc += tl.sum(wlo[None, :] * xlo.to(tl.float32)
-                      + whi[None, :] * xhi.to(tl.float32), axis=1)
-    if HAS_BIAS:
+        if ACC_MODE == 2:
+            # Fully fp16: products and the per-chunk sum stay in fp16, only the
+            # per-chunk partial is promoted to fp32 across iterations.
+            sf = sc_vec.to(tl.float16)
+            wlo = lo.to(tl.float16) * sf
+            whi = hi.to(tl.float16) * sf
+            prod16 = wlo[None, :] * xlo + whi[None, :] * xhi
+            acc += tl.sum(prod16, axis=1).to(tl.float32)
+        elif ACC_MODE == 1:
+            # fp16 products, fp32 accumulation (like the fp16 HPA GEMM path).
+            sf = sc_vec.to(tl.float16)
+            wlo = lo.to(tl.float16) * sf
+            whi = hi.to(tl.float16) * sf
+            prod = (wlo[None, :] * xlo + whi[None, :] * xhi).to(tl.float32)
+            acc += tl.sum(prod, axis=1)
+        else:
+            # fp32 products and accumulation (reference mode).
+            scf = sc_vec[None, :]
+            wlo = lo.to(tl.float32) * scf
+            whi = hi.to(tl.float32) * scf
+            prod = wlo * xlo.to(tl.float32) + whi * xhi.to(tl.float32)
+            acc += tl.sum(prod, axis=1)
+    if HAS_BIAS and pid_k == 0:
         acc += tl.load(b_ptr + row).to(tl.float32)
-    tl.store(y_ptr + ncols * N + row, acc.to(y_ptr.dtype.element_ty))
+    if SPLIT_K == 1:
+        tl.store(y_ptr + ncols * N + row, acc.to(y_ptr.dtype.element_ty))
+    else:
+        tl.atomic_add(y_ptr + ncols * N + row, acc)
 
 
 def quantize_int4(weight, group_size=64):
@@ -136,24 +164,37 @@ def _supported(x, packed, scales, bias, group_size):
     return True
 
 
+def _int4_linear_config(x, packed, scales, bias, group_size, bk, splits, acc_mode, warps):
+    n = packed.shape[0]
+    k = packed.shape[1] * 2
+    m = x.shape[0]
+    if splits == 1:
+        y = torch.empty(m, n, device=x.device, dtype=x.dtype)
+        y_arg = y
+    else:
+        y_arg = torch.zeros(m, n, device=x.device, dtype=torch.float32)
+    _gemv_int4_kernel[(n, splits)](
+        packed, scales, x, bias if bias is not None else y_arg, y_arg, n, k,
+        M=m, GROUP=group_size, BK=bk, SPLIT_K=splits, ACC_MODE=acc_mode,
+        HAS_BIAS=bias is not None, num_warps=warps, num_stages=1,
+    )
+    return y_arg if splits == 1 else y_arg.to(x.dtype)
+
+
 def int4_linear(x, packed, scales, bias=None, group_size=64):
     """Fused dequant+GEMV for M=1..16. Returns fp16 (M, N) or None if unsupported."""
     if not _supported(x, packed, scales, bias, group_size):
         return None
     m = x.shape[0]
+    bk, splits, acc_mode, warps = CONFIGS[m]
     k = packed.shape[1] * 2
-    n = packed.shape[0]
-    bk, warps = CONFIGS[m]
+    # BK must be a power of two that divides K; shrink it for unusual K.
+    while bk > 128 and k % bk:
+        bk //= 2
     if k % bk:
-        bk = k
-        warps = 4
-    y = torch.empty(m, n, device=x.device, dtype=x.dtype)
-    _gemv_int4_kernel[(n,)](
-        packed, scales, x, bias if bias is not None else y, y, n, k,
-        M=m, GROUP=group_size, BK=bk, HAS_BIAS=bias is not None,
-        num_warps=warps, num_stages=1,
-    )
-    return y
+        return None
+    return _int4_linear_config(x, packed, scales, bias, group_size, bk, splits,
+                               acc_mode, warps)
 
 
 def linspace_reference(x, packed, scales, bias=None, group_size=64):

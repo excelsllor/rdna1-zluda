@@ -633,6 +633,29 @@ paired x loads) took M=8 from 0.84 ms to 0.20 ms. Next steps: tiled/split-K int4
 GEMV, exact GPTQ/AWQ loading, and the prefill dequant-GEMM.
 
 `bench/quant.py` reproduces the error, correctness and speed tables.
+### P1-3 follow-up: tuning and hypothesis ablation (2026-11-25)
+
+Three suspected bottlenecks were tested in isolation (warmed GPU, shuffled
+interleaved rounds, medians; note that raw per-process variance is still
++-15-30% because the GPU clocks cannot be fixed):
+
+| variant (M=1, K=4096, group 64) | time | conclusion |
+|---|---|---|
+| per-chunk `tl.sum` + broadcast scales (adopted) | 0.118 ms | baseline |
+| per-byte scale gather (old) | 0.135 ms | **H1 confirmed**: broadcast scales are ~12-14% faster |
+| fp32 products/conversions | 0.116 ms | **H3 refuted**: fp16 products are not faster; conversions are not the bottleneck |
+| vector accumulator, one final sum | 0.134 ms | **H2 partially refuted**: fewer calls to `tl.sum` is slower (register spills) |
+| memory-only floor (no nibble unpack) | 0.105 ms | only ~11% above the floor, so the kernel is close to its structural limit |
+| tiled multi-row kernel (BN=4, BK=2048) | 0.083 ms | ~6% better than the reference in the same process; M=8 is much worse (register pressure) |
+| split-K with atomic add | worse | atomic reduction costs more than the extra parallelism |
+
+Final tuned configuration: M=1 uses BK=4096 with fp16 products + fp32
+accumulation (0.062 ms, 145 GB/s packed, **1.92x** vs the fp16 GEMV); M=8 uses
+BK=1024 (0.200 ms, 0.93x). Fully fp16 accumulation (products + per-chunk sum in
+fp16) runs at the same speed and is less accurate, so it is not used. The
+remaining gap to the 70-80% packed-bandwidth target is structural: one reduction
+per output row with only 0.5 byte/weight of traffic; a multi-row tiling is the
+only measured improvement (+6%) and is not worth the complexity for now.
 
 ## P1-5 Fused transformer kernels (2026-11-25)
 
