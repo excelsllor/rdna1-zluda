@@ -416,3 +416,27 @@ Consequences:
 - Every benchmark must use random data and median timing; report format is in
   `bench/common.py` and `bench/results/rocblas_gap-*.json`.
 - HPA behaves the same way: 6.94 TF random versus ~7.19 TF on zeroed data.
+
+## P0-5 clocks/power monitoring and measurement protocol (2026-11-25)
+
+Clocks remain unavailable, now with a concrete root cause instead of "no tool":
+
+| probe | result |
+|---|---|
+| ZLUDA NVML (`torch.cuda.clock_rate`, `temperature`, `power_draw`) | `NotSupported` |
+| `rocm-smi`/`amd-smi` in ROCm 10.1 Windows user space | not shipped |
+| `atiadlxx.dll` (Adrenalin driver) loaded, adapters enumerated | `AMD Radeon RX 5700 XT` visible |
+| `ADL2_OverdriveN_PerformanceStatus_Get` | `ADL_ERR_NOT_SUPPORTED` (-8) |
+| `ADL2_Overdrive6_CurrentStatus_Get` / `Temperature_Get` | `ADL_ERR_NOT_SUPPORTED` (-8) |
+| `ADL_Overdrive5_CurrentActivity_Get` | `ADL_ERR` (-1) |
+| GPU utilization / VRAM | available (Windows performance counters) |
+
+`bench/gpu_clocks.py` implements the ADL probe and degrades to null values with
+an error string, so reports stay valid.
+
+To keep results comparable without clock telemetry, the protocol is now part of
+every report (`bench/common.py:save_report`): random data only, warmup per
+variant, mean per round, **median across rounds**, variant order shuffled when
+comparing, and the limits are recorded explicitly. `bench_median` is available
+for new benchmarks. This is why the P0-1 zero-data artifact and earlier +-10%
+run-to-run differences are no longer mixed into the numbers.

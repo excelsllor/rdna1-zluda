@@ -1042,10 +1042,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..d13a722c3275b138dd28317624ed16d701de95f6
+index 0000000000000000000000000000000000000000..73df7348d77143ffca5ba72963f3f2aa295bed38
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,442 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1464,12 +1464,36 @@ index 0000000000000000000000000000000000000000..d13a722c3275b138dd28317624ed16d7
 +- Every benchmark must use random data and median timing; report format is in
 +  `bench/common.py` and `bench/results/rocblas_gap-*.json`.
 +- HPA behaves the same way: 6.94 TF random versus ~7.19 TF on zeroed data.
++
++## P0-5 clocks/power monitoring and measurement protocol (2026-11-25)
++
++Clocks remain unavailable, now with a concrete root cause instead of "no tool":
++
++| probe | result |
++|---|---|
++| ZLUDA NVML (`torch.cuda.clock_rate`, `temperature`, `power_draw`) | `NotSupported` |
++| `rocm-smi`/`amd-smi` in ROCm 10.1 Windows user space | not shipped |
++| `atiadlxx.dll` (Adrenalin driver) loaded, adapters enumerated | `AMD Radeon RX 5700 XT` visible |
++| `ADL2_OverdriveN_PerformanceStatus_Get` | `ADL_ERR_NOT_SUPPORTED` (-8) |
++| `ADL2_Overdrive6_CurrentStatus_Get` / `Temperature_Get` | `ADL_ERR_NOT_SUPPORTED` (-8) |
++| `ADL_Overdrive5_CurrentActivity_Get` | `ADL_ERR` (-1) |
++| GPU utilization / VRAM | available (Windows performance counters) |
++
++`bench/gpu_clocks.py` implements the ADL probe and degrades to null values with
++an error string, so reports stay valid.
++
++To keep results comparable without clock telemetry, the protocol is now part of
++every report (`bench/common.py:save_report`): random data only, warmup per
++variant, mean per round, **median across rounds**, variant order shuffled when
++comparing, and the limits are recorded explicitly. `bench_median` is available
++for new benchmarks. This is why the P0-1 zero-data artifact and earlier +-10%
++run-to-run differences are no longer mixed into the numbers.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..5212147f2f0b69d2956d11fa990179d147466caa
+index 0000000000000000000000000000000000000000..5f7612a056012332a09f472da1db067dccff24b4
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,289 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1501,7 +1525,7 @@ index 0000000000000000000000000000000000000000..5212147f2f0b69d2956d11fa990179d1
 +
 +| Priority | Workstream | Status | Benefit | Effort | Dependencies |
 +|---|---|---|---|---|---|
-+| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** | basis for all decisions | low | clocks/power blocked |
++| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** (protocol done, clocks blocked) | basis for all decisions | low | ADL live status NOT_SUPPORTED |
 +| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
 +| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 +| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
@@ -1669,6 +1693,13 @@ index 0000000000000000000000000000000000000000..5212147f2f0b69d2956d11fa990179d1
 +  for this model: it takes ~30 minutes even on an NVIDIA T4, so it is not a
 +  P0 blocker; use eager training or compile a smaller model.
 +- **2026-11-24 - P0-5 HH kernels already existed:** the tuned rocBLAS 7.1.1 library contains 110 HH solutions for gfx1010. `tensile_overrides/gfx1010_hh.csv` selects better existing kernels via `ROCBLAS_TENSILE_GEMM_OVERRIDE_PATH`; `run-zluda.cmd` applies it. HH 2048 **17.94 TF**, HH 4096 **16.73 TF** (defaults 9.5/12.1). No Tensile rebuild needed. SS/HPA remain ~8.2/7.2 TF; zeros/ones/uninitialized data inflated earlier numbers and are not representative.
++- **2026-11-25 - P0-5 monitoring protocol:** `bench/common.py` now records the
++  measurement protocol in every JSON report and offers `bench_median` (median
++  of per-round means; shuffle variant order between rounds when comparing).
++  `bench/gpu_clocks.py` talks to `atiadlxx.dll`: the adapter is enumerated, but
++  OverdriveN/6/5 live status returns `ADL_ERR_NOT_SUPPORTED` (-8) on this
++  driver, so sclk/mclk/temperature/power remain unavailable; utilization and
++  VRAM come from Windows performance counters (`bench/monitor.py`).
 +- **2026-11-24 - Stage 2.1 (partial):** `zluda_ops/flash_attention.py` exposes
 +  Triton FA as an autograd op and SDPA-compatible function/module. Causal and
 +  non-causal fwd+bwd work; GQA works. Masks/dropout/sliding/varlen are
@@ -1701,7 +1732,7 @@ index 0000000000000000000000000000000000000000..5212147f2f0b69d2956d11fa990179d1
 +| FA masks/dropout/window/varlen | **FUNCTIONAL FALLBACK** | correct math; Triton path open |
 +| Flash-decoding | **OPEN** | |
 +| bf16 native / emulation | **DONE (emulation)** | 4.42 native / 7.92 emulated TF |
-+| GPU monitoring | **PARTIAL** | utilization/VRAM; clocks/power blocked |
++| GPU monitoring | **PARTIAL** | utilization/VRAM via Windows PDH; measurement protocol enforced in every report; ADL live clocks return NOT_SUPPORTED (-8), documented blocker |
 +| int8 compute | **IMPOSSIBLE** | storage/dequant only |
 +| Winograd / MIOpen conv | **AUDIT DONE, TEST OPEN** | solvers found; benchmark/auto-select pending |
 +
@@ -1714,7 +1745,7 @@ index 0000000000000000000000000000000000000000..5212147f2f0b69d2956d11fa990179d1
 +| 3 | Triton sliding-window + varlen FA | P0 | correctness vs math; no dense mask allocation |
 +| 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
 +| 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
-+| 6 | Clock/power monitoring | P0 | sclk/mclk/temp available or documented blocked |
++| 6 | Clock/power monitoring | P0 | **DONE 2026-11-25**: protocol (random data, shuffled rounds, median) enforced in `bench/common.save_report`; utilization/VRAM via Windows PDH; sclk/mclk/temp are a documented blocker (`bench/gpu_clocks.py`: ADL adapters enumerate but OverdriveN/6/5 return ADL_ERR_NOT_SUPPORTED = -8) |
 +| 7 | Flash-decoding split-KV | P1 | >=1.5x decode at 4k |
 +| 8 | Full 8-layer `torch.compile` | Deferred | only if compile time becomes acceptable |
 +
@@ -1930,10 +1961,10 @@ index 0000000000000000000000000000000000000000..ee209b7f3947190c45bd443cf5034d21
 +    print("sdpa math: FAIL", type(e).__name__, str(e)[:200])
 diff --git a/bench/common.py b/bench/common.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f9b104489fd51a2942ff5dd089b5d5969abc1fc3
+index 0000000000000000000000000000000000000000..1704cc0bcbf893c77f90f5aabc2d9092ea48101a
 --- /dev/null
 +++ b/bench/common.py
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,105 @@
 +import json
 +import os
 +import time
@@ -1952,6 +1983,23 @@ index 0000000000000000000000000000000000000000..f9b104489fd51a2942ff5dd089b5d596
 +        fn()
 +    torch.cuda.synchronize()
 +    return (time.perf_counter() - start) / iters * 1000.0
++
++
++def bench_median(fn, rounds=5, iters=5, warmup=2):
++    """Median of per-round mean times; use for the reported RDNA1 numbers.
++
++    Rounds are separated so a single clock/power excursion does not leak into
++    the result. Benchmarks that compare variants should also shuffle variant
++    order between rounds (see bench/rocblas_gap.py).
++    """
++    samples = []
++    for _ in range(rounds):
++        samples.append(bench(fn, warmup=warmup, iters=iters))
++    samples.sort()
++    mid = len(samples) // 2
++    if len(samples) % 2:
++        return samples[mid]
++    return (samples[mid - 1] + samples[mid]) / 2.0
 +
 +
 +def gpu_info():
@@ -2004,6 +2052,21 @@ index 0000000000000000000000000000000000000000..f9b104489fd51a2942ff5dd089b5d596
 +    payload = dict(payload)
 +    payload["timestamp"] = datetime.now().isoformat(timespec="seconds")
 +    payload["gpu"] = gpu_info()
++    # Every report records how it was measured: zeros/ones/uninitialised data
++    # inflate GEMM by ~12% (bench/rocblas_gap.py), and clocks cannot be fixed
++    # because ADL live status is NOT_SUPPORTED on this driver.
++    payload.setdefault("protocol", {
++        "data": "random data (torch.randn) unless stated otherwise",
++        "timing": "mean per round, median across rounds, warmup per round",
++        "order": "variant order shuffled between rounds when comparing",
++        "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)",
++    })
++    try:
++        from gpu_clocks import sample as clocks_sample
++
++        payload["clocks"] = clocks_sample()
++    except Exception as exc:  # optional telemetry must never fail a report
++        payload["clocks"] = {"errors": {"gpu_clocks": f"{type(exc).__name__}: {exc}"}}
 +    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 +    print(f"report: {path}")
 +    return path
@@ -2350,6 +2413,354 @@ index 0000000000000000000000000000000000000000..101e2557be14d402e5a7139b37699cf6
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/bench/gpu_clocks.py b/bench/gpu_clocks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8641d0b3d336d4f4b9a9ea5f5aa76f7295c9f872
+--- /dev/null
++++ b/bench/gpu_clocks.py
+@@ -0,0 +1,342 @@
++"""GPU clocks/power telemetry through the AMD Display Library (ADL).
++
++ZLUDA NVML reports NotSupported for clocks and temperature, and the ROCm 10.1
++Windows user space ships no rocm-smi/amd-smi. The Adrenalin driver does install
++`atiadlxx.dll`, which exposes engine/memory clocks, temperature, fan and board
++power through the legacy Overdrive5/Overdrive6 interfaces.
++
++This module wraps the few ADL calls needed for reproducible benchmarks. It
++degrades gracefully: if ADL is missing, no AMD adapter is present, or the
++driver rejects the struct sizes, `sample()` returns None values with an error
++string instead of raising.
++
++Legacy Overdrive5 calls return ADL_ERR on current Adrenalin drivers, so clocks
++come from ADL2_Overdrive6_CurrentStatus_Get (needs the ADL2 control handle).
++
++Usage:
++  venv\\Scripts\\python.exe bench\\gpu_clocks.py            # one sample
++  venv\\Scripts\\python.exe bench\\gpu_clocks.py --seconds 5 --interval 0.5
++  venv\\Scripts\\python.exe bench\\gpu_clocks.py --json     # machine readable
++
++Clocks are reported in MHz (ADL uses 10 kHz units internally); temperature in
++degrees Celsius (ADL uses 1/1000 C); power in percent of the board limit.
++"""
++
++import argparse
++import ctypes
++import json
++import sys
++import time
++from ctypes import CFUNCTYPE, POINTER, Structure, byref, c_char, c_int, c_uint, c_void_p
++
++ADL_MAX_PATH = 256
++ADL_OK = 0
++
++# ADL_Overdrive6_CurrentPower_Get state info selector (percent of board power).
++ADL_OD6_GETSTATEINFO = 0x00000001
++
++
++class AdapterInfo(Structure):
++    _fields_ = [
++        ("iSize", c_int),
++        ("iAdapterIndex", c_int),
++        ("strUDID", c_char * ADL_MAX_PATH),
++        ("iBusNumber", c_int),
++        ("iDeviceNumber", c_int),
++        ("iFunctionNumber", c_int),
++        ("iVendorID", c_int),
++        ("strAdapterName", c_char * ADL_MAX_PATH),
++        ("strDisplayName", c_char * ADL_MAX_PATH),
++        ("iPresent", c_int),
++        ("iExist", c_int),
++        ("strDriverPath", c_char * ADL_MAX_PATH),
++        ("strDriverPathExt", c_char * ADL_MAX_PATH),
++        ("strPNPString", c_char * ADL_MAX_PATH),
++        ("iOSDisplayIndex", c_int),
++    ]
++
++
++class ADLODCurrentActivity(Structure):
++    _fields_ = [
++        ("iAdapterIndex", c_int),
++        ("iEngineClock", c_int),
++        ("iMemoryClock", c_int),
++        ("iVddc", c_int),
++        ("iTemperature", c_int),
++        ("iActivity", c_int),
++        ("iCurrentPerformanceLevel", c_int),
++        ("iCurrentBusSpeed", c_int),
++        ("iCurrentBusLanes", c_int),
++        ("iMaximumBusLanes", c_int),
++        ("iReserved", c_int * 4),
++    ]
++
++
++class ADLOD6CurrentStatus(Structure):
++    """ADL2_Overdrive6_CurrentStatus_Get result: clocks in 10 kHz units."""
++
++    _fields_ = [
++        ("iEngineClock", c_int),
++        ("iMemoryClock", c_int),
++        ("iActivity", c_int),
++    ]
++
++
++class ADLODNPerformanceStatus(Structure):
++    """ADL2_OverdriveN_PerformanceStatus_Get result (RDNA-era live clocks)."""
++
++    _fields_ = [
++        ("iCoreClock", c_int),
++        ("iMemoryClock", c_int),
++        ("iDCEFClock", c_int),
++        ("iGFXClock", c_int),
++        ("iUVDClock", c_int),
++        ("iVCEClock", c_int),
++        ("iGPUActivityPercent", c_int),
++        ("iCurrentCorePerformanceLevel", c_int),
++        ("iCurrentMemoryPerformanceLevel", c_int),
++        ("iCurrentDCEFPerformanceLevel", c_int),
++        ("iCurrentGFXPerformanceLevel", c_int),
++        ("iUVDPerformanceLevel", c_int),
++        ("iUVDEfficiency", c_int),
++        ("iVCEPerformanceLevel", c_int),
++        ("iVCEEfficiency", c_int),
++        ("iVFCEfficiency", c_int),
++        ("iReserved", c_int * 16),
++    ]
++
++
++class ActivitySample(Structure):
++    """Reserved for future Overdrive6 activity sampling."""
++
++    _fields_ = [
++        ("iAdapterIndex", c_int),
++        ("iActivity", c_int),
++    ]
++
++
++ADL_MAIN_MALLOC_CALLBACK = CFUNCTYPE(c_void_p, c_int)
++
++_alloc_keepalive = []
++
++
++def _malloc(size):
++    # ADL keeps the pointer; hold the buffer for the process lifetime.
++    buf = ctypes.create_string_buffer(max(size, 1))
++    _alloc_keepalive.append(buf)
++    return ctypes.cast(buf, c_void_p)
++
++
++class ADL:
++    def __init__(self):
++        self.lib = ctypes.CDLL("atiadlxx.dll")
++        self.callback = ADL_MAIN_MALLOC_CALLBACK(_malloc)
++        self.control = c_void_p()
++        self.error = None
++
++        self.lib.ADL_Main_Control_Create.argtypes = [ADL_MAIN_MALLOC_CALLBACK, c_int]
++        self.lib.ADL_Main_Control_Create.restype = c_int
++        self.lib.ADL_Main_Control_Destroy.argtypes = []
++        self.lib.ADL_Main_Control_Destroy.restype = c_int
++        self.lib.ADL_Adapter_NumberOfAdapters_Get.argtypes = [POINTER(c_int)]
++        self.lib.ADL_Adapter_NumberOfAdapters_Get.restype = c_int
++        self.lib.ADL_Adapter_AdapterInfo_Get.argtypes = [POINTER(AdapterInfo), c_int]
++        self.lib.ADL_Adapter_AdapterInfo_Get.restype = c_int
++        self.lib.ADL_Adapter_Active_Get.argtypes = [c_int, POINTER(c_int)]
++        self.lib.ADL_Adapter_Active_Get.restype = c_int
++        self.lib.ADL_Overdrive5_CurrentActivity_Get.argtypes = [
++            c_int, POINTER(ADLODCurrentActivity)
++        ]
++        self.lib.ADL_Overdrive5_CurrentActivity_Get.restype = c_int
++        self.lib.ADL2_Overdrive6_CurrentPower_Get.argtypes = [
++            c_void_p, c_int, c_uint, POINTER(c_int)
++        ]
++        self.lib.ADL2_Overdrive6_CurrentPower_Get.restype = c_int
++        self.lib.ADL2_Main_Control_Create.argtypes = [
++            ADL_MAIN_MALLOC_CALLBACK, c_int, POINTER(c_void_p)
++        ]
++        self.lib.ADL2_Main_Control_Create.restype = c_int
++        self.lib.ADL2_Main_Control_Destroy.argtypes = [c_void_p]
++        self.lib.ADL2_Overdrive6_CurrentStatus_Get.argtypes = [
++            c_void_p, c_int, POINTER(ADLOD6CurrentStatus)
++        ]
++        self.lib.ADL2_Overdrive6_CurrentStatus_Get.restype = c_int
++        self.lib.ADL2_Overdrive6_Temperature_Get.argtypes = [
++            c_void_p, c_int, POINTER(c_int)
++        ]
++        self.lib.ADL2_Overdrive6_Temperature_Get.restype = c_int
++        self.lib.ADL2_OverdriveN_PerformanceStatus_Get.argtypes = [
++            c_void_p, c_int, POINTER(ADLODNPerformanceStatus)
++        ]
++        self.lib.ADL2_OverdriveN_PerformanceStatus_Get.restype = c_int
++        self.control2 = c_void_p()
++        self.error2 = None
++
++        status = self.lib.ADL_Main_Control_Create(self.callback, 1)
++        if status != ADL_OK:
++            self.error = f"ADL_Main_Control_Create failed: {status}"
++            return
++
++        count = c_int(0)
++        status = self.lib.ADL_Adapter_NumberOfAdapters_Get(byref(count))
++        if status != ADL_OK or count.value <= 0:
++            self.error = f"ADL_Adapter_NumberOfAdapters_Get failed: {status}"
++            return
++
++        infos = (AdapterInfo * count.value)()
++        for info in infos:
++            info.iSize = ctypes.sizeof(AdapterInfo)
++        status = self.lib.ADL_Adapter_AdapterInfo_Get(
++            infos, ctypes.sizeof(AdapterInfo) * count.value
++        )
++        if status != ADL_OK:
++            self.error = f"ADL_Adapter_AdapterInfo_Get failed: {status}"
++            return
++
++        self.adapters = []
++        for info in infos:
++            if not info.iPresent:
++                continue
++            active = c_int(0)
++            if self.lib.ADL_Adapter_Active_Get(info.iAdapterIndex, byref(active)) != ADL_OK:
++                continue
++            if not active.value:
++                continue
++            name = info.strAdapterName.decode(errors="replace") or info.strPNPString.decode(
++                errors="replace"
++            )
++            self.adapters.append((info.iAdapterIndex, name))
++
++        status = self.lib.ADL2_Main_Control_Create(
++            self.callback, 1, byref(self.control2)
++        )
++        if status != ADL_OK:
++            self.error2 = f"ADL2_Main_Control_Create failed: {status}"
++
++    def sample(self):
++        result = {
++            "adapter": None,
++            "engine_clock_mhz": None,
++            "memory_clock_mhz": None,
++            "vddc_mv": None,
++            "temperature_c": None,
++            "activity_pct": None,
++            "power_pct": None,
++            "errors": {},
++        }
++        if self.error:
++            result["errors"]["adl"] = self.error
++            return result
++        if not self.adapters:
++            result["errors"]["adl"] = "no active AMD adapter"
++            return result
++        index, name = self.adapters[0]
++        result["adapter"] = name
++
++        if not self.error2:
++            # Prefer the OverdriveN status API: RDNA cards report live clocks
++            # there while Overdrive5/6 return ADL_ERR_NOT_SUPPORTED.
++            odnn = ADLODNPerformanceStatus()
++            status = self.lib.ADL2_OverdriveN_PerformanceStatus_Get(
++                self.control2, index, byref(odnn)
++            )
++            if status == ADL_OK:
++                result["engine_clock_mhz"] = round(odnn.iCoreClock / 100.0, 1)
++                result["memory_clock_mhz"] = round(odnn.iMemoryClock / 100.0, 1)
++                result["activity_pct"] = odnn.iGPUActivityPercent
++                result["clock_source"] = "overdriveN"
++            else:
++                result["errors"]["overdriveN_status"] = status
++
++            if result["engine_clock_mhz"] is None:
++                status_adl = ADLOD6CurrentStatus()
++                status = self.lib.ADL2_Overdrive6_CurrentStatus_Get(
++                    self.control2, index, byref(status_adl)
++                )
++                if status == ADL_OK:
++                    result["engine_clock_mhz"] = round(status_adl.iEngineClock / 100.0, 1)
++                    result["memory_clock_mhz"] = round(status_adl.iMemoryClock / 100.0, 1)
++                    result["activity_pct"] = status_adl.iActivity
++                    result["clock_source"] = "overdrive6"
++                else:
++                    result["errors"]["overdrive6_status"] = status
++
++            temperature = c_int(0)
++            status = self.lib.ADL2_Overdrive6_Temperature_Get(
++                self.control2, index, byref(temperature)
++            )
++            if status == ADL_OK:
++                result["temperature_c"] = round(temperature.value / 1000.0, 1)
++            else:
++                result["errors"]["overdrive6_temperature"] = status
++
++            power = c_int(0)
++            status = self.lib.ADL2_Overdrive6_CurrentPower_Get(
++                self.control2, index, ADL_OD6_GETSTATEINFO, byref(power)
++            )
++            if status == ADL_OK:
++                result["power_pct"] = power.value
++            else:
++                result["errors"]["overdrive6_power"] = status
++        else:
++            result["errors"]["adl2"] = self.error2
++        return result
++
++    def close(self):
++        if not self.error:
++            self.lib.ADL_Main_Control_Destroy()
++        if not self.error2:
++            self.lib.ADL2_Main_Control_Destroy(self.control2)
++
++
++def sample():
++    try:
++        adl = ADL()
++    except OSError as exc:
++        return {"errors": {"adl": f"cannot load atiadlxx.dll: {exc}"}}
++    try:
++        return adl.sample()
++    finally:
++        adl.close()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--seconds", type=float, default=0.0)
++    parser.add_argument("--interval", type=float, default=1.0)
++    parser.add_argument("--json", action="store_true")
++    args = parser.parse_args()
++
++    if args.seconds <= 0:
++        result = sample()
++        print(json.dumps(result, indent=2) if args.json else result)
++        return 0 if not result.get("errors", {}).get("adl") else 1
++
++    deadline = time.perf_counter() + args.seconds
++    samples = []
++    while time.perf_counter() < deadline:
++        samples.append(sample())
++        time.sleep(args.interval)
++    valid = [s for s in samples if s.get("engine_clock_mhz")]
++    summary = {
++        "samples": len(samples),
++        "engine_clock_mhz": {
++            "min": min((s["engine_clock_mhz"] for s in valid), default=None),
++            "max": max((s["engine_clock_mhz"] for s in valid), default=None),
++            "avg": round(sum(s["engine_clock_mhz"] for s in valid) / len(valid), 1)
++            if valid
++            else None,
++        },
++        "temperature_c": {
++            "min": min((s["temperature_c"] for s in valid), default=None),
++            "max": max((s["temperature_c"] for s in valid), default=None),
++        },
++        "raw": samples if args.json else None,
++        "errors": samples[0].get("errors", {}) if samples else {},
++    }
++    print(json.dumps(summary, indent=2) if args.json else summary)
++    return 0 if valid else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/math_attn_fb.py b/bench/math_attn_fb.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..38066719d338393ad4d5cdd9d110d1032b38f823
@@ -2431,10 +2842,10 @@ index 0000000000000000000000000000000000000000..bc697e5782dc3ace9f538ed9409de6c4
 +        print(f"matmul {str(dtype).split('.')[-1]:9s} n={n:5d}: {ms:9.2f} ms  {2*n**3/(ms/1000)/1e12:7.2f} TFLOPS")
 diff --git a/bench/monitor.py b/bench/monitor.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d7c364411cf8891cfa618e0975597d036d0dbff8
+index 0000000000000000000000000000000000000000..65b65d448bc12f5172552b5a607e8e4f9e98b783
 --- /dev/null
 +++ b/bench/monitor.py
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,77 @@
 +import argparse
 +import json
 +import subprocess
@@ -2443,6 +2854,7 @@ index 0000000000000000000000000000000000000000..d7c364411cf8891cfa618e0975597d03
 +import torch
 +
 +from common import nvml_sample, save_report
++from gpu_clocks import sample as clocks_sample
 +
 +GPU_COUNTER = (
 +    "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue)"
@@ -2477,6 +2889,7 @@ index 0000000000000000000000000000000000000000..d7c364411cf8891cfa618e0975597d03
 +        "vram_used_mb": (total - free) / 1024**2,
 +        "torch_allocated_mb": torch.cuda.memory_allocated() / 1024**2,
 +        "torch_reserved_mb": torch.cuda.memory_reserved() / 1024**2,
++        "clocks": clocks_sample(),
 +    }
 +
 +
@@ -4520,10 +4933,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..45624b462c88d3a62ec2db8517769e60db90a7aa
+index 0000000000000000000000000000000000000000..e378d34ea04f5ff4d193d9bb27b234beb534d42d
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,353 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -4803,6 +5216,7 @@ index 0000000000000000000000000000000000000000..45624b462c88d3a62ec2db8517769e60
 +run-zluda.cmd venv\Scripts\python.exe bench\fp16_ux.py
 +run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
 +run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
++venv\Scripts\python.exe bench\gpu_clocks.py --seconds 3
 +```
 +
 +Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -4824,10 +5238,13 @@ index 0000000000000000000000000000000000000000..45624b462c88d3a62ec2db8517769e60
 +  that `target\release\ptxas.exe` exists; rebuild it with
 +  `build-env.cmd cargo build --release -p ptxas`. Triton uses this stub to
 +  forward PTX to ZLUDA instead of producing NVIDIA SASS.
-+- **No clocks/power telemetry**: ZLUDA NVML reports `NotSupported` and the
-+  Windows ROCm 10.1 packages do not ship rocm-smi/amd-smi. Use the driver's
-+  fixed performance profile for reproducible runs; utilization can still be
-+  sampled with Windows GPU performance counters.
++- **No clocks/power telemetry**: ZLUDA NVML reports `NotSupported`, the Windows
++  ROCm 10.1 packages ship no rocm-smi/amd-smi, and the ADL API of the Adrenalin
++  driver returns `ADL_ERR_NOT_SUPPORTED` for its live status calls (the adapter
++  itself is visible; see `bench/gpu_clocks.py`). Utilization/VRAM are available
++  through Windows performance counters. Keep measurements comparable by using
++  the built-in protocol (random data, warmup, median of shuffled rounds — see
++  `bench/common.py`) and a fixed driver performance profile.
 +- **`cudaErrorSymbolNotFound` with PyTorch**: you are using a cu128+ wheel
 +  (SASS only). Use `cu118`.
 +- **`cublasLtMatmulAlgoGetHeuristic` / `cublasLtMatmulDescCreate` errors**:

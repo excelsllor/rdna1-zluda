@@ -18,6 +18,23 @@ def bench(fn, warmup=3, iters=10):
     return (time.perf_counter() - start) / iters * 1000.0
 
 
+def bench_median(fn, rounds=5, iters=5, warmup=2):
+    """Median of per-round mean times; use for the reported RDNA1 numbers.
+
+    Rounds are separated so a single clock/power excursion does not leak into
+    the result. Benchmarks that compare variants should also shuffle variant
+    order between rounds (see bench/rocblas_gap.py).
+    """
+    samples = []
+    for _ in range(rounds):
+        samples.append(bench(fn, warmup=warmup, iters=iters))
+    samples.sort()
+    mid = len(samples) // 2
+    if len(samples) % 2:
+        return samples[mid]
+    return (samples[mid - 1] + samples[mid]) / 2.0
+
+
 def gpu_info():
     props = torch.cuda.get_device_properties(0)
     info = {
@@ -68,6 +85,21 @@ def save_report(name, payload):
     payload = dict(payload)
     payload["timestamp"] = datetime.now().isoformat(timespec="seconds")
     payload["gpu"] = gpu_info()
+    # Every report records how it was measured: zeros/ones/uninitialised data
+    # inflate GEMM by ~12% (bench/rocblas_gap.py), and clocks cannot be fixed
+    # because ADL live status is NOT_SUPPORTED on this driver.
+    payload.setdefault("protocol", {
+        "data": "random data (torch.randn) unless stated otherwise",
+        "timing": "mean per round, median across rounds, warmup per round",
+        "order": "variant order shuffled between rounds when comparing",
+        "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)",
+    })
+    try:
+        from gpu_clocks import sample as clocks_sample
+
+        payload["clocks"] = clocks_sample()
+    except Exception as exc:  # optional telemetry must never fail a report
+        payload["clocks"] = {"errors": {"gpu_clocks": f"{type(exc).__name__}: {exc}"}}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"report: {path}")
     return path

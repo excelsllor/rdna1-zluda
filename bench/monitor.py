@@ -6,6 +6,7 @@ import time
 import torch
 
 from common import nvml_sample, save_report
+from gpu_clocks import sample as clocks_sample
 
 GPU_COUNTER = (
     "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue)"
@@ -40,6 +41,7 @@ def sample():
         "vram_used_mb": (total - free) / 1024**2,
         "torch_allocated_mb": torch.cuda.memory_allocated() / 1024**2,
         "torch_reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+        "clocks": clocks_sample(),
     }
 
 
