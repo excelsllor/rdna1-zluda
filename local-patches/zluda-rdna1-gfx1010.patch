@@ -1042,10 +1042,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..55fdf110bdf89000ff2d9c7df5a8e772e42d2674
+index 0000000000000000000000000000000000000000..d13a722c3275b138dd28317624ed16d701de95f6
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,418 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1436,13 +1436,40 @@ index 0000000000000000000000000000000000000000..55fdf110bdf89000ff2d9c7df5a8e772
 +SS remains ~8.16 TF and HPA ~7.19 TF; their P0-5 targets are not reached by
 +the existing kernels. Measurements with zeros/ones/uninitialized buffers are
 +inflated (SS up to ~9.1 TF) and are not representative of random model data.
-\ No newline at end of file
++## P0-1 fp32 GEMM "gap" between direct rocBLAS and PyTorch (2026-11-25)
++
++Earlier notes claimed 9.2-9.6 TF from isolated `rocblas_sgemm`/`rocblas_gemm_ex`
++scripts versus 8.16 TF for `torch.matmul`. `bench/rocblas_gap.py` reproduces
++every variant in one warmed process (shuffled rounds, median of 5):
++
++| variant (4096^2 fp32, random data unless noted) | median | TF |
++|---|---|---|
++| `torch.mm(a, b)` | 16.79 ms | 8.19 |
++| `torch.mm(a, b, out=c)` | 16.80 ms | 8.18 |
++| direct `rocblas_sgemm`, torch buffers | 16.79 ms | 8.19 |
++| direct `rocblas_sgemm`, hipMalloc buffers | 16.80 ms | 8.18 |
++| direct `rocblas_sgemm`, **zeroed** hipMalloc buffers | **14.90 ms** | **9.23** |
++
++The direct call is bit-identical to `torch.mm` (max abs error 0). The only
++difference that matters is the data: zero/uninitialised buffers run ~12.8%
++faster because the GPU draws less power and holds higher clocks. The old
++raw-HIP scripts allocated `hipMalloc` buffers without initialising them, so
++their 9.2-9.6 TF numbers were power artifacts, not a software gap.
++
++Consequences:
++
++- fp32 4096^2 on random data is **8.16-8.20 TF = 84% of the 9.754 TF peak**;
++  this is the practical ceiling of the shipped Tensile kernels. The 8.8-9.2 TF
++  target is withdrawn.
++- Every benchmark must use random data and median timing; report format is in
++  `bench/common.py` and `bench/results/rocblas_gap-*.json`.
++- HPA behaves the same way: 6.94 TF random versus ~7.19 TF on zeroed data.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..a5d789465f843d56ae65320e096dc635b31f6dd2
+index 0000000000000000000000000000000000000000..5212147f2f0b69d2956d11fa990179d147466caa
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,282 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1459,6 +1486,11 @@ index 0000000000000000000000000000000000000000..a5d789465f843d56ae65320e096dc635
 +  hardware. Memory 448 GB/s, 8 GB VRAM, PCIe 4.0 x16 (~25 GB/s host link).
 +- Runtime: ROCm 10.1 user space (HIP 7.16, MIOpen) + rocBLAS 7.1.1 with tuned
 +  gfx1010 Tensile libraries. PyTorch `2.7.1+cu118` (PTX path), Triton 3.3.1.
++- Benchmarks must use random data and median timing: zeros, ones and
++  uninitialised buffers raise the measured GEMM rate by ~12% (fp32 4096:
++  8.19 TF random vs 9.23 TF zeros) through power/clock effects, not through a
++  software path. Verified by `bench/rocblas_gap.py`; the old 9.2–9.6 TF
++  readings came from uninitialised `hipMalloc` buffers.
 +- ZLUDA compiles device code with `-wavefrontsize64,+cumode` (wave32 + CU mode).
 +- Known limitations: PyTorch SDPA flash/memory-efficient kernels are not
 +  available on gfx1010 (no MFMA); `cuXXX` performance libraries are mapped to
@@ -1471,7 +1503,7 @@ index 0000000000000000000000000000000000000000..a5d789465f843d56ae65320e096dc635
 +|---|---|---|---|---|---|
 +| **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** | basis for all decisions | low | clocks/power blocked |
 +| **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
-+| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **PARTIAL** | HH achieved; SS/HPA open | medium | rocBLAS 7.1.1; toolchain for new kernels |
++| **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
 +| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
 +| **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **PARTIAL** | training + inference | medium | masks/dropout/window/varlen are math fallback |
 +| **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
@@ -1642,6 +1674,18 @@ index 0000000000000000000000000000000000000000..a5d789465f843d56ae65320e096dc635
 +  non-causal fwd+bwd work; GQA works. Masks/dropout/sliding/varlen are
 +  functional via math fallback but not yet Triton-accelerated. Flash-decoding
 +  remains open.
++- **2026-11-25 - repository maintenance:** portable launchers (repository-
++  relative paths, `vswhere`, `ZLUDA_HIP_PATH`), documented ComfyUI launchers,
++  `gpu_reset.ps1`, ComfyUI freeze file, patch export/validation tooling
++  (`tools/export_patch.ps1`, `tools/check_patch.ps1`, pre-push hook), regenerated
++  UTF-8/LF patch, `smoke/local/` for machine-specific scripts.
++- **2026-11-25 - P0-1 closed (fp32 GEMM "gap"):** `bench/rocblas_gap.py` runs
++  `torch.mm`, direct `rocblas_sgemm` on torch/hipMalloc buffers and a zeroed
++  control in one warmed process with shuffled rounds. Random data: all paths
++  8.18–8.19 TF (median). Zeroed buffers: **9.23 TF (+12.8%)** — an artifact
++  caused by lower power draw/higher clocks. The old 9.2–9.6 TF readings came
++  from uninitialised `hipMalloc` buffers in raw-HIP scripts; there is no
++  ZLUDA/torch gap, and the 8.8–9.2 TF SS target is withdrawn.
 +
 +## P0 status (2026-11-24)
 +
@@ -1650,7 +1694,7 @@ index 0000000000000000000000000000000000000000..a5d789465f843d56ae65320e096dc635
 +| Training stability / MHA crash | **DONE (eager)** | slow-path MHA; full compile skipped |
 +| fp16 accumulation UX | **DONE** | opt-in context, warnings, accuracy table; default off |
 +| Tensile HH | **DONE** | existing 110 kernels; 16.73/17.94 TF with override |
-+| Tensile SS/HPA | **OPEN** | 8.16/7.19 TF; no new `.dat/.co` kernels |
++| Tensile SS/HPA | **CLOSED** | 8.16/6.94 TF on random data = practical ceiling (84% of peak); old 9.2/7.2 TF numbers were zero-data artifacts; 325/302 solutions enumerated, default already best |
 +| GEMV M1-8 / auto M<=32 | **DONE** | ~2x rocBLAS; inference only |
 +| GEMV M16-32 target | **PARTIAL** | 155/78 GB/s; target 70-80% not met |
 +| FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
@@ -1669,14 +1713,17 @@ index 0000000000000000000000000000000000000000..a5d789465f843d56ae65320e096dc635
 +| 2 | Triton masks/dropout for FA | P0 | match math fallback within 1e-3, faster at 1k+ |
 +| 3 | Triton sliding-window + varlen FA | P0 | correctness vs math; no dense mask allocation |
 +| 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
-+| 5 | SS/HPA Tensile decision | P0 | new `.dat/.co` only if toolchain available; otherwise close as blocked |
++| 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
 +| 6 | Clock/power monitoring | P0 | sclk/mclk/temp available or documented blocked |
 +| 7 | Flash-decoding split-KV | P1 | >=1.5x decode at 4k |
 +| 8 | Full 8-layer `torch.compile` | Deferred | only if compile time becomes acceptable |
 +
 +## Definition of done (metrics)
-+- fp32 GEMM 8.16→**8.8–9.2 TF**; HPA 6.94→**7.5–8**; HH target met via override (**16.73/17.94**); bf16 native 4.42→6–7, bf16 emulation **7.92**.
-+  bf16 4.42→**6–7**.
++- fp32 GEMM 8.16 TF = **84% of theoretical peak**, on random data this is the
++  practical ceiling for the shipped Tensile kernels; HPA 6.94 TF = bounded by
++  the fp32 rate (`v_fma_mix`); HH target met via override (**16.73/17.94 TF**);
++  bf16 native 4.42→6–7 open (needs new Tensile code objects), bf16 emulation
++  **7.92 TF** reaches its target.
 +- int4 weight-only decode (dequant-to-fp16): ≥**70–80%** of 448 GB/s;
 +  7B int4 decode target **35–60 tok/s** (theoretical ~100).
 +- No int8 GEMM/TOPS target: gfx1010 has no int8 dot/tensor units; int8 is
@@ -2631,6 +2678,249 @@ index 0000000000000000000000000000000000000000..23d7a589bcba6d7f28e1fb3a64a98624
 +if __name__ == "__main__":
 +    main()
 +
+diff --git a/bench/rocblas_gap.py b/bench/rocblas_gap.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b24ce00f5a7d21308426fe8efb89c226134b4e5
+--- /dev/null
++++ b/bench/rocblas_gap.py
+@@ -0,0 +1,237 @@
++"""Check whether the fp32 GEMM gap between PyTorch and direct rocBLAS is real.
++
++Older measurements disagreed: `bench/stage1.py` reports 8.16 TF for a 4096^2
++fp32 `torch.matmul`, while isolated ctypes scripts reported 9.2-9.6 TF for
++direct `rocblas_sgemm`/`rocblas_gemm_ex` calls. This script runs every variant
++in one process with a warmed GPU, shuffled rounds and median timing, and adds a
++zero-data control:
++
++  * all call paths (torch mm, torch mm with out=, direct rocBLAS on torch
++    buffers, direct rocBLAS on hipMalloc buffers) agree on random data;
++  * the same direct call on zeroed buffers is ~12% faster, which explains the
++    old 9.2-9.6 TF numbers: those scripts used uninitialised `hipMalloc`
++    buffers. Zero data draws less power, so the GPU holds higher clocks; it is
++    not a software gap and nothing in ZLUDA/torch can recover it.
++
++Conclusion: use random data and median timing everywhere; 8.16-8.20 TF is the
++representative fp32 4096^2 result on this card.
++
++Usage:
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\rocblas_gap.py --n 2048
++  run-zluda.cmd venv\\Scripts\\python.exe bench\\rocblas_gap.py --n 4096 --rounds 5
++  DISABLE_ADDMM_CUDA_LT=1 run-zluda.cmd venv\\Scripts\\python.exe bench\\rocblas_gap.py --n 4096
++
++The CUDA-Lt vs cuBLAS choice is a process-wide environment variable, so run
++the script twice with and without DISABLE_ADDMM_CUDA_LT=1.
++"""
++
++import argparse
++import ctypes
++import os
++import random
++import statistics
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++from common import save_report
++
++REPO = Path(__file__).resolve().parents[1]
++
++ROCBLAS_OP_N = 111
++HIP_MEMCPY_D2D = 3
++
++
++def load_rocblas():
++    hip_path = os.environ.get("HIP_PATH")
++    if not hip_path:
++        hip_path = str(REPO / "hip")
++    hip_bin = Path(hip_path) / "bin"
++    if hasattr(os, "add_dll_directory"):
++        try:
++            os.add_dll_directory(str(hip_bin))
++        except OSError:
++            pass
++    hip = ctypes.CDLL(str(hip_bin / "amdhip64_7.dll"))
++    rb = ctypes.CDLL(str(hip_bin / "rocblas.dll"))
++
++    hip.hipInit.argtypes = [ctypes.c_uint]
++    hip.hipInit.restype = ctypes.c_int
++    hip.hipMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
++    hip.hipMalloc.restype = ctypes.c_int
++    hip.hipFree.argtypes = [ctypes.c_void_p]
++    hip.hipFree.restype = ctypes.c_int
++    hip.hipMemcpy.argtypes = [
++        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
++    ]
++    hip.hipMemcpy.restype = ctypes.c_int
++    hip.hipMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
++    hip.hipMemset.restype = ctypes.c_int
++    hip.hipDeviceSynchronize.argtypes = []
++    hip.hipDeviceSynchronize.restype = ctypes.c_int
++
++    rb.rocblas_create_handle.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
++    rb.rocblas_create_handle.restype = ctypes.c_int
++    rb.rocblas_sgemm.argtypes = [
++        ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
++        ctypes.c_int, ctypes.c_int, ctypes.c_int,
++        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
++        ctypes.c_void_p, ctypes.c_int,
++        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
++    ]
++    rb.rocblas_sgemm.restype = ctypes.c_int
++    return hip, rb
++
++
++def make_sgemm(rb, handle, alpha, beta, a_ptr, b_ptr, c_ptr, n):
++    # Row-major C = A@B is computed by a column-major call with B and A
++    # swapped (square buffers).
++    def call():
++        return rb.rocblas_sgemm(
++            handle, ROCBLAS_OP_N, ROCBLAS_OP_N, n, n, n,
++            ctypes.byref(alpha), ctypes.c_void_p(b_ptr), n,
++            ctypes.c_void_p(a_ptr), n,
++            ctypes.byref(beta), ctypes.c_void_p(c_ptr), n,
++        )
++    return call
++
++
++def time_call(fn, warmup, iters):
++    for _ in range(warmup):
++        fn()
++    torch.cuda.synchronize()
++    start = time.perf_counter()
++    for _ in range(iters):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - start) / iters * 1000.0
++
++
++def tflops(n, ms):
++    return 2.0 * n ** 3 / (ms / 1000.0) / 1e12
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--n", type=int, default=2048)
++    parser.add_argument("--rounds", type=int, default=5)
++    parser.add_argument("--iters", type=int, default=5)
++    parser.add_argument("--warmup", type=int, default=2)
++    parser.add_argument("--vram-fraction", type=float, default=None,
++                        help="cap the PyTorch allocator (e.g. 0.8) for risky runs")
++    args = parser.parse_args()
++
++    if args.vram_fraction:
++        torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++        print(f"VRAM fraction {args.vram_fraction}", flush=True)
++
++    n = args.n
++    torch.manual_seed(0)
++    a = torch.randn(n, n, device="cuda", dtype=torch.float32)
++    b = torch.randn(n, n, device="cuda", dtype=torch.float32)
++    c = torch.empty(n, n, device="cuda", dtype=torch.float32)
++    torch.cuda.synchronize()
++
++    hip, rb = load_rocblas()
++    assert hip.hipInit(0) == 0
++    handle = ctypes.c_void_p()
++    assert rb.rocblas_create_handle(ctypes.byref(handle)) == 0
++    alpha = ctypes.c_float(1.0)
++    beta = ctypes.c_float(0.0)
++
++    # Hip-allocated buffers, initialised from the torch tensors (same content
++    # so compression does not skew the comparison).
++    hip_ptrs, hip_bufs = [], []
++    nbytes = n * n * 4
++    for src in (a, b, c):
++        ptr = ctypes.c_void_p()
++        assert hip.hipMalloc(ctypes.byref(ptr), nbytes) == 0
++        assert hip.hipMemcpy(ptr, ctypes.c_void_p(src.data_ptr()), nbytes,
++                             HIP_MEMCPY_D2D) == 0
++        hip_ptrs.append(ptr)
++        hip_bufs.append(ptr)
++    hip.hipDeviceSynchronize()
++
++    sgemm_torch = make_sgemm(rb, handle, alpha, beta,
++                             a.data_ptr(), b.data_ptr(), c.data_ptr(), n)
++    sgemm_hip = make_sgemm(rb, handle, alpha, beta,
++                           hip_ptrs[0].value, hip_ptrs[1].value,
++                           hip_ptrs[2].value, n)
++    assert sgemm_torch() == 0 and sgemm_hip() == 0
++    torch.cuda.synchronize()
++
++    # Zero-data control: same direct call, same allocations, zeroed content.
++    # This is what the old isolated scripts accidentally measured.
++    zero_ptrs = []
++    for _ in range(3):
++        ptr = ctypes.c_void_p()
++        assert hip.hipMalloc(ctypes.byref(ptr), nbytes) == 0
++        assert hip.hipMemset(ptr, 0, nbytes) == 0
++        zero_ptrs.append(ptr)
++    sgemm_hip_zeros = make_sgemm(rb, handle, alpha, beta,
++                                 zero_ptrs[0].value, zero_ptrs[1].value,
++                                 zero_ptrs[2].value, n)
++    assert sgemm_hip_zeros() == 0
++    torch.cuda.synchronize()
++
++    # Sanity: direct call on torch buffers must match torch.mm.
++    ref = a @ b
++    err = (c - ref).abs().max().item()
++    del ref
++    torch.cuda.synchronize()
++
++    variants = {
++        "torch_mm": lambda: torch.mm(a, b),
++        "torch_mm_out": lambda: torch.mm(a, b, out=c),
++        "sgemm_torch_buf": sgemm_torch,
++        "sgemm_hip_buf": sgemm_hip,
++        "sgemm_hip_zeros": sgemm_hip_zeros,
++    }
++
++    samples = {name: [] for name in variants}
++    order = list(variants)
++    rng = random.Random(1234)
++    for _ in range(args.rounds):
++        rng.shuffle(order)
++        for name in order:
++            samples[name].append(time_call(variants[name], args.warmup, args.iters))
++
++    rows = []
++    print(f"n={n} rounds={args.rounds} iters={args.iters} "
++          f"tf32={torch.backends.cuda.matmul.allow_tf32} "
++          f"precision={torch.get_float32_matmul_precision()} "
++          f"addmm_lt_disabled={os.environ.get('DISABLE_ADDMM_CUDA_LT')}", flush=True)
++    print(f"direct sgemm max abs error vs torch.mm: {err:.3e}", flush=True)
++    for name, values in samples.items():
++        med = statistics.median(values)
++        best = min(values)
++        rows.append({
++            "variant": name,
++            "median_ms": med,
++            "best_ms": best,
++            "median_tflops": tflops(n, med),
++            "best_tflops": tflops(n, best),
++            "samples_ms": values,
++        })
++        print(f"{name:16s} median {med:8.3f} ms {tflops(n, med):6.2f} TF | "
++              f"best {best:8.3f} ms {tflops(n, best):6.2f} TF", flush=True)
++
++    for ptr in hip_bufs + zero_ptrs:
++        hip.hipFree(ptr)
++    save_report("rocblas_gap", {
++        "n": n,
++        "rounds": args.rounds,
++        "iters": args.iters,
++        "direct_error": err,
++        "allow_tf32": torch.backends.cuda.matmul.allow_tf32,
++        "float32_matmul_precision": torch.get_float32_matmul_precision(),
++        "disable_addmm_cuda_lt": os.environ.get("DISABLE_ADDMM_CUDA_LT"),
++        "vram_fraction": args.vram_fraction,
++        "rows": rows,
++    })
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/roofline.py b/bench/roofline.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..453c5bc2f73c481f1c1e2b79117a97c3ed7e87b7
@@ -4230,10 +4520,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b34f3f469f9387cc24fb6468ced4cd7b5df99a4b
+index 0000000000000000000000000000000000000000..45624b462c88d3a62ec2db8517769e60db90a7aa
 --- /dev/null
 +++ b/docs/RDNA1_BUILD_AND_USAGE.md
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,349 @@
 +# RDNA1 (gfx1010) build and usage guide
 +
 +This document describes how to build ZLUDA for Radeon RX 5000 series (gfx1010)
@@ -4381,10 +4671,12 @@ index 0000000000000000000000000000000000000000..b34f3f469f9387cc24fb6468ced4cd7b
 +<repo>\target\release\zluda.exe -- %*
 +```
 +
-+Every variable is only set when it is not already defined, so a different HIP
-+installation or cache location can be selected in the environment before the
-+launcher runs. The Visual Studio environment is located with `vswhere` (set `VS`
-+to override) and is optional at run time.
++Every variable is only set when it is not already defined, so a different cache
++location can be selected in the environment before the launcher runs. The HIP
++runtime always comes from the repository (`<repo>\hip`); set `ZLUDA_HIP_PATH`
++before calling the launcher to use another installation (a stale system-wide
++`HIP_PATH` is intentionally ignored). The Visual Studio environment is located
++with `vswhere` (set `VS` to override) and is optional at run time.
 +
 +Important:
 +
@@ -4510,6 +4802,7 @@ index 0000000000000000000000000000000000000000..b34f3f469f9387cc24fb6468ced4cd7b
 +run-zluda-auto.cmd venv\Scripts\python.exe smoke\auto_test.py
 +run-zluda.cmd venv\Scripts\python.exe bench\fp16_ux.py
 +run-zluda.cmd venv\Scripts\python.exe bench\monitor.py --seconds 3
++run-zluda.cmd venv\Scripts\python.exe bench\rocblas_gap.py --n 4096
 +```
 +
 +Expected reference numbers are in `RESULTS_RDNA1.md`.
@@ -4580,7 +4873,6 @@ index 0000000000000000000000000000000000000000..b34f3f469f9387cc24fb6468ced4cd7b
 +enabled (`torch._C._set_cublas_allow_fp16_accumulation(True)`); HPA/SS lines
 +are intentionally not included. Use random data for measurements: zeros,
 +ones and uninitialized buffers are not representative.
-\ No newline at end of file
 diff --git a/docs/comfy-freeze.txt b/docs/comfy-freeze.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..6c3369aaf97348f7df7750daccdd46200301148e
@@ -5168,10 +5460,10 @@ index 0000000000000000000000000000000000000000..45fe5fbfcdf8683a72153758310ab7cc
 +call "%~dp0run-zluda.cmd" "%~dp0venv\Scripts\python.exe" "%~dp0tools\run_with_auto.py" %*
 diff --git a/run-zluda.cmd b/run-zluda.cmd
 new file mode 100644
-index 0000000000000000000000000000000000000000..ead2a903ac744391633058bb9d20fa5ac8ac5c99
+index 0000000000000000000000000000000000000000..3c5e1840f0daea05b0b191e3624cfef3cd2cd345
 --- /dev/null
 +++ b/run-zluda.cmd
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,29 @@
 +@echo off
 +rem Run a command through ZLUDA.
 +rem All paths are relative to this repository; every variable can be overridden
@@ -5189,7 +5481,8 @@ index 0000000000000000000000000000000000000000..ead2a903ac744391633058bb9d20fa5a
 +if not defined VS if exist "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools" set "VS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
 +if defined VS if exist "%VS%\VC\Auxiliary\Build\vcvars64.bat" call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
 +
-+if not defined HIP_PATH set "HIP_PATH=%ROOT%\hip"
++if defined ZLUDA_HIP_PATH (set "HIP_PATH=%ZLUDA_HIP_PATH%") else (set "HIP_PATH=%ROOT%\hip")
++if not exist "%HIP_PATH%\bin\amdhip64_7.dll" echo [run-zluda] warning: amdhip64_7.dll not found under "%HIP_PATH%\bin"
 +if not defined HIP_VISIBLE_DEVICES set "HIP_VISIBLE_DEVICES=0"
 +if not defined ZLUDA_CC set "ZLUDA_CC=8.6"
 +if not defined TRITON_PTXAS_PATH set "TRITON_PTXAS_PATH=%ROOT%\target\release\ptxas.exe"
