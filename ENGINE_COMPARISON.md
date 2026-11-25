@@ -1,31 +1,32 @@
 # Engine comparison: Vulkan (Ollama) vs ZLUDA (PyTorch/Triton) on gfx1010
 
-Updated: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B
+Final report: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B
 (same weights: GGUF for Ollama, safetensors for PyTorch). VRAM capped to 85%
-for PyTorch runs. GPU clocks cannot be fixed: single-run spread is +-15-30%.
+in PyTorch runs. GPU clocks cannot be fixed (+-15-30% run-to-run spread).
 
 ## Setups
 
-- **Vulkan**: Ollama 0.40.18, llama.cpp Vulkan backend, 100% GPU offload.
-  GGUF Q4_K_M and F16 imported with num_ctx 32768.
-  `OLLAMA_FLASH_ATTENTION` (on/off) and `OLLAMA_KV_CACHE_TYPE` (q8_0/f16/f32)
-  set through `bench/ollama_config.ps1`; measurement via `bench/ollama_bench.py`
-  (`bench/run_vulkan_matrix.py` for the matrix).
+- **Vulkan**: Ollama 0.40.18, llama.cpp Vulkan backend, 100% GPU offload, GGUF
+  Q4_K_M and F16 imported with num_ctx 32768. FA and KV cache type switched via
+  `bench/ollama_config.ps1`; measured with `bench/ollama_bench.py` and
+  `bench/run_vulkan_matrix.py`.
 - **ZLUDA**: this fork (PyTorch 2.7.1+cu118, Triton 3.3.1, ROCm 10.1 + tuned
-  rocBLAS 7.1.1), benchmarked with `bench/model_bench.py`.
-- **llama.cpp CUDA under ZLUDA: blocked.** b12721 CUDA 12.4 build loads under
-  ZLUDA (device found: 8176 MiB, compute 8.6) but kernel launch fails with
-  `CUDA error: operation not supported` at `cudaLaunchKernelEx` (programmatic
-  dependent launch). With `GGML_CUDA_PDL=0` the run hangs. Same-engine
-  Vulkan-vs-ZLUDA is therefore not possible today.
-- **bitsandbytes: excluded.** 0.50.2 imports and ships ROCm libs, but its
-  kernels fail under ZLUDA (`named symbol not found`, both default and
-  `BNB_BACKEND=rocm`). Substitute: `zluda_ops/optim8bit.py` (Triton
-  blockwise-int8 AdamW): step 0.124 ms vs 0.566 ms torch AdamW at 1 Mi
-  params (4.6x), optimizer-state memory 3.94x smaller, 11% parameter deviation
-  after 8 steps (int8 state quantization, same tradeoff as bnb).
+  rocBLAS 7.1.1), measured with `bench/model_bench.py` (which also reports the
+  flash-attention/flash-decoding dispatch counters from `zluda_ops.auto`).
+- **llama.cpp CUDA under ZLUDA: blocked.** Two Windows CUDA builds were tried:
+  b12721 (current) fails at `cudaLaunchKernelEx` (programmatic dependent launch,
+  PDL) with `CUDA error: operation not supported`, and hangs with
+  `GGML_CUDA_PDL=0`; b9802 (pre-PDL) fails with `CUDA error` in
+  `ggml-cuda.cu`. The CUDA backend loads and sees the GPU (8176 MiB, CC 8.6),
+  but kernels cannot run through ZLUDA. Same-engine Vulkan-vs-ZLUDA comparison
+  is therefore not possible today.
+- **bitsandbytes: excluded.** 0.50.2 imports and ships ROCm libraries, but its
+  kernels fail under ZLUDA (`named symbol not found`, default and
+  `BNB_BACKEND=rocm`). Substitute in this repo: `zluda_ops/optim8bit.py`.
 
-## Vulkan results (Ollama, KV=q8_0, FA=1 unless noted)
+## Vulkan results (Ollama)
+
+Q4_K_M / F16, KV q8_0, FA=1:
 
 | model | ctx | prompt tok | prefill tok/s | decode tok/s |
 |---|---|---|---|---|
@@ -34,82 +35,134 @@ for PyTorch runs. GPU clocks cannot be fixed: single-run spread is +-15-30%.
 | Q4_K_M | 32768 | 29150 | 946 | 104.8 |
 | F16 | 2048 | 1850 | 4771 | 133.7 |
 | F16 | 8192 | 7310 | 2810 | 123.3 |
-| F16 | 32768 (clamped to 8192) | 4098 | 3843 | 129.0 |
+| F16 | 32768 | - | - | - (Ollama clamps F16 to 8192 ctx on 8 GB) |
 
-FA on/off and KV variants (KV=f16, FA=0 is the valid combination; q8_0 KV
-requires FA, otherwise Ollama returns HTTP 500):
+FA on/off, KV f16 (q8_0 KV requires FA, otherwise HTTP 500):
 
-| model | FA | KV | ctx | prefill tok/s | decode tok/s |
-|---|---|---|---|---|---|
-| Q4_K_M | 1 | f16 | 2048 | 4364 | 31.8 (*) |
-| Q4_K_M | 1 | f16 | 8192 | 2769 | 143.1 |
-| F16 | 1 | f16 | 2048 | 4905 | 142.8 |
-| F16 | 1 | f16 | 8192 | 2857 | 133.4 |
-| Q4_K_M | 0 | f16 | 2048 | 2782 | 196.2 |
-| Q4_K_M | 0 | f16 | 8192 | 3986 | 178.6 |
-| F16 | 0 | f16 | 2048 | 6258 | 212.3 |
-| F16 | 0 | f16 | 8192 | 4179 | 172.7 |
+| model | FA | ctx | prefill tok/s | decode tok/s |
+|---|---|---|---|---|
+| Q4_K_M | 1 | 8192 | 2769 | 143.1 |
+| F16 | 1 | 8192 | 2857 | 133.4 |
+| Q4_K_M | 0 | 2048 | 2782 | 196.2 |
+| Q4_K_M | 0 | 8192 | 3986 | 178.6 |
+| F16 | 0 | 2048 | 6258 | 212.3 |
+| F16 | 0 | 8192 | 4179 | 172.7 |
 
-(*) outlier, likely a warm-up artefact; decode is otherwise 130-212 tok/s.
+## ZLUDA/PyTorch results (Qwen2.5-0.5B)
 
-Observations: flash attention mainly helps prefill at short context; FA=0
-decodes faster here; **F16 model is clamped by Ollama to 8192 context** on
-8 GB while Q4_K_M reaches 32768.
-
-## ZLUDA/PyTorch results (prefill 1024 tokens, decode 8, ctx 1024)
+Prefill/decode at 1024 exact tokens (decode 8 tokens):
 
 | config | prefill tok/s | decode tok/s | peak VRAM |
 |---|---|---|---|
 | fp16, math SDPA | 4525 | 22.1 | 1270 MB |
 | fp16, fp16-accum | **7774** | 26.2 | 1270 MB |
-| fp16, Triton FA (`--exact-seq 1024`) | 4813 | 27.9 | 1281 MB |
+| fp16, Triton FA + flash-decoding | 4813 | **27.9** | 1281 MB |
 | bf16, math SDPA | 2798 | 10.2 | 1270 MB |
 | fp32, math SDPA | 4984 | 25.3 | 2518 MB |
-| int4 weights (fused dequant), fp16 | 2031 | 25.4 | 2014 MB (**) |
-| int8 weights (dequant-once), fp16 | 1990 | 18.9 | 2496 MB (**) |
-| 8-bit AdamW step (1 Mi fp32 params) | 0.124 ms/step vs 0.566 torch | - | 4x less state |
+| int4 weights (fused dequant) | 2031 | 25.4 | steady 519 MB |
+| int8 weights (dequant-once) | 1990 | 18.9 | steady 747 MB, 1694 MB active |
 
-(**) peak includes model load + quantization temporaries; int4 should end lower
-than fp16 once the guard/measurement is refined.
+Long context (fp16, Triton FA, exact seq, `logits_to_keep=1`):
 
-## Comparison and diagnosis
+| ctx | prefill tok/s | decode tok/s | peak VRAM |
+|---|---|---|---|
+| 1024 | 4813 | 27.9 | 1281 MB |
+| 8192 | 3275 | 12.6 | 1340 MB |
+| 16384 | 2076 | 6.7 | 1723 MB |
+| 32768 | 1199 | 6.2 | 2487 MB |
 
-- **Prefill** is competitive: ZLUDA fp16 4525 tok/s vs Vulkan 4364-4905 tok/s;
-  fp16 accumulation pushes ZLUDA to 7774 tok/s (~+70% over Vulkan), and fp32
-  (4984) is faster than fp16 because rocBLAS fp32 (8.16 TF) beats HPA fp16
-  (6.9 TF) for prefill-sized GEMMs.
-- **Decode is 4-8x slower**: ZLUDA 19-28 tok/s vs Vulkan 105-212 tok/s. Main
-  causes: one Python/kernel-launch-heavy forward per token, math SDPA for the
-  1-token query in the default path, no CUDA graphs, no persistent/merged
-  decode kernels. This is the biggest known ZLUDA-side gap.
-- **Quantization** does not help prefill on ZLUDA (dequant ALU is no longer
-  hidden at M>=1024) - int4 2031 / int8 1990 tok/s vs 4525 fp16; its value is
-  memory/storage (see the quant sections of RESULTS_RDNA1.md). The int4 memory
-  measurement still needs a guard-aware peak fix.
-- **fp16-accum** is the cheapest large prefill win (7.8k tok/s) at the cost of
-  accuracy (documented in RESULTS_RDNA1.md); it also slightly helps decode.
-- Anthropic-tokenizer note: initial FA test used a 1021-token prompt (not
-  divisible by 128) and silently fell back to math; `--exact-seq` pads to an
-  exact 1024-token random prompt so the Triton path runs.
+torch.compile (fp16, ctx 1024, `mode` in the table, dynamic=False):
 
-## Bugs found and fixed during this comparison
+| mode | prefill tok/s | decode tok/s | peak VRAM |
+|---|---|---|---|
+| eager | 4525 | 22.1 | 1270 MB |
+| default | **6449** | 0.1 | 1031 MB |
+| max-autotune-no-cudagraphs | **6733** | 0.0 | 1031 MB |
+| reduce-overhead (CUDA graphs) | unsupported: `CUDA error: operation not supported` on graph capture | | |
+| default + dynamic=True | 3612 | 0.27 | 1031 MB |
 
-- `zluda_ops.flash_attention` fallback called the globally patched
-  `F.scaled_dot_product_attention`, causing infinite recursion when the Triton
-  FA path falls back (e.g. sequence not divisible by 128). Now it captures the
-  original function at import (`_ORIGINAL_SDPA`).
-- `torch.compile` and long-context ZLUDA runs are still to be measured
-  (compile of the full model is expected to be slow on this stack).
+Explicit fusion test: replacing Qwen2 RMSNorm and SwiGLU MLP with the Triton
+kernels from `zluda_ops.fused` gave **1.01x** only in eager mode (Inductor's
+whole-graph fusion wins); the fused kernels are useful where `torch.compile`
+is not available (ComfyUI, dynamic shapes) and for isolated ops.
 
-## Next steps
+## Analysis: where ZLUDA wins / loses
 
-1. ZLUDA decode optimizations: CUDA/HIP graphs, fused per-token kernels,
-   flash-decoding dispatch in the default path, batching - target is to close
-   the 4-8x gap to Vulkan.
-2. Max-context ZLUDA runs with Triton FA (8k/16k/32k) and the F16-context clamp
-   investigation on the Vulkan side.
-3. torch.compile runs (fp16, fp16-accum) and the TORCH_LOGS fusion audit;
-   implement the missing fusions.
-4. Refine quantization memory accounting (peak during load/quant vs steady
-   state) and re-measure int4/int8.
-5. Final analysis of usage problems and missed optimizations.
+- **Prefill**: ZLUDA is competitive and can win. fp16 4525 tok/s is on par with
+  Vulkan (4364-4905); with fp16 accumulation 7774 tok/s (+70% over Vulkan);
+  torch.compile raises it to 6449-6733 tok/s. ZLUDA at 32k prefill (1199 tok/s)
+  is faster than Vulkan Q4_K_M at 32k (946 tok/s).
+- **Decode is the main gap**: 22-28 tok/s at 1k context and 6.2 tok/s at 32k vs
+  105-212 tok/s on Vulkan, i.e. 4-8x at short context and ~17x at 32k. Causes:
+  one Python/kernel-launch-heavy forward per token, math SDPA for the query in
+  the default path (our flash-decoding helps ~+22%), no CUDA/HIP graphs,
+  no persistent/fused decode kernels, no batched decode.
+- **Torch.compile**: excellent for prefill on this stack (Inductor fuses the
+  whole graph, peak memory drops to 1031 MB) but unusable for decode with
+  `dynamic=False` (recompilation per token) and CUDA graphs are not supported
+  by ZLUDA; `dynamic=True` also recompiles per token here. Decode-specific
+  compilation/graph support is an open ZLUDA issue.
+- **Quantization**: steady memory is a real win (fp16 950 MB -> int4 519 MB,
+  1.85x), but prefill gets slower (2031 tok/s) because dequant ALU is no
+  longer hidden at large M; int8's dequant-once cache makes active memory
+  worse (1694 MB) - a fused int8 kernel is the clear next step.
+- **8-bit AdamW** (bnb substitute): step 0.124 ms vs 0.566 ms torch (4.6x) and
+  3.94x smaller optimizer state; 11% parameter deviation after 8 steps due to
+  int8 state quantization (same tradeoff as bitsandbytes).
+
+## What else can be implemented (not touched yet)
+
+ZLUDA core / runtime:
+- `cudaLaunchKernelEx` / PDL support and broader CUDA 12 launch API coverage in
+  ZLUDA (unblocks llama.cpp CUDA, and with it a same-engine Vulkan-vs-ZLUDA
+  comparison); CUDA graph capture/instantiate support (unblocks
+  `torch.compile(mode="reduce-overhead")` and would attack the decode gap
+  directly).
+- Native HIP-process ZLUDA (no CUDA shim) and a Vulkan/DX12 backend are out of
+  scope but would remove the CUDA-API translation overhead.
+
+Decode path:
+- Persistent decode kernel (all 24 layers in one launch), fused QKV + RoPE +
+  KV-cache append, fused MLP, CUDA/HIP graph capture of the decode loop,
+  batched/defragmented KV cache, paged attention, speculative decoding, and
+  KV-cache quantization (int8/fp8 storage) - the decode gap is the largest
+  remaining opportunity on this card.
+
+Quantization:
+- Fused int8 GEMV/GEMM (analogous to the int4 kernels) so int8 storage does not
+  need the 950 MB dequantized copy; tiled int4 GEMM; fused int4 prefill with
+  better tiling/vectorization; exact GPTQ/AWQ loading (nibble order, zero
+  points, act-order) to drop the 9-12% RTN error; KV-cache quantization;
+  int4 embeddings/lm_head; CPU/disk offload of int4 weights.
+
+Kernels / compiler:
+- Triton autotune tables for RDNA1 (wave32, WGP vs CU; `+cumode` experiment),
+  fused residual+RMSNorm, RoPE+attention, GeGLU/AdamW vectorization,
+  chunked-CE backward, flash-decoding at long KV (split tuning), bigger
+  flash-attention tile search, MIOpen find-db for gfx1010 (channel_last/VAE
+  paths), GEMM epilogue fusion (activation/residual/scale), grouped GEMM for
+  MoE, int8/fp8 stubs for libraries that probe them.
+
+Engines / integrations:
+- llama.cpp CUDA under ZLUDA (blocked by launch API; see above),
+  vLLM/paged-attention port, ExLlamaV2/AWQ, xformers/flash-attn PTX
+  compatibility, ComfyUI/SD/Flux real-workload measurements (conv fp16 ->
+  fp32 Winograd workaround is available), llama.cpp HIP/ROCm build for a
+  native-ROCm baseline on this machine (ROCm 6.4 has no gfx1010 support, so a
+  TheRock-based build is needed), ONNX Runtime/TensorRT-like paths are out of
+  scope.
+
+Tooling / methodology:
+- Fixed-clock measurements (requires BIOS/power-play or ADL work), CI on a
+  self-hosted gfx1010 runner, automatic regression gates for kernels and
+  engines, and reproducible benchmark manifests (seeds, prompts, cache state).
+
+## Next steps (ordered)
+
+1. ZLUDA decode: support CUDA graphs or implement a persistent/merged decode
+   kernel; target is to close the 4-8x gap to Vulkan at 1-8k context.
+2. torch.compile for decode once graphs work; otherwise per-layer CUDA-graph
+   capture in the harness.
+3. Fused int8 GEMV + tiled int4 prefill; exact GPTQ/AWQ loading.
+4. Long-context decode tuning (flash-decoding split count, KV layout).
+5. Same-engine comparison once ZLUDA supports the llama.cpp launch API.

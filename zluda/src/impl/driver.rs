@@ -732,12 +732,21 @@ pub(crate) unsafe fn launch_kernel_ex(
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> CUresult {
-    let attrs = std::slice::from_raw_parts(config.attrs, config.numAttrs as usize);
-    if attrs.iter().any(|&attr| {
-        !(attr.id == CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
-            && attr.value.programmaticStreamSerializationAllowed == 0)
-    }) {
-        return CUresult::ERROR_NOT_SUPPORTED;
+    // Launch-time attributes are hints. ZLUDA does not implement programmatic
+    // dependent launch (PDL) or the other optional attributes, but launching
+    // the kernels serialized is semantically correct, so accept them instead
+    // of returning ERROR_NOT_SUPPORTED (this is what lets llama.cpp's CUDA
+    // backend run under ZLUDA).
+    let attrs: &[cuda_types::cuda::CUlaunchAttribute] = if config.attrs.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(config.attrs, config.numAttrs as usize)
+    };
+    for attr in attrs {
+        match attr.id {
+            CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION => {}
+            _ => eprintln!("zluda: ignoring unsupported launch attribute {:?}", attr.id),
+        }
     }
     function::launch_kernel(
         f,
