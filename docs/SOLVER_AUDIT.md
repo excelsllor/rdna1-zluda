@@ -113,3 +113,23 @@ while small shapes automatically stay on the fp16 path.
 Remaining open items: int4 decoder-shaped GEMV sweep, fused int8 GEMV, and the
 non-LLM library paths (rocFFT/rocSPARSE/RNG) which are not exercised by the
 current workloads.
+
+## 7. int4 quantization solver (decode shapes)
+
+Two available solvers: the fused int4 GEMV (dequantises inside the kernel, 4x
+weight memory saving) and dequant-once to fp16 followed by the tuned fp16 GEMV
+(2x memory for the cached copy). M=1, group 64, fp16 activations:
+
+| shape (N x K) | fused int4 | dequant-once + tuned GEMV | winner |
+|---|---|---|---|
+| 896 x 896 (qkv/o) | 62.8 us | 42.8 us | dequant |
+| 4864 x 896 (gate/up) | 120.3 us | 70.1 us | dequant |
+| 896 x 4864 (down) | 86.7 us | 74.7 us | dequant |
+| 151936 x 896 (lm_head) | 2329 us | 831.5 us | dequant (2.8x) |
+
+Verdict: for **compute** at decode the dequant-once + tuned fp16 GEMV is optimal
+(up to 2.8x faster); the fused int4 kernel is the **memory**-optimal choice
+(4x less weight storage). Recommendation: keep fused int4 as the default when
+VRAM-bound, and expose the dequant-once path when throughput matters and the
+2x fp16 copy fits. For prefill (M>=32) the fused tiled int4 GEMM remains faster
+than dequant-once (measured earlier: 0.61-2.06 ms vs 2.67-3.79 ms at 4096).
