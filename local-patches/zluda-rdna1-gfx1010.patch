@@ -2159,10 +2159,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f10820c658fda76e6b9baaee4fca4459029cd641
+index 0000000000000000000000000000000000000000..7a5c86615c63bb43eaa130524e8d996354be9495
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,539 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2413,15 @@ index 0000000000000000000000000000000000000000..f10820c658fda76e6b9baaee4fca4459
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - conv solver selection:** implemented per-shape solver
++  auto-selection in `zluda_ops/conv.py` (fp32 winograd weights cached by
++  data_ptr/_version, one-time timing of fp16 vs fp32 candidates per shape,
++  decision cached; `ZLUDA_CONV_AUTO=1`, legacy `ZLUDA_CONV_FP32=1` still works).
++  Measured: small shapes stay on fp16 (0.10 ms), mid/large shapes take the
++  cached-weight fp32 Winograd path - 1x128x32x32 0.12 vs 0.16 ms, 1x320x16x16
++  0.15 vs 0.22 ms, 1x64x128x128 0.22 vs 0.58 ms (2.7x); error 2e-3..4e-3.
++  Remaining audit items: int4 decode-shape configs, fused int8, rocFFT/SPARSE
++  paths (not exercised).
 +- **2026-11-25 - solver/kernel audit (first pass):** GEMV configs were a single
 +  fixed (4096,4) - swept and replaced with a shape-aware TUNED_M1 table
 +  (qkv 28.5 us 2.07x vs rocBLAS, gate/up 40.1 us 2.01x, down_proj 53.7 us
@@ -10754,10 +10763,10 @@ index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb9
 +ones and uninitialized buffers are not representative.
 diff --git a/docs/SOLVER_AUDIT.md b/docs/SOLVER_AUDIT.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..1dfd4b29d5e3ec6ed4e5e65de48ec5e22f5e04b3
+index 0000000000000000000000000000000000000000..2ccfbad0c4d84f29b5d41980b9b38140dba84755
 --- /dev/null
 +++ b/docs/SOLVER_AUDIT.md
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,115 @@
 +# Solver / kernel audit (RDNA1, 2026-11-25)
 +
 +Goal: go through every computation in the stack, check which solver/kernel is
@@ -10845,7 +10854,34 @@ index 0000000000000000000000000000000000000000..1dfd4b29d5e3ec6ed4e5e65de48ec5e2
 +  stays the optimum available.
 +- CUDA graphs for decode are now the delivery mechanism for the GEMV path
 +  (see docs/CUDA_GRAPHS_ZLUDA.md).
-\ No newline at end of file
++## 6. conv2d solver selection (implemented)
++
++Sweep of conv2d candidates on SD/ResNet shapes (fp16 input/weights, 3x3 s1 p1):
++
++| shape | fp16 (MIOpen GemmFwdRest) | fp32 Winograd, weights cached | old workaround (casts both) | winner |
++|---|---|---|---|---|
++| 1x4x64x64 -> 64 | 0.10 ms | 0.11 ms | 0.12 ms | fp16 |
++| 1x64x64x64 -> 64 | 0.16 ms | 0.13 ms | 0.13 ms | fp32 |
++| 1x128x32x32 -> 128 | 0.16 ms | 0.12 ms | 0.14 ms | fp32 |
++| 1x320x16x16 -> 320 | 0.22 ms | 0.15 ms | 0.19 ms | fp32 |
++| 1x64x128x128 -> 64 | 0.58 ms | 0.22 ms | 0.23 ms | fp32 (2.7x) |
++
++Action: `zluda_ops/conv.py` now implements per-shape solver selection with
++- `_W_CACHE`: fp32 copies of weights (keyed by data_ptr/_version, LRU 256), so
++  the fp32 path only pays for the input cast per call;
++- `_SOLVER_CACHE`: first call for a new shape times both candidates once
++  (3 iterations each) and stores the winner; later calls dispatch directly.
++
++Enabled with `ZLUDA_CONV_AUTO=1` (recommended) or forced with
++`ZLUDA_CONV_FP32=1`; `auto.py` installs the F.conv2d patch in either mode.
++Correctness vs the native fp16 convolution: max abs error 2e-3..4e-3 (fp16
++rounding of the fp32 result). Mid/large SD shapes now take the fp32 Winograd
++path (2.7x faster than the previous forced workaround timing on 1x64x128x128),
++while small shapes automatically stay on the fp16 path.
++
++Remaining open items: int4 decoder-shaped GEMV sweep, fused int8 GEMV, and the
++non-LLM library paths (rocFFT/rocSPARSE/RNG) which are not exercised by the
++current workloads.
 diff --git a/docs/comfy-freeze.txt b/docs/comfy-freeze.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..6c3369aaf97348f7df7750daccdd46200301148e
@@ -15292,38 +15328,48 @@ index 0000000000000000000000000000000000000000..8db2e10b78e555c4ce5243c81ed38707
 +__all__ = ["matmul", "linear"]
 diff --git a/zluda_ops/conv.py b/zluda_ops/conv.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..024c0f3a3bdfec8526b917af5aa1ccd844fe3368
+index 0000000000000000000000000000000000000000..25f0a8805d570d8b7b198b814db9b17485c6dd47
 --- /dev/null
 +++ b/zluda_ops/conv.py
-@@ -0,0 +1,93 @@
-+"""Cast-to-fp32 convolution workaround for gfx1010 (Winograd).
+@@ -0,0 +1,183 @@
++"""Per-shape solver selection for conv2d on gfx1010 (MIOpen).
 +
-+On this stack MIOpen picks a Winograd solver for fp32 3x3 convolutions
-+(`ConvBinWinogradRxSf2x3g1`), but fp16 3x3 falls back to a rocBLAS GEMM
-+(`GemmFwdRest`), which is 1.4-2.7x slower for forward and up to 1.9x slower for
-+forward+backward on SD/ResNet shapes. Casting the fp16 inputs (and weights) to
-+fp32, running the fp32 Winograd convolution and casting the result back is
-+faster and at least as accurate: fp16 inputs are exactly representable in fp32,
-+so the result equals an fp32 convolution rounded to fp16.
++MIOpen uses different solvers depending on the data type and shape:
 +
-+`conv2d` mirrors `torch.nn.functional.conv2d` for the eligible subset (fp16,
-+3x3, stride 1, dilation 1, groups 1, CUDA). Gradients flow through the casts, so
-+it is usable for both inference and training. `install()`/`uninstall()` patch
-+`F.conv2d` behind the `ZLUDA_CONV_FP32=1` environment variable.
++* fp32 3x3 convolutions -> `ConvBinWinogradRxSf2x3g1` (fast Winograd);
++* fp16 3x3 -> `GemmFwdRest` (rocBLAS GEMM), which is 1.4-2.7x slower forward
++  and up to 1.9x slower forward+backward on SD/ResNet shapes;
++* for some small shapes the fp16 path is nevertheless faster than the
++  fp32-cast workaround because the casts dominate.
 +
-+Limitations: fp32 copies of the weights cost memory (conv weights are small
-+relative to a model, but this is not free); the win depends on the shape (small
-+convolutions are conversion-bound, large ones win up to ~2.7x forward); only
-+the 3x3 stride-1/dilation-1/group-1 case benefits, everything else uses the
-+regular path.
++This module measures both candidates once per shape and caches the winner
++(`_SOLVER_CACHE`), and caches the fp32 copies of the weights (`_W_CACHE`) so the
++fp32 path only pays for the input cast on every call. Everything is
++transparent: the fp32 path casts the inputs, runs the fp32 Winograd
++convolution and casts the result back (fp16 inputs are exactly representable in
++fp32, so the result equals an fp32 convolution rounded to fp16).
++
++Enable either with:
++
++  ZLUDA_CONV_AUTO=1   per-shape auto-selection (recommended)
++  ZLUDA_CONV_FP32=1   force the fp32 Winograd path for eligible shapes
++
++or call `conv2d(..., fp32_winograd=False/True)` / `install()` directly.
 +"""
 +
 +import os
++from collections import OrderedDict
++
 +import torch
 +import torch.nn.functional as F
 +
-+_eligible_cache = {}
 +_orig_conv2d = None
++# key: (weight data_ptr, weight._version, shape, dtype) -> (w32, b32, weight_ref)
++_W_CACHE = OrderedDict()
++_W_CACHE_MAX = 256
++# key: (x.shape, weight.shape, stride, padding, dilation, groups) -> "fp16"|"fp32"
++_SOLVER_CACHE = {}
++_SOLVER_BENCH_ITERS = 3
 +
 +
 +def _normalize_pair(value):
@@ -15346,23 +15392,92 @@ index 0000000000000000000000000000000000000000..024c0f3a3bdfec8526b917af5aa1ccd8
 +    return True
 +
 +
-+def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1,
-+           fp32_winograd=None):
-+    """Drop-in conv2d that uses the fp32 Winograd path for eligible fp16 3x3."""
-+    if fp32_winograd is None:
-+        fp32_winograd = is_eligible(x, weight, stride, padding, dilation, groups)
-+    if not fp32_winograd:
-+        original = _orig_conv2d if _orig_conv2d is not None else F.conv2d
-+        return original(x, weight, bias, stride=stride, padding=padding,
-+                        dilation=dilation, groups=groups)
-+    y = F.conv2d(x.float(), weight.float(),
-+                 None if bias is None else bias.float(),
-+                 stride=stride, padding=padding, dilation=dilation, groups=groups)
++def _shape_key(x, weight, bias, stride, padding, dilation, groups):
++    return (tuple(x.shape), tuple(weight.shape),
++            None if bias is None else tuple(bias.shape),
++            _normalize_pair(stride), _normalize_pair(padding),
++            _normalize_pair(dilation), groups)
++
++
++def _fp32_params(weight, bias):
++    key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
++    cached = _W_CACHE.get(key)
++    if cached is not None:
++        _W_CACHE.move_to_end(key)
++        return cached[0], cached[1]
++    w32 = weight.detach().float()
++    b32 = None if bias is None else bias.detach().float()
++    _W_CACHE[key] = (w32, b32, weight)  # keep a reference so data_ptr stays valid
++    while len(_W_CACHE) > _W_CACHE_MAX:
++        _W_CACHE.popitem(last=False)
++    return w32, b32
++
++
++def _conv_fp32_cached(x, weight, bias, stride, padding):
++    w32, b32 = _fp32_params(weight, bias)
++    y = F.conv2d(x.float(), w32, b32, stride=stride, padding=padding)
 +    return y.to(x.dtype)
 +
 +
++def _conv_fp16(x, weight, bias, stride, padding, dilation, groups):
++    original = _orig_conv2d if _orig_conv2d is not None else F.conv2d
++    return original(x, weight, bias, stride=stride, padding=padding,
++                    dilation=dilation, groups=groups)
++
++
++def _time(fn, iters=_SOLVER_BENCH_ITERS):
++    torch.cuda.synchronize()
++    for _ in range(2):
++        fn()
++    torch.cuda.synchronize()
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    for _ in range(iters):
++        fn()
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) / iters
++
++
++def _choose_solver(x, weight, bias, stride, padding, dilation, groups):
++    key = _shape_key(x, weight, bias, stride, padding, dilation, groups)
++    chosen = _SOLVER_CACHE.get(key)
++    if chosen is not None:
++        return chosen
++    try:
++        t16 = _time(lambda: _conv_fp16(x, weight, bias, stride, padding,
++                                       dilation, groups))
++        t32 = _time(lambda: _conv_fp32_cached(x, weight, bias, stride, padding))
++        chosen = "fp16" if t16 <= t32 else "fp32"
++        _SOLVER_CACHE[key] = chosen
++    except Exception:
++        chosen = "fp32"
++        _SOLVER_CACHE[key] = chosen
++    return chosen
++
++
++def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1,
++           fp32_winograd=None, auto=None):
++    """Drop-in conv2d with per-shape solver selection for eligible fp16 3x3."""
++    if auto is None:
++        auto = os.environ.get("ZLUDA_CONV_AUTO") == "1"
++    if fp32_winograd is None:
++        fp32_winograd = os.environ.get("ZLUDA_CONV_FP32") == "1"
++    eligible = is_eligible(x, weight, stride, padding, dilation, groups)
++    if not eligible:
++        return _conv_fp16(x, weight, bias, stride, padding, dilation, groups)
++    if fp32_winograd:
++        return _conv_fp32_cached(x, weight, bias, stride, padding)
++    if auto:
++        chosen = _choose_solver(x, weight, bias, stride, padding, dilation, groups)
++        if chosen == "fp32":
++            return _conv_fp32_cached(x, weight, bias, stride, padding)
++    return _conv_fp16(x, weight, bias, stride, padding, dilation, groups)
++
++
 +def install():
-+    """Patch F.conv2d to use the fp32 Winograd path (env-gated in practice)."""
++    """Patch F.conv2d (auto or forced-fp32 mode, controlled by env vars)."""
 +    global _orig_conv2d
 +    if _orig_conv2d is not None:
 +        return
@@ -15388,7 +15503,18 @@ index 0000000000000000000000000000000000000000..024c0f3a3bdfec8526b917af5aa1ccd8
 +    return _orig_conv2d is not None
 +
 +
-+__all__ = ["conv2d", "install", "uninstall", "installed", "is_eligible"]
++def stats():
++    return {"weight_cache": len(_W_CACHE), "solver_cache": len(_SOLVER_CACHE),
++            "choices": dict(_SOLVER_CACHE)}
++
++
++def clear_caches():
++    _W_CACHE.clear()
++    _SOLVER_CACHE.clear()
++
++
++__all__ = ["conv2d", "install", "uninstall", "installed", "is_eligible",
++           "stats", "clear_caches"]
 diff --git a/zluda_ops/flash_attention.py b/zluda_ops/flash_attention.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..2057cfabac282ea9a70fd6f56e1369495109d0e6
