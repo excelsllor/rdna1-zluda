@@ -1049,10 +1049,10 @@ index 933147055e77a5c8a4853830cf401e917237285d..8daf61ed2a625b91e2e5adaed8a8cb46
 +MIT, matching upstream.
 diff --git a/RESULTS_RDNA1.md b/RESULTS_RDNA1.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..06664cbfb5d0260241f983e33d98abaeced2ecc9
+index 0000000000000000000000000000000000000000..7400e2696efefc3f8bc923c2d7b630c066f1ac3e
 --- /dev/null
 +++ b/RESULTS_RDNA1.md
-@@ -0,0 +1,757 @@
+@@ -0,0 +1,792 @@
 +# ZLUDA on Radeon RX 5700 XT (gfx1010 / RDNA1) — build and benchmark results
 +
 +Before/after summary: [`BEFORE_AFTER.md`](BEFORE_AFTER.md)
@@ -1810,12 +1810,47 @@ index 0000000000000000000000000000000000000000..06664cbfb5d0260241f983e33d98abae
 +and the cold-start cost is process initialisation. The remaining conv win is
 +the dtype/solver split handled by the cast-to-fp32 workaround (previous
 +section), and possibly the missing channels_last path (measured unusable).
++
++## Fused kernels extension: LayerNorm, GeGLU, fused AdamW (2026-11-25)
++
++Added to `zluda_ops/fused.py` (see the earlier P1-5 section for RMSNorm/RoPE/
++SwiGLU/softmax): exact-erf GeGLU fwd+bwd, LayerNorm fwd+bwd and an in-place
++fused AdamW step. `bench/fused.py` covers all cases. Measured after a clean
++idle-GPU window (fp16, VRAM 85%):
++
++| op | shape | fused | torch eager | speedup |
++|---|---|---|---|---|
++| RMSNorm fwd | 8192x4096 | 0.402 ms | 3.787 ms | **9.4x** |
++| RMSNorm fwd+bwd | 8192x4096 | 4.57 ms | 13.49 ms | **2.95x** |
++| softmax | 8192x4096 | 0.371 ms | 0.870 ms | **2.3x** |
++| RoPE fwd | 1x32x2048x128 | 0.132 ms | 1.433 ms | **10.9x** |
++| RoPE fwd+bwd | 1x32x2048x128 | 0.396 ms | 3.282 ms | **8.3x** |
++| SwiGLU fwd/bwd | 8192x2048 | 0.305/0.935 ms | 0.457/1.397 ms | 1.50x/1.49x |
++| GeGLU fwd/bwd | 8192x2048 | 0.303/0.936 ms | 0.467/1.393 ms | 1.54x/1.49x |
++| LayerNorm fwd | 8192x4096 | 0.405 ms | 0.480 ms | 1.19x |
++| LayerNorm fwd+bwd | 8192x4096 | 4.10 ms | 2.15 ms | **0.53x (slower)** |
++| AdamW step | 4 Mi elements | 0.331 ms | 1.130 ms | **3.4x**, param diff 3e-8 |
++| chunked CE | 4096x16384 | 6.6 ms / 736 MB | 3.5 ms / 1024 MB | 0.52x (memory **-28%**) |
++
++Notes:
++
++- **LayerNorm**: the forward kernel wins slightly, but training is slower than
++  torch's native LayerNorm (the atomic weight/bias gradients dominate), so use
++  `torch.nn.LayerNorm` for training; the Triton version is useful only for
++  inference-style forward-only paths.
++- **Chunked CE** remains a memory-only option (-28% peak memory, slower).
++- GeGLU uses `libdevice.erf` (exact GELU, matches `F.gelu`), not the tanh
++  approximation.
++- Numbers vary run-to-run on this card (clocks cannot be fixed); the table is
++  from a verified idle-GPU window. During this session a concurrent external
++  benchmark had to be stopped and the GPU/driver recovered before the final
++  measurement — benchmarks must not share the GPU with other jobs.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..9c581a92667c7a6408f941bcc95525ebacb07148
+index 0000000000000000000000000000000000000000..27581eaa88c88a1ff471661823c9c94018a4c217
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,371 @@
+@@ -0,0 +1,379 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -1878,7 +1913,7 @@ index 0000000000000000000000000000000000000000..9c581a92667c7a6408f941bcc95525eb
 +| 1 — GEMM | **PARTIAL** | baseline, bf16, HH done; SS/HPA, M16/32, fused epilogues open |
 +| 2 — Attention | **PARTIAL** | masks/dropout/window in Triton, varlen per-sequence, flash-decoding done; fused decode/backward integration open |
 +| 3 — Quantization | **PARTIAL** | groupwise int4/int8 storage + fused int4 dequant-GEMV (`zluda_ops/quant.py`); exact GPTQ/AWQ loading and prefill GEMM open; no int8 compute |
-+| 4 — Fused kernels | **PARTIAL** | Triton RMSNorm/RoPE/SwiGLU/softmax implemented and faster (`zluda_ops/fused.py`); chunked CE is memory-only (slower); LayerNorm/GeGLU/AdamW/sampling open |
++| 4 — Fused kernels | **PARTIAL** | Triton RMSNorm/RoPE/SwiGLU/GeGLU/softmax/AdamW implemented and faster (`zluda_ops/fused.py`); LayerNorm fwd-only win (training slower); chunked CE memory-only; sampling open |
 +| 5 — Diffusion/MIOpen | **PARTIAL** | conv audited (`bench/conv.py`): NCHW-only, GEMM-fallback, fp16 slower; MIOpen perf-db for gfx1010 missing; channels_last/VAE/auto-selection open |
 +| 6 — Runtime/memory | **PARTIAL** | ComfyUI workaround; allocator/graphs/offload open |
 +| 7 — Compiler/LLVM/Triton | **OPEN** | WGP/CU and autotune not started |
@@ -2066,6 +2101,14 @@ index 0000000000000000000000000000000000000000..9c581a92667c7a6408f941bcc95525eb
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-25 - fused kernels extension:** added exact-erf GeGLU fwd+bwd,
++  LayerNorm fwd+bwd and an in-place fused AdamW to `zluda_ops/fused.py`. Clean
++  measurements: RMSNorm 9.4x fwd / 2.95x fwd+bwd, softmax 2.3x, RoPE 10.9x/8.3x,
++  SwiGLU 1.5x, GeGLU 1.54x/1.49x, AdamW **3.4x** (param diff 3e-8), LayerNorm
++  forward 1.19x but training 0.53x (torch native LayerNorm wins because of the
++  atomic gradients), chunked CE memory -28% but slower. GPU benchmarks were
++  re-run in a verified idle window after a concurrent external job wedged the
++  driver; results in RESULTS_RDNA1.md.
 +- **2026-11-25 - MIOpen find-db/solver:** no system find-db for gfx1010 is
 +  shipped, but the user find-db (`~/.miopen`) is populated automatically and used
 +  (~4.5 ms per new shape). The ~1.2 s first-convolution cost is process
@@ -3740,10 +3783,10 @@ index 0000000000000000000000000000000000000000..bfe293b2fb732c81eb04779c91cff2f3
 +    main()
 diff --git a/bench/fused.py b/bench/fused.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..dded6067b2b5433bae115b1c86cdac06edf2cbe4
+index 0000000000000000000000000000000000000000..e4eb96755619405f54c944bbfc192a9cc57b23de
 --- /dev/null
 +++ b/bench/fused.py
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,342 @@
 +"""Benchmark fused Triton kernels (RMSNorm/RoPE/SwiGLU/softmax/chunked CE).
 +
 +Compares the Triton implementations in zluda_ops.fused with torch eager
@@ -3959,6 +4002,105 @@ index 0000000000000000000000000000000000000000..dded6067b2b5433bae115b1c86cdac06
 +            "err": err, "grad_err": gerr}
 +
 +
++
++def layer_norm_case(rows, n, device="cuda"):
++    _setup()
++    x = torch.randn(rows, n, device=device, dtype=torch.float16, requires_grad=True)
++    w = torch.randn(n, device=device, dtype=torch.float16, requires_grad=True)
++    b = torch.randn(n, device=device, dtype=torch.float16, requires_grad=True)
++    do = torch.randn_like(x)
++    eps = 1e-5
++    out = fused.layer_norm(x, w, b, eps)
++    ref = F.layer_norm(x, (n,), w, b, eps)
++    ferr = (out.float() - ref.float()).abs().max().item()
++    out.backward(do, retain_graph=True)
++    g1 = [t.grad.clone() for t in (x, w, b)]
++    for t in (x, w, b):
++        t.grad = None
++    ref.backward(do)
++    gerr = max((a - t.grad).abs().max().item() for a, t in zip(g1, (x, w, b)))
++    for t in (x, w, b):
++        t.grad = None
++    fm = bench_median(lambda: fused.layer_norm(x, w, b, eps), rounds=3, iters=5)
++    rm = bench_median(lambda: F.layer_norm(x, (n,), w, b, eps), rounds=3, iters=5)
++    def fb_fused():
++        y = fused.layer_norm(x, w, b, eps)
++        y.backward(do)
++        x.grad = w.grad = b.grad = None
++    def fb_ref():
++        y = F.layer_norm(x, (n,), w, b, eps)
++        y.backward(do)
++        x.grad = w.grad = b.grad = None
++    fbm = bench_median(fb_fused, rounds=3, iters=3)
++    rbm = bench_median(fb_ref, rounds=3, iters=3)
++    print(f"layer_norm {rows}x{n}: fwd {fm:.3f} vs {rm:.3f} ms ({rm/fm:.2f}x) | "
++          f"fwd+bwd {fbm:.3f} vs {rbm:.3f} ms ({rbm/fbm:.2f}x) | err {ferr:.5f}/{gerr:.4f}", flush=True)
++    return {"rows": rows, "n": n, "fwd_ms": fm, "ref_fwd_ms": rm, "fwd_bwd_ms": fbm,
++            "ref_fwd_bwd_ms": rbm, "speedup_fwd": rm / fm, "speedup_fwd_bwd": rbm / fbm,
++            "fwd_err": ferr, "grad_err": gerr}
++
++
++def geglu_case(rows, n, device="cuda"):
++    _setup()
++    g = torch.randn(rows, n, device=device, dtype=torch.float16, requires_grad=True)
++    u = torch.randn(rows, n, device=device, dtype=torch.float16, requires_grad=True)
++    do = torch.randn_like(g)
++    out = fused.geglu(g, u)
++    ref = F.gelu(g) * u
++    ferr = (out.float() - ref.float()).abs().max().item()
++    out.backward(do, retain_graph=True)
++    g1, u1 = g.grad.clone(), u.grad.clone()
++    g.grad = u.grad = None
++    ref.backward(do)
++    gerr = max((g1 - g.grad).abs().max().item(), (u1 - u.grad).abs().max().item())
++    g.grad = u.grad = None
++    fm = bench_median(lambda: fused.geglu(g, u), rounds=3, iters=5)
++    rm = bench_median(lambda: F.gelu(g) * u, rounds=3, iters=5)
++    def fb_fused():
++        y = fused.geglu(g, u)
++        y.backward(do)
++        g.grad = u.grad = None
++    def fb_ref():
++        y = F.gelu(g) * u
++        y.backward(do)
++        g.grad = u.grad = None
++    fbm = bench_median(fb_fused, rounds=3, iters=3)
++    rbm = bench_median(fb_ref, rounds=3, iters=3)
++    print(f"geglu {rows}x{n}: fwd {fm:.3f} vs {rm:.3f} ms ({rm/fm:.2f}x) | "
++          f"fwd+bwd {fbm:.3f} vs {rbm:.3f} ms ({rbm/fbm:.2f}x) | err {ferr:.5f}/{gerr:.5f}", flush=True)
++    return {"rows": rows, "n": n, "fwd_ms": fm, "ref_fwd_ms": rm, "fwd_bwd_ms": fbm,
++            "ref_fwd_bwd_ms": rbm, "speedup_fwd": rm / fm, "speedup_fwd_bwd": rbm / fbm,
++            "fwd_err": ferr, "grad_err": gerr}
++
++
++def adamw_case(num, device="cuda"):
++    torch.manual_seed(0)
++    p = torch.randn(num, device=device) * 0.1
++    grad = torch.randn(num, device=device) * 0.01
++    m = torch.zeros(num, device=device)
++    v = torch.zeros(num, device=device)
++    p_ref = p.clone()
++    m_ref = torch.zeros_like(m)
++    v_ref = torch.zeros_like(v)
++    lr, b1, b2, eps, wd = 1e-3, 0.9, 0.999, 1e-8, 0.01
++    fused.adamw_step_(p, grad, m, v, lr=lr, beta1=b1, beta2=b2, eps=eps,
++                      weight_decay=wd, step=1)
++    def torch_step():
++        p_ref.mul_(1 - lr * wd)
++        m_ref.mul_(b1).add_(grad, alpha=1 - b1)
++        v_ref.mul_(b2).addcmul_(grad, grad, value=1 - b2)
++        p_ref.addcdiv_(m_ref / (1 - b1), (v_ref / (1 - b2)).sqrt().add_(eps), value=-lr)
++    torch_step()
++    diff = (p - p_ref).abs().max().item()
++    fm = bench_median(lambda: fused.adamw_step_(p, grad, m, v, lr=lr, beta1=b1,
++                                                beta2=b2, eps=eps, weight_decay=wd,
++                                                step=1), rounds=3, iters=10)
++    tm = bench_median(torch_step, rounds=3, iters=10)
++    print(f"adamw {num} elems: fused {fm:.3f} vs torch {tm:.3f} ms ({tm/fm:.2f}x) "
++          f"| max param diff {diff:.2e}", flush=True)
++    return {"num": num, "fused_ms": fm, "torch_ms": tm, "speedup": tm / fm,
++            "param_diff": diff}
++
 +def main():
 +    parser = argparse.ArgumentParser(description=__doc__)
 +    parser.add_argument("--quick", action="store_true")
@@ -3976,6 +4118,9 @@ index 0000000000000000000000000000000000000000..dded6067b2b5433bae115b1c86cdac06
 +        "rope": rope_case(1, 8, 1024, 128) if args.quick else rope_case(1, 32, 2048, 128),
 +        "swiglu": swiglu_case(rows, n // 2),
 +        "chunked_ce": ce_case(1024, 8192, 256) if args.quick else ce_case(4096, 16384, 512),
++        "layer_norm": layer_norm_case(rows, n),
++        "geglu": geglu_case(rows, n // 2),
++        "adamw": adamw_case(rows * n // 8),
 +    }
 +    save_report("fused", {"cases": cases, "quick": args.quick})
 +    print("done", flush=True)
@@ -12213,10 +12358,10 @@ index 0000000000000000000000000000000000000000..a793bf1a34b95d6417bd9e74b6d109e2
 +]
 diff --git a/zluda_ops/fused.py b/zluda_ops/fused.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f1813bc9e9234bae810889fb1f2f8c95a7988306
+index 0000000000000000000000000000000000000000..f2c468916bf29529b0e9f1f0c46d54e2e16d4431
 --- /dev/null
 +++ b/zluda_ops/fused.py
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,416 @@
 +"""Fused Triton kernels for common transformer operations on gfx1010.
 +
 +Implemented (fp16 tensors, contiguous last dimension):
@@ -12236,6 +12381,7 @@ index 0000000000000000000000000000000000000000..f1813bc9e9234bae810889fb1f2f8c95
 +import torch
 +import triton
 +import triton.language as tl
++from triton.language.extra import libdevice
 +
 +
 +@triton.jit
@@ -12447,7 +12593,191 @@ index 0000000000000000000000000000000000000000..f1813bc9e9234bae810889fb1f2f8c95
 +    return total / rows
 +
 +
-+__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy"]
++
++
++@triton.jit
++def _layer_norm_fwd(X, W, B, Y, MEAN, RSTD, N: tl.constexpr, eps, BLOCK: tl.constexpr,
++                    HAS_WB: tl.constexpr):
++    row = tl.program_id(0)
++    offs = tl.arange(0, BLOCK)
++    mask = offs < N
++    x = tl.load(X + row * N + offs, mask=mask, other=0.0).to(tl.float32)
++    mean = tl.sum(x, axis=0) / N
++    xc = x - mean
++    var = tl.sum(xc * xc, axis=0) / N
++    rstd = 1.0 / tl.sqrt(var + eps)
++    if HAS_WB:
++        w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
++        b = tl.load(B + offs, mask=mask, other=0.0).to(tl.float32)
++    else:
++        w = x * 0.0 + 1.0
++        b = x * 0.0
++    tl.store(Y + row * N + offs, (xc * rstd * w + b).to(Y.dtype.element_ty), mask=mask)
++    tl.store(MEAN + row, mean)
++    tl.store(RSTD + row, rstd)
++
++
++@triton.jit
++def _layer_norm_bwd(DY, X, W, MEAN, RSTD, DX, DW, DB, N: tl.constexpr,
++                    BLOCK: tl.constexpr, HAS_WB: tl.constexpr):
++    row = tl.program_id(0)
++    offs = tl.arange(0, BLOCK)
++    mask = offs < N
++    x = tl.load(X + row * N + offs, mask=mask, other=0.0).to(tl.float32)
++    dy = tl.load(DY + row * N + offs, mask=mask, other=0.0).to(tl.float32)
++    mean = tl.load(MEAN + row)
++    rstd = tl.load(RSTD + row)
++    xhat = (x - mean) * rstd
++    if HAS_WB:
++        w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
++    else:
++        w = tl.zeros((BLOCK,), tl.float32) + 1.0
++    dxhat = dy * w
++    s1 = tl.sum(dxhat, axis=0)
++    s2 = tl.sum(dxhat * xhat, axis=0)
++    dx = rstd * (dxhat - s1 / N - xhat * s2 / N)
++    tl.store(DX + row * N + offs, dx.to(DX.dtype.element_ty), mask=mask)
++    if HAS_WB:
++        tl.atomic_add(DW + offs, dy * xhat, mask=mask)
++        tl.atomic_add(DB + offs, dy, mask=mask)
++
++
++class _LayerNorm(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, weight, bias, eps):
++        rows, n = x.reshape(-1, x.shape[-1]).shape
++        block = triton.next_power_of_2(n)
++        y = torch.empty_like(x)
++        mean = torch.empty(rows, device=x.device, dtype=torch.float32)
++        rstd = torch.empty(rows, device=x.device, dtype=torch.float32)
++        has_wb = weight is not None
++        w = weight if has_wb else x
++        b = bias if bias is not None else x
++        _layer_norm_fwd[(rows,)](x, w, b, y, mean, rstd, n, float(eps),
++                                 BLOCK=block, HAS_WB=has_wb, num_warps=4,
++                                 num_stages=1)
++        ctx.save_for_backward(x, w, mean, rstd)
++        ctx.rows, ctx.n, ctx.block, ctx.has_wb = rows, n, block, has_wb
++        ctxeps = eps
++        return y
++
++    @staticmethod
++    def backward(ctx, dy):
++        x, w, mean, rstd = ctx.saved_tensors
++        dx = torch.empty_like(x)
++        dw = torch.zeros_like(w, dtype=torch.float32)
++        db = torch.zeros_like(w, dtype=torch.float32)
++        _layer_norm_bwd[(ctx.rows,)](dy, x, w, mean, rstd, dx, dw, db, ctx.n,
++                                     BLOCK=ctx.block, HAS_WB=ctx.has_wb,
++                                     num_warps=4, num_stages=1)
++        return dx, dw.to(w.dtype), db.to(w.dtype), None
++
++
++def layer_norm(x, weight=None, bias=None, eps=1e-5):
++    if x.dtype != torch.float16 or not x.is_contiguous() or not x.is_cuda:
++        raise NotImplementedError("layer_norm supports contiguous fp16 CUDA tensors")
++    return _LayerNorm.apply(x, weight, bias, eps)
++
++
++@triton.jit
++def _geglu_fwd(G, U, Y, NUM, BLOCK: tl.constexpr):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < NUM
++    g = tl.load(G + offs, mask=mask, other=0.0).to(tl.float32)
++    u = tl.load(U + offs, mask=mask, other=0.0).to(tl.float32)
++    gelu = 0.5 * g * (1.0 + libdevice.erf(g * 0.7071067811865476))
++    tl.store(Y + offs, (gelu * u).to(Y.dtype.element_ty), mask=mask)
++
++
++@triton.jit
++def _geglu_bwd(DY, G, U, DG, DU, NUM, BLOCK: tl.constexpr):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < NUM
++    dy = tl.load(DY + offs, mask=mask, other=0.0).to(tl.float32)
++    g = tl.load(G + offs, mask=mask, other=0.0).to(tl.float32)
++    u = tl.load(U + offs, mask=mask, other=0.0).to(tl.float32)
++    cdf = 0.5 * (1.0 + libdevice.erf(g * 0.7071067811865476))
++    pdf = tl.exp(-0.5 * g * g) * 0.3989422804014327
++    dgelu = cdf + g * pdf
++    gelu = g * cdf
++    tl.store(DG + offs, (dy * u * dgelu).to(DG.dtype.element_ty), mask=mask)
++    tl.store(DU + offs, (dy * gelu).to(DU.dtype.element_ty), mask=mask)
++
++
++class _GeGLU(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, gate, up):
++        y = torch.empty_like(gate)
++        num = gate.numel()
++        block = 1024
++        _geglu_fwd[(triton.cdiv(num, block),)](gate, up, y, num, BLOCK=block,
++                                               num_warps=4)
++        ctx.save_for_backward(gate, up)
++        return y
++
++    @staticmethod
++    def backward(ctx, dy):
++        gate, up = ctx.saved_tensors
++        dg = torch.empty_like(gate)
++        du = torch.empty_like(up)
++        num = gate.numel()
++        block = 1024
++        _geglu_bwd[(triton.cdiv(num, block),)](dy, gate, up, dg, du, num,
++                                               BLOCK=block, num_warps=4)
++        return dg, du
++
++
++def geglu(gate, up):
++    if gate.dtype != torch.float16 or not gate.is_cuda or not gate.is_contiguous():
++        raise NotImplementedError("geglu supports contiguous fp16 CUDA tensors")
++    return _GeGLU.apply(gate, up)
++
++
++@triton.jit
++def _adamw_kernel(P, G, M, V, NUM, lr, b1, b2, bc1, bc2, eps, wd,
++                  BLOCK: tl.constexpr, HAS_WD: tl.constexpr):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < NUM
++    p = tl.load(P + offs, mask=mask, other=0.0).to(tl.float32)
++    g = tl.load(G + offs, mask=mask, other=0.0).to(tl.float32)
++    m = tl.load(M + offs, mask=mask, other=0.0).to(tl.float32)
++    v = tl.load(V + offs, mask=mask, other=0.0).to(tl.float32)
++    m = m * b1 + g * (1.0 - b1)
++    v = v * b2 + g * g * (1.0 - b2)
++    mhat = m / bc1
++    vhat = v / bc2
++    if HAS_WD:
++        p = p - lr * (mhat / (tl.sqrt(vhat) + eps) + wd * p)
++    else:
++        p = p - lr * (mhat / (tl.sqrt(vhat) + eps))
++    tl.store(P + offs, p.to(P.dtype.element_ty), mask=mask)
++    tl.store(M + offs, m.to(M.dtype.element_ty), mask=mask)
++    tl.store(V + offs, v.to(V.dtype.element_ty), mask=mask)
++
++
++def adamw_step_(param, grad, exp_avg, exp_avg_sq, lr=1e-3, beta1=0.9,
++                beta2=0.999, eps=1e-8, weight_decay=0.01, step=1):
++    """In-place AdamW update for fp32 tensors (matches torch.optim.AdamW)."""
++    if param.dtype != torch.float32 or not param.is_cuda:
++        raise NotImplementedError("adamw_step_ supports fp32 CUDA tensors")
++    if not (param.is_contiguous() and grad.is_contiguous()
++            and exp_avg.is_contiguous() and exp_avg_sq.is_contiguous()):
++        raise NotImplementedError("adamw_step_ needs contiguous tensors")
++    num = param.numel()
++    block = 1024
++    bc1 = 1.0 - beta1 ** step
++    bc2 = 1.0 - beta2 ** step
++    _adamw_kernel[(triton.cdiv(num, block),)](
++        param, grad, exp_avg, exp_avg_sq, num, lr, float(beta1), float(beta2), bc1, bc2, eps,
++        float(weight_decay), BLOCK=block, HAS_WD=weight_decay > 0.0,
++        num_warps=4,
++    )
++    return param
++
++__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
 diff --git a/zluda_ops/gemv.py b/zluda_ops/gemv.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..38dcde5db7c612e561976380b6f94108adbeeebf
