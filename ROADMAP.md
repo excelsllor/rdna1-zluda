@@ -248,6 +248,20 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-25 - cross-backend comparison (Vulkan vs native ROCm vs ZLUDA):**
+  built F32/BF16 GGUF variants for Vulkan/llama.cpp; found the native ROCm torch
+  environment in `D:\comfyui\Data\Packages\ComfyUIrocm\venv` (torch
+  2.14.0+rocm10.1.0, HIP 7.16) and ran the math-SDPA matrix there. ZLUDA beats
+  native ROCm torch on this model (fp16 4831 vs 3082 prefill / 28.8 vs 19.8
+  decode; fp32 5418 vs 1177; bf16 3450 vs 2845). fp16 accumulation is the
+  biggest PyTorch knob on ZLUDA (7450 prefill math, 9460 with Triton FA) and is
+  a cuBLAS concept (ignored by ROCm, absent on Vulkan). ZLUDA attention stacks
+  measured: math, SDPA-fast (falls back to math), Triton FA (+16% prefill),
+  flex attention (works), flash_attn/flex shims (prefill good, decode needs
+  work), xformers shim OOM. Vulkan llama.cpp GGUF matrix
+  F16/F32/BF16 measured (high variance across runs). Full report:
+  docs/CROSS_BACKEND_COMPARISON.md; raw data in
+  bench/results/cross_backend_summary.json.
 - **2026-11-25 - llama.cpp under ZLUDA WORKS (custom PTX build), same-engine
   Vulkan comparison:** built llama.cpp locally with portable CUDA 12.4.1
   (nvcc 12.4.131, VS 2022) and `-DCMAKE_CUDA_ARCHITECTURES=86-virtual`
