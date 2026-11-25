@@ -53,8 +53,8 @@ next steps.
 | 1 | 114 GB/s | 294 GB/s | 2.58x | 66% |
 | 4 | 107 GB/s | 278 GB/s | 2.60x | 62% |
 | 8 | 109 GB/s | 242 GB/s | 2.22x | 54% |
-| 16 | 108 GB/s | 155 GB/s | 1.44x | 35% |
-| 32 | 76 GB/s | 78 GB/s | 1.03x | 17% |
+| 16 | 108 GB/s | 176 GB/s | 1.63x | 39% |
+| 32 | 76 GB/s | 83 GB/s | 1.09x | 19% |
 
 `torch.mv`/`cublasSgemv` is unsupported for fp32, so GEMV had no usable cuBLAS
 path before. M=1/4/8 reach 78–82% of the measured 377 GB/s copy ceiling.

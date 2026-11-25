@@ -32,7 +32,7 @@ runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 | **P0** | Infra: roofline microbenchmarks, correctness + performance regression tests, clock/power monitoring | **PARTIAL** (protocol done, clocks blocked) | basis for all decisions | low | ADL live status NOT_SUPPORTED |
 | **P0** | fp16-accumulation UX: safe opt-in, accuracy table, warnings | **DONE** | ~2x fp16 (inference) | low | HH requires explicit flag |
 | **P0** | Tensile tuning: SS / HH_HPA / HH across LLM and SD shapes | **DONE (HH) / CLOSED (SS, HPA)** | HH achieved; SS/HPA on random data are at the practical ceiling — the 8.8–9.2 TF target came from a zero-data artifact (see `bench/rocblas_gap.py`) | medium | rocBLAS 7.1.1 |
-| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **PARTIAL** | decode (LLM inference) | medium | M=16/32 target open |
+| **P0** | GEMV / skinny GEMM (M=1..32) + batched / strided-batched GEMM | **CLOSED** | decode (LLM inference) | medium | M16 176 GB/s (39%), M32 83 (19%); target 70-80% unreachable with split-K/tl.dot/packed-fp16 (all measured worse); rocBLAS fp32 M=32 fallback kept |
 | **P0** | Triton FA integration: op/nn.Module, SDPA-compatible backend, GQA/MQA, causal/sliding window | **DONE** | training + inference | medium | masks/dropout/window in Triton; varlen uses per-sequence Triton (fused packed kernel open) |
 | **P1** | Flash-decoding (split-KV) for long-context decode at small batch | **OPEN** | 1.5–2x decode | medium | FA integration |
 | **P1** | int4/int8 weight-only **storage** + dequant-to-fp16 GEMV/GEMM; no int8 math on RDNA1 | **OPEN** | largest memory win for 8 GB | high | GEMV/GEMM |
@@ -179,7 +179,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   rocm-smi/amd-smi on Windows.
 - **2026-11-24 - Stage 1 (baseline complete):** `bench/gemv.py` adds a Triton
   GEMV/skinny kernel for M=1..32. M=1 294/311 GB/s fp16/fp32 (66/69%), M=4 278,
-  M=8 242 (fp16), M=16/32 are compute-bound (155/78); rocBLAS linear is
+  M=8 242 (fp16), M=16/32 are compute-bound (176/83); rocBLAS linear is
   108-155 GB/s and `cublasSgemv` fp32 is unsupported. `bench/stage1.py`
   records the GEMM shape grid (fp32 8.16, fp16 6.92, bf16 4.40 TF at 4096),
   batched/strided GEMM (7.5/6.9 TF), bias/residual/GELU epilogues, bf16 fp32
@@ -220,6 +220,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   kernels with the Philox mask regenerated from (head, query, key) offsets;
   unbiased (z≈0.8 over 16 seeds), deterministic per seed, p=0 unchanged vs math;
   s=1024 causal p=0.1 is 1.04 vs 1.97 ms (1.90x).
+- **2026-11-25 - P0-4 (GEMV M=16/32):** benchmarked a split-K / tl.dot kernel
+  (`bench/gemv_m32.py`) and packed-fp16 product variants. Split-K reaches
+  64-81 GB/s at M=32 (mvec 81), packed-fp16 is worse (31-50), so the 70-80%
+  bandwidth target is recorded as unreachable on this reduction pattern. Best
+  remaining win: M=16 with fp32 products, **176 GB/s (39%, +13%)**, now the
+  default benchmark config; M=32 stays at 83 GB/s (19%), where fp32 rocBLAS
+  (119 GB/s) remains the auto-path fallback. Peak GEMV M=1 improved to
+  302 GB/s / 331 GB/s (fp16/fp32).
 - **2026-11-25 - P0-3 (window/varlen):** sliding window is implemented
   arithmetically in the Triton fwd+bwd kernels (block-range skipping, no dense
   mask; `lo` aligned down to `BLOCK_N` before advancing block pointers).
@@ -249,7 +257,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | Tensile HH | **DONE** | existing 110 kernels; 16.73/17.94 TF with override |
 | Tensile SS/HPA | **CLOSED** | 8.16/6.94 TF on random data = practical ceiling (84% of peak); old 9.2/7.2 TF numbers were zero-data artifacts; 325/302 solutions enumerated, default already best |
 | GEMV M1-8 / auto M<=32 | **DONE** | ~2x rocBLAS; inference only |
-| GEMV M16-32 target | **PARTIAL** | 155/78 GB/s; target 70-80% not met |
+| GEMV M16-32 target | **CLOSED** | 176/83 GB/s (39%/19%); 70-80% target not reachable; split-K/tl.dot/packed-fp16 measured worse; rocBLAS fp32 M=32 stays the fallback |
 | FA causal/non-causal/GQA | **DONE** | Triton fwd+bwd |
 | FA masks | **DONE** | bool/additive 2D/3D/4D broadcast masks, causal+mask, fwd+bwd in Triton; fwd err ≤1e-3, grad err ≤4e-3; masked causal 1024 is 1.67x math |
 | FA dropout | **DONE** | inverted dropout in Triton fwd+bwd, unbiased (z<1), deterministic per seed, fwd+bwd errors unchanged; causal 1024 1.90x math |
@@ -268,7 +276,7 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
 | 1 | Winograd/MIOpen conv test (`bench/conv.py`) | P1 | >=10% vs implicit GEMM or document "not beneficial" |
 | 2 | Triton dropout for FA | P0 | **CLOSED 2026-11-25**: masks and inverted dropout run in Triton fwd+bwd; window/varlen remain (row 3) |
 | 3 | Triton sliding-window + varlen FA | P0 | **CLOSED 2026-11-25**: window arithmetic in kernel (7.1x @1024), varlen per-sequence Triton; fused packed varlen kernel still open |
-| 4 | GEMV M=16/32 tuning | P0 | >=70% of 448 GB/s |
+| 4 | GEMV M=16/32 tuning | P0 | **CLOSED 2026-11-25**: M16 176 GB/s (+13% via fp32-product config), M32 83; split-K/tl.dot (64-81) and packed-fp16 (31-50) measured worse; target 70-80% recorded as unreachable, rocBLAS fp32 M=32 kept as fallback |
 | 5 | SS/HPA Tensile | P0 | **CLOSED 2026-11-25**: random-data ceiling 8.16/6.94 TF; 325/302 solutions already enumerated, default is best, no toolchain for new kernels |
 | 6 | Clock/power monitoring | P0 | **DONE 2026-11-25**: protocol (random data, shuffled rounds, median) enforced in `bench/common.save_report`; utilization/VRAM via Windows PDH; sclk/mclk/temp are a documented blocker (`bench/gpu_clocks.py`: ADL adapters enumerate but OverdriveN/6/5 return ADL_ERR_NOT_SUPPORTED = -8) |
 | 7 | Flash-decoding split-KV | P1 | >=1.5x decode at 4k |
