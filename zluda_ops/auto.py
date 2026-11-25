@@ -5,8 +5,9 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from . import bf16 as _bf16
-from . import gemv as _gemv
 from . import flash_attention as _fa
+from . import flash_decode as _flash_decode
+from . import gemv as _gemv
 from . import mha as _mha
 
 _orig_linear = None
@@ -61,6 +62,25 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
             return _fa.scaled_dot_product_attention(
                 query, key, value, attn_mask=None, dropout_p=0.0,
                 is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
+            )
+        except Exception:
+            pass
+    # Decode: a few query tokens against a long KV cache -> flash-decoding
+    # (split-KV), which needs no backward and no mask/scale override.
+    if (not _compiling() and attn_mask is None and dropout_p == 0.0
+            and scale is None and not enable_gqa
+            and query.is_cuda and query.dtype == torch.float16
+            and key.dtype == torch.float16 and value.dtype == torch.float16
+            and query.dim() == 4 and query.shape[-1] == 64
+            and 1 <= query.shape[2] <= 16
+            and query.shape[0] == key.shape[0] == value.shape[0]
+            and query.shape[1] == key.shape[1] == value.shape[1]
+            and key.shape[2] == value.shape[2] and key.shape[2] >= 512
+            and key.shape[2] % 128 == 0
+            and not _needs_grad(query, key, value)):
+        try:
+            return _flash_decode.flash_decode_attn(
+                query, key, value, causal=bool(is_causal)
             )
         except Exception:
             pass

@@ -572,3 +572,29 @@ find choose among solvers (ZLUDA calls `miopenFindSolutions` and takes the
 fastest), and for gfx1010 it picks the GEMM fallback; Winograd is "not
 beneficial/not selected" rather than an opportunity. The remaining conv win
 would come from the missing gfx1010 perf-db and from the fp16-vs-fp32 anomaly.
+
+## P1-2 Flash-decoding (split-KV) for decode (2026-11-25)
+
+`zluda_ops/flash_decode.py` implements decode attention as split-KV flash
+decoding: each (batch, head) is split into up to 16 KV chunks, a Triton kernel
+computes partial (acc, m, l), and a merge kernel combines the partials with the
+standard log-sum-exp formula. Reference is float32 scores/softmax; the M query
+tokens are assumed to be the last M positions when causal.
+
+| case (B1 H8 D64 fp16) | max rel err | flash-decoding | math SDPA | speedup |
+|---|---|---|---|---|
+| M=1, N=1024 | 4.6e-4 | 0.090 ms | 0.306 ms | **3.39x** |
+| M=1, N=2048 | 4.6e-4 | 0.107 ms | 0.357 ms | **3.33x** |
+| M=1, N=4096 | 3.6e-4 | 0.131 ms | 0.465 ms | **3.55x** |
+| M=8 casual, N=4096 | 2.9e-4 | 0.137 ms | 0.615 ms | **4.50x** |
+| M=8, N=2048 | 4.6e-4 | 0.193 ms | 0.360 ms | 1.86x |
+| M=4, N=4096 | 4.5e-4 | 0.133 ms | 0.467 ms | 3.52x |
+
+The milestone target (>=1.5x decode at 4k) is met. `zluda_ops.auto` now
+dispatches `F.scaled_dot_product_attention` decode calls (fp16, head_dim 64,
+M<=16, KV>=512, no mask/dropout/grad, default scale) to flash-decoding: output
+matches the direct kernel bit-exactly (max abs 2.8e-5 vs float32 reference) and
+is 1.33x faster than math through the patched Python entry point (the raw kernel
+is 3.35x; the difference is Python dispatch overhead at these small latencies).
+
+`bench/flash_decode.py` reproduces both the correctness checks and the timings.
