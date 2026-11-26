@@ -559,3 +559,64 @@ mod tests {
         api.cublasDestroy_v2(handle);
     }
 }
+
+// --- GEMV (level-2 BLAS) ---------------------------------------------------
+// zluda_blas previously only implemented GEMM, so cublasSgemv/Dgemv fell to the
+// unimplemented stub (CUBLAS_STATUS_NOT_SUPPORTED). Map them to rocBLAS.
+
+pub(crate) fn sgemv_v2(
+    handle: &Handle,
+    trans: rocblas_operation,
+    m: ::core::ffi::c_int,
+    n: ::core::ffi::c_int,
+    alpha: *const f32,
+    a: *const f32,
+    lda: ::core::ffi::c_int,
+    x: *const f32,
+    incx: ::core::ffi::c_int,
+    beta: *const f32,
+    y: *mut f32,
+    incy: ::core::ffi::c_int,
+) -> cublasStatus_t {
+    unsafe {
+        rocblas()?.rocblas_sgemv(handle.rocm_handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
+    }?;
+    Ok(())
+}
+
+pub(crate) fn sgemv(
+    handle: &Handle,
+    trans: rocblas_operation,
+    m: ::core::ffi::c_int,
+    n: ::core::ffi::c_int,
+    alpha: *const f32,
+    a: *const f32,
+    lda: ::core::ffi::c_int,
+    x: *const f32,
+    incx: ::core::ffi::c_int,
+    beta: *const f32,
+    y: *mut f32,
+    incy: ::core::ffi::c_int,
+) -> cublasStatus_t {
+    sgemv_v2(handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
+}
+
+pub(crate) fn sgemv_v2_64(
+    handle: &Handle,
+    trans: rocblas_operation,
+    m: i64,
+    n: i64,
+    alpha: *const f32,
+    a: *const f32,
+    lda: i64,
+    x: *const f32,
+    incx: i64,
+    beta: *const f32,
+    y: *mut f32,
+    incy: i64,
+) -> cublasStatus_t {
+    unsafe {
+        rocblas()?.rocblas_sgemv_64(handle.rocm_handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
+    }?;
+    Ok(())
+}
