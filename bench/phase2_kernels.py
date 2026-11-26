@@ -114,6 +114,40 @@ def main():
     check("gqa_decode_speed", gqa_speed)
     check("add_rms_norm_correctness", rms_correctness)
     check("add_rms_norm_speed", rms_speed)
+    def qkv_rope_append_check():
+        from zluda_ops.qkv_fused import qkv_rope_append
+
+        torch.manual_seed(0)
+        K, hq, hkv, d, n = 896, 14, 2, 64, 64
+        x = torch.randn(K, device="cuda", dtype=torch.float16)
+        wq = torch.randn(hq * d, K, device="cuda", dtype=torch.float16) * 0.05
+        wk = torch.randn(hkv * d, K, device="cuda", dtype=torch.float16) * 0.05
+        wv = torch.randn(hkv * d, K, device="cuda", dtype=torch.float16) * 0.05
+        w_qkv = torch.cat([wq, wk, wv], dim=0)
+        pos = 37
+        q_out = torch.zeros(1, hq, 1, d, device="cuda", dtype=torch.float16)
+        k_cache = torch.zeros(hkv, n, d, device="cuda", dtype=torch.float16)
+        v_cache = torch.zeros(hkv, n, d, device="cuda", dtype=torch.float16)
+        cos = torch.randn(32, device="cuda", dtype=torch.float16) * 0.5
+        sin = torch.randn(32, device="cuda", dtype=torch.float16) * 0.5
+        ok = qkv_rope_append(x, w_qkv, cos, sin, k_cache, v_cache, q_out, pos)
+        assert ok
+        q = (x.float() @ wq.t().float())
+        kk = (x.float() @ wk.t().float())
+        vv = (x.float() @ wv.t().float())
+        def rope(v):
+            a, b = v[:32], v[32:]
+            return torch.cat([a * cos.float() - b * sin.float(),
+                              a * sin.float() + b * cos.float()])
+        q_ref = torch.stack([rope(q[h * 64:(h + 1) * 64]) for h in range(hq)])
+        k_ref = torch.stack([rope(kk[h * 64:(h + 1) * 64]) for h in range(hkv)])
+        v_ref = vv.reshape(hkv, 64)
+        err_q = float((q_out[0, :, 0].float() - q_ref).abs().max())
+        err_k = float((k_cache[:, pos].float() - k_ref).abs().max())
+        err_v = float((v_cache[:, pos].float() - v_ref).abs().max())
+        return {"q": round(err_q, 4), "k": round(err_k, 4), "v": round(err_v, 4)}
+
+    check("qkv_rope_append_correctness", qkv_rope_append_check)
     ok = sum(1 for r in RESULTS if r["status"] == "OK")
     print(f"SUMMARY {ok}/{len(RESULTS)} phase-2 kernel checks passed", flush=True)
     out = Path(__file__).resolve().parents[1] / "bench" / "results" / "phase2_kernels.json"
