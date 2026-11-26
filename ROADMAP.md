@@ -248,7 +248,20 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
-- **2026-11-26 - Phase 2 kernels validated (7/7):** GQA KV-reuse decode
+- **2026-11-26 - Phase 2 COMPLETE (kernels validated + e2e wired):**
+  9/9 kernel checks pass (bench/phase2_kernels.py): GQA KV-reuse decode 1.34x,
+  M=1 specialised decode 1.34x (M>1 exact after fixing the bench reference),
+  fused residual+RMSNorm, fused QKV+RoPE+KV-append, embedding gather+scale,
+  Gumbel-max sampling (greedy exact, top-50 40/40, distribution matches
+  softmax), int8 prefill GEMM (correct; slower than dequant-once+fp16, kept as
+  a VRAM option). Wired fused decoder-layer norm+MLP into
+  zluda_ops/model_patches.py: GraphDecoder replay 11.02 -> 10.36 ms/token
+  (90.8 -> 96.6 tok/s, +6.4%), logits err 0.034. Roofline: copy 85%, fill 95%,
+  large GEMV up to 77% of 448 GB/s peak; small kernels launch-bound. Fixed a
+  Triton/ZLUDA codegen bug (constexpr N in add_rms_norm) by using runtime N;
+  tl.cumsum is unreliable here so sampling uses Gumbel-max. Remaining:
+  int8-prefill tuning, parallel sampling reduction, autotune tables, wire
+  fused QKV/GQA into the layer path.- **2026-11-26 - Phase 2 kernels validated (7/7):** GQA KV-reuse decode
   (1.32x vs head-per-program; 87.5 vs 115.9 us), specialised M=1 decode
   (1.26x, err 2e-6), fused residual+RMSNorm (43x: 1.0 vs 46.2 us), fused
   QKV+RoPE+KV-append (err ~1e-3), embedding gather+scale (21.3 us, exact).

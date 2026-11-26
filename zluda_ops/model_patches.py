@@ -60,4 +60,52 @@ def installed():
     return _installed
 
 
-__all__ = ["install", "uninstall", "installed"]
+__all__ = ["install", "uninstall", "installed", "install_decoder_layer", "uninstall_decoder_layer"]
+def _decoder_layer_forward(self, hidden_states, attention_mask=None,
+                           position_ids=None, past_key_values=None,
+                           use_cache=False, cache_position=None,
+                           position_embeddings=None, **kwargs):
+    from . import fused as _fused
+
+    residual = hidden_states
+    normed = self.input_layernorm(hidden_states)
+    try:
+        attn_out = self.self_attn(
+            hidden_states=normed, attention_mask=attention_mask,
+            past_key_values=past_key_values, cache_position=cache_position,
+            position_embeddings=position_embeddings, **kwargs)[0]
+        fused = _fused.add_rms_norm(residual, attn_out,
+                                    self.post_attention_layernorm.weight)
+    except Exception:  # noqa: BLE001 - fall back to the stock layer
+        return _orig["layer"](self, hidden_states,
+                              attention_mask=attention_mask,
+                              position_ids=position_ids,
+                              past_key_values=past_key_values,
+                              use_cache=use_cache,
+                              cache_position=cache_position,
+                              position_embeddings=position_embeddings,
+                              **kwargs)
+    if fused is None:
+        hidden = residual + attn_out
+        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+    normed2, hidden = fused
+    return hidden + self.mlp(normed2)
+
+
+
+def install_decoder_layer():
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    if "layer" not in _orig:
+        _orig["layer"] = mq.Qwen2DecoderLayer.forward
+        mq.Qwen2DecoderLayer.forward = _decoder_layer_forward
+    return True
+
+
+def uninstall_decoder_layer():
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    if "layer" in _orig:
+        mq.Qwen2DecoderLayer.forward = _orig["layer"]
+        del _orig["layer"]
+    return True

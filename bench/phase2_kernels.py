@@ -42,12 +42,26 @@ def bench(fn, n=20):
 
 
 def math_ref(q, k, v, causal):
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-
-    with sdpa_kernel(SDPBackend.MATH):
-        return torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=causal, enable_gqa=True)
-
+    """Reference computed with explicit torch math (no SDPA mask ambiguity)."""
+    b, hq, m, d = q.shape
+    hkv = k.shape[1]
+    n = k.shape[2]
+    group = hq // hkv
+    out = torch.zeros(b, hq, m, d, device=q.device, dtype=torch.float32)
+    qf, kf, vf = q.float(), k.float(), v.float()
+    scale = d ** -0.5
+    qpos = torch.arange(n - m, n, device=q.device)
+    kvpos = torch.arange(n, device=q.device)
+    keep = qpos[:, None] >= kvpos[None, :]
+    for bi in range(b):
+        for h in range(hq):
+            kv_h = h // group
+            logits = (qf[bi, h] @ kf[bi, kv_h].t()) * scale
+            if causal:
+                logits = logits.masked_fill(~keep, float("-inf"))
+            w = torch.softmax(logits, dim=-1)
+            out[bi, h] = w @ vf[bi, kv_h]
+    return out
 
 def main():
     if not torch.cuda.is_available():
@@ -176,6 +190,41 @@ def main():
         return {"err": round(err, 5), "us": round(us, 1)}
 
     check("embedding_gather_scale", embedding_check)
+    def sampling_check():
+        from zluda_ops.sampling import sample_logits
+
+        torch.manual_seed(0)
+        logits = torch.randn(151936, device="cuda") * 2.0
+        greedy = sample_logits(logits, temperature=0.0)
+        assert int(greedy) == int(logits.argmax()), "greedy mismatch"
+        topk = torch.topk(logits, 50).indices
+        hits = 0
+        for _ in range(40):
+            tok = sample_logits(logits, temperature=1.0, top_k=50)
+            hits += int(tok.item() in topk.tolist())
+        us = bench(lambda: sample_logits(logits, temperature=1.0, top_k=50), n=20)
+        return {"greedy_ok": True, "top50_hits": f"{hits}/40", "us": round(us, 1)}
+
+    def int8_matmul_check():
+        from zluda_ops import quant as Q
+
+        torch.manual_seed(0)
+        n, k, m = 2048, 2048, 64
+        w = (torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.05)
+        x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        wi8, sc = Q.quantize_int8(w, 128)
+        ref = (Q.dequantize_int8(wi8, sc, (n, k), 128) @ x.t()).t()
+        got = Q.int8_matmul(x, wi8, sc)
+        err = float((got.float() - ref.float()).abs().max())
+        us = bench(lambda: Q.int8_matmul(x, wi8, sc), n=10)
+        w_deq = Q.dequantize_int8(wi8, sc, (n, k), 128)
+        ref_us = bench(lambda: x @ w_deq.t(), n=10)
+        return {"err": round(err, 3), "int8_us": round(us, 1),
+                "dequant_fp16_us": round(ref_us, 1)}
+
+    check("sampling_kernel", sampling_check)
+    check("int8_prefill_matmul", int8_matmul_check)
+
 
     check("qkv_rope_append_correctness", qkv_rope_append_check)
     ok = sum(1 for r in RESULTS if r["status"] == "OK")

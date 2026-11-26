@@ -8,6 +8,7 @@ from . import bf16 as _bf16
 from . import conv as _conv
 from . import flash_attention as _fa
 from . import flash_decode as _flash_decode
+from . import gqa_decode as _gqa_decode
 from . import gemv as _gemv
 from . import mha as _mha
 
@@ -137,11 +138,18 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
             and not _needs_grad(query, key, value)):
         try:
             _DISPATCH_STATS["decode"] += 1
-            return _flash_decode.flash_decode_attn(
-                query, key, value, causal=bool(is_causal)
-            )
+            out = _gqa_decode.gqa_decode_attn(
+                query, key, value, causal=bool(is_causal))
+            if out is not None:
+                return out
         except Exception:
             pass
+        try:
+            return _flash_decode.flash_decode_attn(
+                query, key, value, causal=bool(is_causal))
+        except Exception:
+            pass
+
     _DISPATCH_STATS["math"] += 1
     with sdpa_kernel(SDPBackend.MATH):
         return _orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
