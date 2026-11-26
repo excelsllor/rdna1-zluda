@@ -248,7 +248,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
-- **2026-11-26 - compatibility matrix (pre-Phase-2):** added docs/COMPAT_MATRIX.md
+- **2026-11-26 - Phase 2 started (kernels written, validation pending):**
+  implemented `zluda_ops/gqa_decode.py` (GQA KV-reuse flash-decoding: one
+  program per (batch, kv-head) split, looping the group heads so K/V hits L2
+  instead of DRAM - removes up to 7x redundant KV traffic) and
+  `fused.add_rms_norm` (fused residual add + RMSNorm, returns the pre-norm
+  residual). Added `bench/phase2_kernels.py` (correctness + speed) and
+  docs/PHASE2_KERNELS.md. GPU is wedged from the compatibility run and needs a
+  reboot before these can be validated.- **2026-11-26 - compatibility matrix (pre-Phase-2):** added docs/COMPAT_MATRIX.md
   with crash-isolated results. Attention: prefill math/Triton-FA/flex
   (slow)/flash_attn/xformers work; PyTorch sdpa_default/flash/efficient/cudnn
   FAIL (launch failure / cutlass fmha sm80 arch fatal) -> zluda_ops.auto now

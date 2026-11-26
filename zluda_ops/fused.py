@@ -413,7 +413,7 @@ def adamw_step_(param, grad, exp_avg, exp_avg_sq, lr=1e-3, beta1=0.9,
     )
     return param
 
-__all__ = ["rms_norm", "rope_apply", "swiglu", "swiglu_gemv", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
+__all__ = ["add_rms_norm", "rms_norm", "rope_apply", "swiglu", "swiglu_gemv", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
 
 # ---------------------------------------------------------------------------
 
@@ -472,3 +472,42 @@ def swiglu_gemv(x, w_gate, w_up, bias_gate=None, bias_up=None,
         num_warps=4, num_stages=1,
     )
     return y
+
+# ---------------------------------------------------------------------------
+# Fused residual add + RMSNorm: y = rms_norm(x + delta) * weight, and the
+# pre-norm residual (x + delta) is returned too because the next layer needs it.
+# Replaces two bandwidth-bound kernels (add, rms_norm) per transformer layer.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _add_rms_norm_kernel(X, D, W, Y, R, N: tl.constexpr, BLOCK: tl.constexpr,
+                         eps):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(X + row * N + offs, mask=mask, other=0.0).to(tl.float32)
+    d = tl.load(D + row * N + offs, mask=mask, other=0.0).to(tl.float32)
+    res = x + d
+    ms = tl.sum(tl.where(mask, res * res, 0.0)) / N
+    rstd = 1.0 / tl.sqrt(ms + eps)
+    w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Y + row * N + offs, (res * rstd * w).to(Y.dtype.element_ty), mask=mask)
+    tl.store(R + row * N + offs, res.to(R.dtype.element_ty), mask=mask)
+
+
+def add_rms_norm(x, delta, weight, eps=1e-6):
+    """Fused residual add + RMSNorm. Returns (normed, residual) with x's dtype."""
+    n = x.shape[-1]
+    if (not x.is_cuda or x.dtype != torch.float16 or x.shape != delta.shape
+            or weight.shape != (n,) or weight.dtype != torch.float16):
+        return None
+    if n > 8192 or (n & (n - 1)):
+        return None
+    xf = x.reshape(-1, n)
+    df = delta.reshape(-1, n)
+    rows = xf.shape[0]
+    out = torch.empty_like(xf)
+    res = torch.empty_like(xf)
+    block = max(128, triton.next_power_of_2(n))
+    _add_rms_norm_kernel[(rows,)](xf, df, weight, out, res, n, BLOCK=block,
+                                  eps=eps, num_warps=4, num_stages=1)
+    return out.reshape(x.shape), res.reshape(x.shape)

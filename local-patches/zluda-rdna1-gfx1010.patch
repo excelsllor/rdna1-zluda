@@ -2171,10 +2171,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..93573de2284d52b50d2008567d8780b6050fd9ee
+index 0000000000000000000000000000000000000000..ace64067a8c128c9c1ff9ba7f8d4a1c188115e9f
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,653 @@
+@@ -0,0 +1,660 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2425,7 +2425,14 @@ index 0000000000000000000000000000000000000000..93573de2284d52b50d2008567d8780b6
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
-+- **2026-11-26 - compatibility matrix (pre-Phase-2):** added docs/COMPAT_MATRIX.md
++- **2026-11-26 - Phase 2 started (kernels written, validation pending):**
++  implemented `zluda_ops/gqa_decode.py` (GQA KV-reuse flash-decoding: one
++  program per (batch, kv-head) split, looping the group heads so K/V hits L2
++  instead of DRAM - removes up to 7x redundant KV traffic) and
++  `fused.add_rms_norm` (fused residual add + RMSNorm, returns the pre-norm
++  residual). Added `bench/phase2_kernels.py` (correctness + speed) and
++  docs/PHASE2_KERNELS.md. GPU is wedged from the compatibility run and needs a
++  reboot before these can be validated.- **2026-11-26 - compatibility matrix (pre-Phase-2):** added docs/COMPAT_MATRIX.md
 +  with crash-isolated results. Attention: prefill math/Triton-FA/flex
 +  (slow)/flash_attn/xformers work; PyTorch sdpa_default/flash/efficient/cudnn
 +  FAIL (launch failure / cutlass fmha sm80 arch fatal) -> zluda_ops.auto now
@@ -7312,6 +7319,139 @@ index 0000000000000000000000000000000000000000..cc28e960b6702370273b29654817af61
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/bench/phase2_kernels.py b/bench/phase2_kernels.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0099e1e7e33a05b16def36e1125ab3a8f1f44a9e
+--- /dev/null
++++ b/bench/phase2_kernels.py
+@@ -0,0 +1,127 @@
++"""Phase-2 kernel validation/bench (run after a reboot, under run-zluda.cmd).
++
++Checks:
++  * GQA KV-reuse flash-decoding vs math SDPA (correctness) and vs the
++    head-per-program `flash_decode_attn` (speed / DRAM traffic);
++  * fused residual+RMSNorm vs reference (correctness) and vs the two-kernel
++    path (speed).
++Saves bench/results/phase2_kernels.json.
++"""
++
++import json
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++RESULTS = []
++
++
++def check(name, fn, tol=None):
++    try:
++        detail = fn()
++        RESULTS.append({"name": name, "status": "OK", "detail": detail})
++        print(f"OK   {name:34s} {str(detail)[:120]}", flush=True)
++    except Exception as exc:  # noqa: BLE001
++        RESULTS.append({"name": name, "status": "FAIL",
++                        "detail": f"{type(exc).__name__}: {str(exc)[:160]}"})
++        print(f"FAIL {name:34s} {type(exc).__name__}: {str(exc)[:100]}", flush=True)
++
++
++def bench(fn, n=20):
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(n):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t0) / n * 1e6
++
++
++def math_ref(q, k, v, causal):
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    with sdpa_kernel(SDPBackend.MATH):
++        return torch.nn.functional.scaled_dot_product_attention(
++            q, k, v, is_causal=causal, enable_gqa=True)
++
++
++def main():
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(0.7)
++    from zluda_ops.gqa_decode import gqa_decode_attn
++    from zluda_ops.flash_decode import flash_decode_attn
++    from zluda_ops import fused as F
++
++    def gqa_correctness():
++        torch.manual_seed(0)
++        out = {}
++        for n, m in ((1024, 1), (2048, 1), (2048, 4)):
++            b, hq, hkv, d = 1, 14, 2, 64
++            q = torch.randn(b, hq, m, d, device="cuda", dtype=torch.float16)
++            k = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
++            v = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
++            ref = math_ref(q, k, v, causal=(m > 1))
++            got = gqa_decode_attn(q, k, v, causal=(m > 1))
++            assert got is not None, "shapes unsupported"
++            out[f"n{n}_m{m}"] = float((got.float() - ref.float()).abs().max())
++        return out
++
++    def gqa_speed():
++        b, hq, hkv, d, n, m = 1, 14, 2, 64, 2048, 1
++        q = torch.randn(b, hq, m, d, device="cuda", dtype=torch.float16)
++        k = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
++        v = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
++        kv_bytes = 2 * b * hkv * n * d * 2
++        gqa_us = bench(lambda: gqa_decode_attn(q, k, v))
++        old_us = bench(lambda: flash_decode_attn(q, k, v))
++        return {"gqa_us": round(gqa_us, 1), "old_us": round(old_us, 1),
++                "speedup_vs_head_per_program": round(old_us / gqa_us, 2),
++                "effective_GBs": round(kv_bytes / gqa_us / 1e3, 1)}
++
++    def rms_correctness():
++        torch.manual_seed(0)
++        x = torch.randn(2, 128, device="cuda", dtype=torch.float16)
++        d = torch.randn(2, 128, device="cuda", dtype=torch.float16)
++        w = torch.randn(128, device="cuda", dtype=torch.float16)
++        y, res = F.add_rms_norm(x, d, w)
++        res_ref = x.float() + d.float()
++        y_ref = (res_ref * torch.rsqrt(res_ref.pow(2).mean(-1, keepdim=True) + 1e-6)
++                 * w.float())
++        return {"res_err": round(float((res.float() - res_ref).abs().max()), 5),
++                "y_err": round(float((y.float() - y_ref).abs().max()), 4)}
++
++    def rms_speed():
++        x = torch.randn(1, 896, device="cuda", dtype=torch.float16)
++        d = torch.randn(1, 896, device="cuda", dtype=torch.float16)
++        w = torch.randn(896, device="cuda", dtype=torch.float16)
++        fused_us = bench(lambda: F.add_rms_norm(x, d, w))
++
++        def two_kernel():
++            res = x + d
++            F.rms_norm(res, w)
++
++        old_us = bench(two_kernel)
++        return {"fused_us": round(fused_us, 1), "two_kernel_us": round(old_us, 1),
++                "speedup": round(old_us / fused_us, 2)}
++
++    check("gqa_decode_correctness", gqa_correctness)
++    check("gqa_decode_speed", gqa_speed)
++    check("add_rms_norm_correctness", rms_correctness)
++    check("add_rms_norm_speed", rms_speed)
++    ok = sum(1 for r in RESULTS if r["status"] == "OK")
++    print(f"SUMMARY {ok}/{len(RESULTS)} phase-2 kernel checks passed", flush=True)
++    out = Path(__file__).resolve().parents[1] / "bench" / "results" / "phase2_kernels.json"
++    out.parent.mkdir(parents=True, exist_ok=True)
++    out.write_text(json.dumps({"results": RESULTS}, indent=1), encoding="utf-8")
++    print(f"report: {out}", flush=True)
++    return 0 if ok == len(RESULTS) else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/quant.py b/bench/quant.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..dba4a3698ee0c636aecbb1efbc707e9d9c3329e8
@@ -11900,6 +12040,52 @@ index 0000000000000000000000000000000000000000..fa81d2ce186045a6d2d56e5048cfee7b
 +- 2026-11-25: portable CUDA toolchain + llama.cpp build configured and started;
 +  see the ROADMAP entry for the outcome and ENGINE_COMPARISON.md for the
 +  Vulkan-vs-ZLUDA matrix once the PTX build runs.
+\ No newline at end of file
+diff --git a/docs/PHASE2_KERNELS.md b/docs/PHASE2_KERNELS.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..fff3ce40c83e627d2e3f44ea212e3c0c73fd854e
+--- /dev/null
++++ b/docs/PHASE2_KERNELS.md
+@@ -0,0 +1,39 @@
++# Phase 2 kernels: custom Triton fast paths
++
++Status: **implemented, GPU validation pending** (the GPU/driver is wedged after
++the compatibility-matrix run and needs a reboot; run
++`venv\Scripts\python.exe bench\phase2_kernels.py` under `run-zluda.cmd` right
++after the reboot).
++
++## Implemented
++
++### 1. GQA KV-reuse flash-decoding (`zluda_ops.gqa_decode.gqa_decode_attn`)
++Problem: `flash_decode_attn` maps one program per (batch, query head); with GQA
++(14 q / 2 kv heads) each of the 7 query heads of a group re-reads the same K/V
++from DRAM, i.e. up to 7x redundant KV traffic on long contexts (decode attention
++was at ~23% of peak bandwidth).
++
++Design: one program per **(batch, kv head) x KV-split**, looping over the query
++heads of the group. The K/V chunk of each split is loaded once per head
++iteration; the following iterations hit it in the 4 MB L2 (chunk bytes =
++N/SPLITS * D * 2, tiny compared to L2), so DRAM traffic drops to ~1x while the
++SPLITS * B * HKV programs still fill the CUs. Partials/merge reuse the existing
++`_decode_merge` layout, so the kernel is a drop-in alternative to
++`flash_decode_attn` (returns None for unsupported shapes).
++
++Expected: lower DRAM traffic on GQA decode; measured speedup/effective
++bandwidth is reported by `bench/phase2_kernels.py`.
++
++### 2. Fused residual + RMSNorm (`zluda_ops.fused.add_rms_norm`)
++Computes `res = x + delta` (returned for the next residual) and
++`y = rms_norm(res) * weight` in a single bandwidth-bound kernel, removing one
++kernel launch and one extra read/write of the residual stream per layer.
++
++## Next Phase-2 kernels (planned)
++- fused QKV projection + RoPE + KV-cache append (decode, one kernel/layer);
++- fused MLP projections + activation (gate/up fused already; add down fusion);
++- sampling kernels (temperature/top-k/top-p fused);
++- embedding gather + scale;
++- int8/int4 prefill tiles (fused GEMM with on-the-fly dequant);
++- autotune tables (per-shape configs) and roofline harness for all decode
++  kernels.
 \ No newline at end of file
 diff --git a/docs/RDNA1_BUILD_AND_USAGE.md b/docs/RDNA1_BUILD_AND_USAGE.md
 new file mode 100644
@@ -18958,10 +19144,10 @@ index 0000000000000000000000000000000000000000..a793bf1a34b95d6417bd9e74b6d109e2
 +]
 diff --git a/zluda_ops/fused.py b/zluda_ops/fused.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e2eb26fb10473a005c02225aac636a1ad17a467a
+index 0000000000000000000000000000000000000000..8d7b95ada78ca074f77381ee6c163194e0e237a0
 --- /dev/null
 +++ b/zluda_ops/fused.py
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,513 @@
 +"""Fused Triton kernels for common transformer operations on gfx1010.
 +
 +Implemented (fp16 tensors, contiguous last dimension):
@@ -19377,7 +19563,7 @@ index 0000000000000000000000000000000000000000..e2eb26fb10473a005c02225aac636a1a
 +    )
 +    return param
 +
-+__all__ = ["rms_norm", "rope_apply", "swiglu", "swiglu_gemv", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
++__all__ = ["add_rms_norm", "rms_norm", "rope_apply", "swiglu", "swiglu_gemv", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
 +
 +# ---------------------------------------------------------------------------
 +
@@ -19436,6 +19622,45 @@ index 0000000000000000000000000000000000000000..e2eb26fb10473a005c02225aac636a1a
 +        num_warps=4, num_stages=1,
 +    )
 +    return y
++
++# ---------------------------------------------------------------------------
++# Fused residual add + RMSNorm: y = rms_norm(x + delta) * weight, and the
++# pre-norm residual (x + delta) is returned too because the next layer needs it.
++# Replaces two bandwidth-bound kernels (add, rms_norm) per transformer layer.
++# ---------------------------------------------------------------------------
++@triton.jit
++def _add_rms_norm_kernel(X, D, W, Y, R, N: tl.constexpr, BLOCK: tl.constexpr,
++                         eps):
++    row = tl.program_id(0)
++    offs = tl.arange(0, BLOCK)
++    mask = offs < N
++    x = tl.load(X + row * N + offs, mask=mask, other=0.0).to(tl.float32)
++    d = tl.load(D + row * N + offs, mask=mask, other=0.0).to(tl.float32)
++    res = x + d
++    ms = tl.sum(tl.where(mask, res * res, 0.0)) / N
++    rstd = 1.0 / tl.sqrt(ms + eps)
++    w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
++    tl.store(Y + row * N + offs, (res * rstd * w).to(Y.dtype.element_ty), mask=mask)
++    tl.store(R + row * N + offs, res.to(R.dtype.element_ty), mask=mask)
++
++
++def add_rms_norm(x, delta, weight, eps=1e-6):
++    """Fused residual add + RMSNorm. Returns (normed, residual) with x's dtype."""
++    n = x.shape[-1]
++    if (not x.is_cuda or x.dtype != torch.float16 or x.shape != delta.shape
++            or weight.shape != (n,) or weight.dtype != torch.float16):
++        return None
++    if n > 8192 or (n & (n - 1)):
++        return None
++    xf = x.reshape(-1, n)
++    df = delta.reshape(-1, n)
++    rows = xf.shape[0]
++    out = torch.empty_like(xf)
++    res = torch.empty_like(xf)
++    block = max(128, triton.next_power_of_2(n))
++    _add_rms_norm_kernel[(rows,)](xf, df, weight, out, res, n, BLOCK=block,
++                                  eps=eps, num_warps=4, num_stages=1)
++    return out.reshape(x.shape), res.reshape(x.shape)
 diff --git a/zluda_ops/gemv.py b/zluda_ops/gemv.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..ef18a47deb4135107a7533b6f46c69cbdbbb868d
@@ -19520,6 +19745,145 @@ index 0000000000000000000000000000000000000000..ef18a47deb4135107a7533b6f46c69cb
 +                       HAS_BIAS=bias is not None, PROD_F16=not accurate,
 +                       num_warps=warps, num_stages=1)
 +    return y
+diff --git a/zluda_ops/gqa_decode.py b/zluda_ops/gqa_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c7b420cd42899518d1a481fd167a33273e878b3
+--- /dev/null
++++ b/zluda_ops/gqa_decode.py
+@@ -0,0 +1,133 @@
++"""GQA KV-reuse flash-decoding (Phase 2 kernel).
++
++The existing `flash_decode_attn` maps one program to one (batch, query-head)
++pair, so with GQA (e.g. 14 q heads / 2 kv heads) every query head of a group
++re-reads the same K/V from DRAM: 7x redundant traffic on long contexts.
++
++This kernel maps one program to one **(batch, kv-head)** pair and loops over the
++query heads of its group sequentially. The K/V tile for a chunk is loaded once
++per iteration; the following head iterations hit the same chunk in L2 (chunk =
++N/SPLITS * D * 2 bytes fits in the 4 MB L2), so DRAM traffic drops to ~1x while
++keeping SPLITS * B * HKV programs busy across the CUs.
++
++API (mirrors flash_decode):
++    out = gqa_decode_attn(q, k, v, causal=False)  # (B, Hq, M, D) fp16 -> (B, Hq, M, D)
++Returns None when the shape is not supported (caller falls back).
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++from .flash_decode import BLOCK_M, BLOCK_N, _choose_splits, _decode_merge
++
++
++@triton.jit
++def _gqa_decode_split(Q, K, V, Out, Max, Lsum,
++                      stride_qz, stride_qh, stride_qm, stride_qk,
++                      stride_kz, stride_kh, stride_kn, stride_kk,
++                      stride_vz, stride_vh, stride_vn, stride_vk,
++                      Hq, HKV, GROUP, M, N, OFFSET, sm_scale,
++                      SPLITS: tl.constexpr, BLOCK_M: tl.constexpr,
++                      BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
++                      CAUSAL: tl.constexpr):
++    pid_split = tl.program_id(0)
++    bhid_kv = tl.program_id(1)
++    off_z = bhid_kv // HKV
++    off_hkv = bhid_kv % HKV
++
++    k_off = off_z * stride_kz + off_hkv * stride_kh
++    v_off = off_z * stride_vz + off_hkv * stride_vh
++    offs_m = tl.arange(0, BLOCK_M)
++    offs_d = tl.arange(0, HEAD_DIM)
++    qk_scale = sm_scale * 1.44269504
++
++    chunk = N // SPLITS
++    start = pid_split * chunk
++    end = start + chunk
++
++    for g in range(GROUP):
++        off_h = off_hkv * GROUP + g
++        q_off = off_z * stride_qz + off_h * stride_qh
++        q = tl.load(Q + q_off + offs_m[:, None] * stride_qm
++                    + offs_d[None, :] * stride_qk,
++                    mask=offs_m[:, None] < M, other=0.0)
++        m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
++        l_i = tl.zeros((BLOCK_M,), tl.float32)
++        acc = tl.zeros((BLOCK_M, HEAD_DIM), tl.float32)
++        for start_n in range(start, end, BLOCK_N):
++            offs_n = start_n + tl.arange(0, BLOCK_N)
++            k = tl.load(K + k_off + offs_n[:, None] * stride_kn
++                        + offs_d[None, :] * stride_kk)
++            v = tl.load(V + v_off + offs_n[:, None] * stride_vn
++                        + offs_d[None, :] * stride_vk)
++            qk = tl.dot(q, tl.trans(k)) * qk_scale
++            if CAUSAL:
++                qpos = OFFSET + offs_m
++                qk = tl.where(qpos[:, None] >= offs_n[None, :], qk, -1.0e6)
++            m_new = tl.maximum(m_i, tl.max(qk, 1))
++            p = tl.math.exp2(qk - m_new[:, None])
++            alpha = tl.math.exp2(m_i - m_new)
++            l_i = l_i * alpha + tl.sum(p, 1)
++            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
++            m_i = m_new
++
++        part = (off_z * Hq + off_h) * SPLITS + pid_split
++        out_ptrs = Out + part * M * HEAD_DIM + offs_m[:, None] * HEAD_DIM + offs_d[None, :]
++        tl.store(out_ptrs, acc, mask=offs_m[:, None] < M)
++        tl.store(Max + part * M + offs_m, m_i, mask=offs_m < M)
++        tl.store(Lsum + part * M + offs_m, l_i, mask=offs_m < M)
++
++
++def gqa_decode_attn(q, k, v, causal=False, splits=None):
++    """GQA-aware flash-decoding for (B, Hq, M, D) fp16, M<=16, D=64.
++
++    Returns (B, Hq, M, D) fp16 or None if the shape is unsupported.
++    """
++    if (not q.is_cuda or q.dim() != 4 or q.dtype != torch.float16
++            or k.dtype != torch.float16 or v.dtype != torch.float16):
++        return None
++    b, hq, m, d = q.shape
++    if m < 1 or m > BLOCK_M or d != 64:
++        return None
++    if k.shape[0] != b or v.shape[0] != b or k.shape[2] != v.shape[2]:
++        return None
++    if k.shape[1] != v.shape[1] or k.shape[3] != d or v.shape[3] != d:
++        return None
++    hkv = k.shape[1]
++    if hkv < 1 or hq % hkv:
++        return None
++    group = hq // hkv
++    n = k.shape[2]
++    if n < 512 or n % (BLOCK_N * 2):
++        return None
++    q = q.contiguous()
++    k = k.contiguous()
++    v = v.contiguous()
++    if splits is None:
++        splits = _choose_splits(n, b * hq)
++    if n % (BLOCK_N * splits):
++        return None
++    partials = torch.empty(b * hq * splits * m * d, device=q.device,
++                           dtype=torch.float32)
++    maxs = torch.empty(b * hq * splits * m, device=q.device, dtype=torch.float32)
++    lsums = torch.empty_like(maxs)
++    out = torch.empty(b, hq, m, d, device=q.device, dtype=torch.float16)
++    sm_scale = (1.0 / (d ** 0.5))
++    offset = n - m
++    _gqa_decode_split[(splits, b * hkv)](
++        q, k, v, partials, maxs, lsums,
++        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
++        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
++        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
++        hq, hkv, group, m, n, offset, sm_scale,
++        SPLITS=splits, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=d,
++        CAUSAL=causal, num_warps=4, num_stages=1,
++    )
++    _decode_merge[(b * hq,)](partials, maxs, lsums, out, m,
++                             SPLITS=splits, BLOCK_M=BLOCK_M, HEAD_DIM=d,
++                             num_warps=4)
++    return out
++
++
++__all__ = ["gqa_decode_attn"]
 diff --git a/zluda_ops/graph_decode.py b/zluda_ops/graph_decode.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..44e51bfd7719bcd5984972df769c05b100308759

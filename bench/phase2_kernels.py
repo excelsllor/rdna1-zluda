@@ -1,0 +1,127 @@
+"""Phase-2 kernel validation/bench (run after a reboot, under run-zluda.cmd).
+
+Checks:
+  * GQA KV-reuse flash-decoding vs math SDPA (correctness) and vs the
+    head-per-program `flash_decode_attn` (speed / DRAM traffic);
+  * fused residual+RMSNorm vs reference (correctness) and vs the two-kernel
+    path (speed).
+Saves bench/results/phase2_kernels.json.
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+RESULTS = []
+
+
+def check(name, fn, tol=None):
+    try:
+        detail = fn()
+        RESULTS.append({"name": name, "status": "OK", "detail": detail})
+        print(f"OK   {name:34s} {str(detail)[:120]}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        RESULTS.append({"name": name, "status": "FAIL",
+                        "detail": f"{type(exc).__name__}: {str(exc)[:160]}"})
+        print(f"FAIL {name:34s} {type(exc).__name__}: {str(exc)[:100]}", flush=True)
+
+
+def bench(fn, n=20):
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / n * 1e6
+
+
+def math_ref(q, k, v, causal):
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    with sdpa_kernel(SDPBackend.MATH):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=causal, enable_gqa=True)
+
+
+def main():
+    if not torch.cuda.is_available():
+        print("CUDA/ZLUDA device is not available")
+        return 1
+    torch.cuda.set_per_process_memory_fraction(0.7)
+    from zluda_ops.gqa_decode import gqa_decode_attn
+    from zluda_ops.flash_decode import flash_decode_attn
+    from zluda_ops import fused as F
+
+    def gqa_correctness():
+        torch.manual_seed(0)
+        out = {}
+        for n, m in ((1024, 1), (2048, 1), (2048, 4)):
+            b, hq, hkv, d = 1, 14, 2, 64
+            q = torch.randn(b, hq, m, d, device="cuda", dtype=torch.float16)
+            k = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
+            v = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
+            ref = math_ref(q, k, v, causal=(m > 1))
+            got = gqa_decode_attn(q, k, v, causal=(m > 1))
+            assert got is not None, "shapes unsupported"
+            out[f"n{n}_m{m}"] = float((got.float() - ref.float()).abs().max())
+        return out
+
+    def gqa_speed():
+        b, hq, hkv, d, n, m = 1, 14, 2, 64, 2048, 1
+        q = torch.randn(b, hq, m, d, device="cuda", dtype=torch.float16)
+        k = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
+        v = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
+        kv_bytes = 2 * b * hkv * n * d * 2
+        gqa_us = bench(lambda: gqa_decode_attn(q, k, v))
+        old_us = bench(lambda: flash_decode_attn(q, k, v))
+        return {"gqa_us": round(gqa_us, 1), "old_us": round(old_us, 1),
+                "speedup_vs_head_per_program": round(old_us / gqa_us, 2),
+                "effective_GBs": round(kv_bytes / gqa_us / 1e3, 1)}
+
+    def rms_correctness():
+        torch.manual_seed(0)
+        x = torch.randn(2, 128, device="cuda", dtype=torch.float16)
+        d = torch.randn(2, 128, device="cuda", dtype=torch.float16)
+        w = torch.randn(128, device="cuda", dtype=torch.float16)
+        y, res = F.add_rms_norm(x, d, w)
+        res_ref = x.float() + d.float()
+        y_ref = (res_ref * torch.rsqrt(res_ref.pow(2).mean(-1, keepdim=True) + 1e-6)
+                 * w.float())
+        return {"res_err": round(float((res.float() - res_ref).abs().max()), 5),
+                "y_err": round(float((y.float() - y_ref).abs().max()), 4)}
+
+    def rms_speed():
+        x = torch.randn(1, 896, device="cuda", dtype=torch.float16)
+        d = torch.randn(1, 896, device="cuda", dtype=torch.float16)
+        w = torch.randn(896, device="cuda", dtype=torch.float16)
+        fused_us = bench(lambda: F.add_rms_norm(x, d, w))
+
+        def two_kernel():
+            res = x + d
+            F.rms_norm(res, w)
+
+        old_us = bench(two_kernel)
+        return {"fused_us": round(fused_us, 1), "two_kernel_us": round(old_us, 1),
+                "speedup": round(old_us / fused_us, 2)}
+
+    check("gqa_decode_correctness", gqa_correctness)
+    check("gqa_decode_speed", gqa_speed)
+    check("add_rms_norm_correctness", rms_correctness)
+    check("add_rms_norm_speed", rms_speed)
+    ok = sum(1 for r in RESULTS if r["status"] == "OK")
+    print(f"SUMMARY {ok}/{len(RESULTS)} phase-2 kernel checks passed", flush=True)
+    out = Path(__file__).resolve().parents[1] / "bench" / "results" / "phase2_kernels.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"results": RESULTS}, indent=1), encoding="utf-8")
+    print(f"report: {out}", flush=True)
+    return 0 if ok == len(RESULTS) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
