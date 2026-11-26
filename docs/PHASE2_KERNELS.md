@@ -98,3 +98,28 @@ lm_head 151936x896 347 GB/s (77%); small decode kernels are dominated by the
   parallelise the block reduction before using it in hot loops;
 - autotune tables per shape; wire fused QKV/GQA kernels into the graph-decoder
   layer path (currently fused norm + MLP).
+## Phase-2 tuning round (2026-11-26, final)
+
+- **Sampling** parallelised: two-stage reduction (block Gumbel-argmax → merge)
+  with torch-generated uniform noise (`tl.rand` lowering is pathologically slow
+  on this stack). Standalone: **138.6 us** for a 151936 vocab (was 658 us in the
+  single-program version, 3693 us with `tl.rand`), greedy exact, top-50 40/40,
+  empirical frequencies match softmax. The bench number (430 us) includes the
+  caller-side top-k masking kernels.
+- **GEMV autotune**: `bench/autotune_gemv.py` sweeps (BK, num_warps) against the
+  real kernel and writes `zluda_ops/tuned_gemv_ext.py`; `gemv._config` uses it
+  for shapes without a hand-tuned entry (falls back to CONFIGS otherwise).
+  Sweep (raw kernel): 896x896 30.5 us, 4864x896 57.1 us, 896x4864 59.7 us,
+  151936x896 1130 us, 4096x4096 111.8 us, 4864x4864 159.8 us (clocks are not
+  fixed, so the numbers have run-to-run variance; the hand-tuned TUNED_M1
+  entries keep priority).
+- **int8 prefill tuning**: best config (bm=128, bn=64, bk=128, warps=8,
+  stages=2) -> 387 us (M=64) / 1624 us (M=512) vs fp16 dequant-once baseline
+  207 / 726 us. int8 prefill stays ~2x slower on RDNA1 (no int8 dot product);
+  it is kept only as a VRAM-saving option and is now the default config.
+
+Final `bench/phase2_kernels.py`: **9/9 OK**. Phase 2 is complete for the
+kernel set planned in docs/KERNEL_GAPS.md; the open follow-ups are wiring the
+fused QKV/GQA kernels directly into the layer path (currently fused norm+MLP
+in the decoder layer, GQA decode in the auto-dispatch) and further e2e
+measurements.

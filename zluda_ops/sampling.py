@@ -19,6 +19,8 @@ API:
 `logits` is a 1-D tensor (vocab); returns a 0-dim int64 tensor.
 """
 
+import random
+
 import torch
 import triton
 import triton.language as tl
@@ -27,27 +29,30 @@ _BLOCK = 4096
 
 
 @triton.jit
-def _sample_gumbel(LOGITS, V, TEMP, SEED, OUT, BLOCK: tl.constexpr):
-    # Exact categorical sampling via the Gumbel-max trick:
-    #   argmax_i (logit_i / T + gumbel_i) ~ Categorical(softmax(logits / T))
-    # No cumsum / probability vector is needed, which works around the
-    # unreliable tl.cumsum lowering on this stack.
-    best_val = tl.full((), -float("inf"), tl.float32)
-    best_idx = tl.full((), 0, tl.int32)
-    for off in range(0, V, BLOCK):
-        idx = off + tl.arange(0, BLOCK)
-        mask = idx < V
-        x = tl.load(LOGITS + idx, mask=mask,
-                    other=-float("inf")).to(tl.float32) * TEMP
-        u = tl.rand(SEED, idx)
-        u = tl.maximum(u, 1e-7)
-        g = -tl.log(-tl.log(u))
-        val = tl.where(mask, x + g, -float("inf"))
-        blk_val = tl.max(val, axis=0)
-        blk_idx = tl.min(tl.where(val == blk_val, idx, 1073741824), axis=0)
-        take = blk_val > best_val
-        best_val = tl.where(take, blk_val, best_val)
-        best_idx = tl.where(take, blk_idx, best_idx)
+def _gumbel_blocks(LOGITS, U, V, TEMP, PART_VAL, PART_IDX, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < V
+    x = tl.load(LOGITS + idx, mask=mask,
+                other=-float("inf")).to(tl.float32) * TEMP
+    u = tl.load(U + idx, mask=mask, other=1.0)
+    u = tl.maximum(u, 1e-7)
+    g = -tl.log(-tl.log(u))
+    val = tl.where(mask, x + g, -float("inf"))
+    block_val = tl.max(val, axis=0)
+    block_idx = tl.min(tl.where(val == block_val, idx, 1073741824), axis=0)
+    tl.store(PART_VAL + pid, block_val)
+    tl.store(PART_IDX + pid, block_idx)
+
+
+@triton.jit
+def _gumbel_merge(PART_VAL, PART_IDX, NBLK, OUT, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < NBLK
+    val = tl.load(PART_VAL + offs, mask=mask, other=-float("inf"))
+    idx = tl.load(PART_IDX + offs, mask=mask, other=1073741824)
+    best_val = tl.max(val, axis=0)
+    best_idx = tl.min(tl.where(val == best_val, idx, 1073741824), axis=0)
     tl.store(OUT, best_idx.to(tl.int64))
 
 def sample_logits(logits, temperature=1.0, top_k=0, top_p=1.0, generator=None):
@@ -72,8 +77,19 @@ def sample_logits(logits, temperature=1.0, top_k=0, top_p=1.0, generator=None):
     out = torch.empty((), device=work.device, dtype=torch.int64)
     seed = int(torch.randint(0, 2 ** 31 - 1, (1,), device=work.device,
                              generator=generator).item())
-    _sample_gumbel[(1,)](work, work.numel(), float(temperature), seed, out,
-                         BLOCK=_BLOCK, num_warps=8)
+    v = work.numel()
+    # torch-generated uniform noise (tl.rand lowering is very slow on this stack);
+    # the Triton kernel does temperature scaling, the Gumbel transform and the
+    # two-stage argmax reduction.
+    u = torch.rand(v, device=work.device, dtype=torch.float32,
+                   generator=generator)
+    nblk = triton.cdiv(v, _BLOCK)
+    part_val = torch.empty(nblk, device=work.device, dtype=torch.float32)
+    part_idx = torch.empty(nblk, device=work.device, dtype=torch.int32)
+    _gumbel_blocks[(nblk,)](work, u, v, float(temperature), part_val,
+                            part_idx, BLOCK=_BLOCK, num_warps=8)
+    _gumbel_merge[(1,)](part_val, part_idx, nblk, out, BLOCK=128, num_warps=4)
+
 
     return out
 
