@@ -25,7 +25,7 @@
   "detail": "",
   "streams": 2,
   "events": 2,
-  "elapsed_ms": 148.411,
+  "elapsed_ms": 146.642,
   "y1_ok": true,
   "y2_ok": true
  },
@@ -42,7 +42,7 @@
   "status": "OK",
   "detail": "",
   "dtype": "fp32",
-  "max_err": 0.00021
+  "max_err": 0.00022
  },
  {
   "name": "cublas_gemm_fp16",
@@ -68,20 +68,19 @@
   "name": "cublas_gemv",
   "status": "OK",
   "detail": "",
-  "max_err": 0.0621
+  "max_err": 0.0624
  },
  {
   "name": "cublas_addmm_epilogue",
   "status": "OK",
   "detail": "",
-  "max_err": 0.041
+  "max_err": 0.052
  },
  {
   "name": "cublas_sgemv_fp32",
   "status": "OK",
   "detail": "",
   "shape": [
-   1,
    4096
   ]
  },

@@ -61,6 +61,9 @@ cuda_macros::cublas_function_declarations!(
             cublasSetWorkspace_v2,
             cublasSetVector,
             cublasSgemmStridedBatched,
+            cublasSgemv,
+            cublasSgemv_v2,
+            cublasSgemv_v2_64,
             cublasSgemm_v2,
         ],
     implemented_and_always_succeeds
@@ -155,6 +158,8 @@ cuda_macros::rocblas_function_declarations!(
             rocblas_set_workspace,
             rocblas_sgemm_strided_batched,
             rocblas_sgemm,
+            rocblas_sgemv,
+            rocblas_sgemv_64,
         ]
 );
 

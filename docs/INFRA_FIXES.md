@@ -84,3 +84,21 @@ Infra probe (`bench/infra_probe.py`) now covers both fallbacks:
 calls remain FAIL (expected, documented above). Current result: **20/24**
 checks pass; remaining failures: raw BN/RNN (use the fallbacks), fp64 GEMM
 (rocBLAS/Tensile f64 not available for gfx1010).
+
+## 2026-11-26: cublasSgemv (fp32 1-D GEMV) implemented
+
+Found by the infra probe: `torch.mv` on fp32 tensors failed with
+`CUBLAS_STATUS_NOT_SUPPORTED` (calling `cublasSgemv`). zluda_blas implemented
+only GEMM variants; GEMV was never mapped.
+
+Fix: added `sgemv`, `sgemv_v2`, `sgemv_v2_64` in `zluda_blas/src/impl.rs`
+(mapping to `rocblas_sgemv` / `rocblas_sgemv_64`), registered the rocBLAS
+symbols in the vtable and the cublas entry points in the implemented list.
+
+Verified: `torch.mv` fp32 and fp16 now work (512-element output, fp16 path uses
+the existing Hgemm? - `torch.mv` fp16 also OK), `w @ x` 1-D works.
+
+Still unsupported: `cublasDgemv` (fp64 GEMV) - the crate has no `FromCuda`
+conversion for `*const f64` arguments, and fp64 BLAS is generally unavailable on
+this gfx1010 build (no f64 Tensile). fp64 `torch.mv`/`torch.linalg` remain
+documented limitations.

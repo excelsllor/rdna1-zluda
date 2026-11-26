@@ -21,7 +21,7 @@ blockers fixed.
 | ZLUDA core (nvcuda.dll) | WORKS | PyTorch 2.7.1+cu118, llama.cpp, custom kernels; CUDA graphs now implemented (capture/instantiate/launch; launch-time attributes/PDL accepted) | keep; add regression tests |
 | CUDA graphs | WORKS (basic) | torch.cuda.CUDAGraph capture/replay on side streams; self-loop update-in-graph variant broken | verify capture with cuBLAS in graph; document restrictions |
 | cuBLAS -> rocBLAS (GEMM) | WORKS, near peak | 8.18 TF fp32 of 9.75 TF peak with tuned gfx1010 Tensile overrides; native ROCm torch without overrides is 4.6x slower | keep (phase 3 optional) |
-| cuBLAS GEMV (small M) | WORKS but SLOW | 24-284 us per matvec; 15-40% of bandwidth; Triton/HIP GEMV prototypes 1.1-4.8x faster | phase 2 (Triton) then phase 3 |
+| cuBLAS GEMV (small M) | WORKS but SLOW (Triton path used) | cublasSgemv was unimplemented and is now mapped (torch.mv fp32/fp16 work); for ULMs the Triton GEMV is used. Bandwidth 15-40% of peak -> phase 2/3. | phase 2 then phase 3 |
 | cuBLASLt (cublasLt64_11/12/13.dll) | MAPPED, UNVERIFIED | DLLs exist; PyTorch rarely exercises the epilogue paths | probe with a bias-epilogue GEMM / vendor code |
 | cuDNN -> MIOpen: conv2d | WORKS (with solver selection) | fp16 3x3 picks GEMM solver; per-shape auto-selection implemented (fp32 Winograd cached-weight path 1.4-2.7x) | keep; extend to conv1d/3d/transposed |
 | cuDNN: pool2d / avgpool / conv_transpose | WORKS | probe OK | regression tests |

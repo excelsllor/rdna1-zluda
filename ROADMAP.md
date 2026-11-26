@@ -248,6 +248,12 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - cublasSgemv fixed:** zluda_blas had no level-2 BLAS at all, so
+  torch.mv on fp32 failed with CUBLAS_STATUS_NOT_SUPPORTED. Added sgemv /
+  sgemv_v2 / sgemv_v2_64 mapping to rocBLAS (+vtable/implemented wiring);
+  torch.mv fp32 and fp16 now work. cublasDgemv (fp64) remains unsupported (no
+  FromCuda conversion for *const f64; fp64 BLAS absent on this gfx1010 build).
+  Infra probe: 21/25 OK.
 - **2026-11-26 - kernel gaps + allocation audit:** added fused int8 GEMV
   (`quant.int8_linear`, correct 2e-4..4e-3) - fused is memory-optimal but
   dequant-once+tuned fp16 GEMV is faster for compute (45.6 vs 61.9 us qkv,
