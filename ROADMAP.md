@@ -248,6 +248,12 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - torch.compile + StaticCache blocked:** compiling the
+  StaticCache decode path fails in Inductor kernel generation
+  (`Triton Error [CUDA]: error`); prefill compile (plain model, DynamicCache)
+  still works (+42-49%). Decode delivery stays CUDA-graph replay
+  (`zluda_ops.graph_decode.GraphDecoder`). Open item: identify the failing
+  inductor kernel.
 - **2026-11-26 - cublasSgemv fixed:** zluda_blas had no level-2 BLAS at all, so
   torch.mv on fp32 failed with CUBLAS_STATUS_NOT_SUPPORTED. Added sgemv /
   sgemv_v2 / sgemv_v2_64 mapping to rocBLAS (+vtable/implemented wiring);
