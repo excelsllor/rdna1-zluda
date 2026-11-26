@@ -23,6 +23,50 @@ def _bf16_allowed(weight):
     return _BF16_LIMIT > 0 and weight.numel() * weight.element_size() <= _BF16_LIMIT
 
 
+
+_SDPA_FLAGS = None
+
+
+def _disable_fast_sdpa():
+    """Disable PyTorch SDPA backends that crash under ZLUDA.
+
+    The flash/efficient/cudnn SDPA backends either report "no available kernel"
+    or fail with an async launch error that poisons the CUDA context (a crash in
+    `fmha` kernels). MATH is the only safe backend; our Triton FA/flash-decoding
+    paths are dispatched by this module before falling back to math.
+    """
+    global _SDPA_FLAGS
+    try:
+        import torch
+
+        _SDPA_FLAGS = (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
+
+
+def _restore_sdpa():
+    global _SDPA_FLAGS
+    if _SDPA_FLAGS is None:
+        return
+    try:
+        import torch
+
+        flash, eff, cudnn = _SDPA_FLAGS
+        torch.backends.cuda.enable_flash_sdp(flash)
+        torch.backends.cuda.enable_mem_efficient_sdp(eff)
+        torch.backends.cuda.enable_cudnn_sdp(cudnn)
+    except Exception:
+        pass
+    _SDPA_FLAGS = None
+
 def _compiling():
     try:
         return torch._dynamo.is_compiling()
@@ -116,6 +160,7 @@ def install():
     _orig_sdpa = F.scaled_dot_product_attention
     F.linear = _linear
     F.scaled_dot_product_attention = _sdpa
+    _disable_fast_sdpa()
     if (os.environ.get("ZLUDA_CONV_FP32") == "1"
             or os.environ.get("ZLUDA_CONV_AUTO") == "1"):
         _conv.install()

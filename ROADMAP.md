@@ -248,6 +248,20 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - compatibility matrix (pre-Phase-2):** added docs/COMPAT_MATRIX.md
+  with crash-isolated results. Attention: prefill math/Triton-FA/flex
+  (slow)/flash_attn/xformers work; PyTorch sdpa_default/flash/efficient/cudnn
+  FAIL (launch failure / cutlass fmha sm80 arch fatal) -> zluda_ops.auto now
+  disables the fast SDPA backends; decode: flash-decoding 0.121 ms vs math
+  0.305 (2.5x). llama.cpp: F16 fa0 and F32 fa0 work (pp64 1762/2841, tg4
+  172/139), fa1 fails (named symbol not found), Q4/Q8 MMQ not runnable safely.
+  torch.compile: prefill works with math SDPA (6449-6733 tok/s), fails with raw
+  SDPA (cuDNN fmha) or with zluda_ops.auto (Inductor Triton Error); decode
+  compile (StaticCache) fails; reduce-overhead unsupported. ComfyUI: base mode
+  did not reach API within 200 s under ZLUDA, custom-nodes launcher fails on
+  comfyui-sam3 missing comfy_env; 0.5 MP Flux GGUF e2e not completed (needs
+  matching text encoders + more VRAM; plan after fresh reboot with minimal
+  node set at 704x704).
 - **2026-11-26 - PHASE 1 COMPLETE (acceptance suite PASS):** implemented
   `tools/run_infra_suite.ps1` (infra probe + training suite + shim smoke):
   infra 21/25, training 7/7, shims 4/4 -> PASS. Closed in this phase: cuFFT and
