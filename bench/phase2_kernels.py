@@ -147,6 +147,36 @@ def main():
         err_v = float((v_cache[:, pos].float() - v_ref).abs().max())
         return {"q": round(err_q, 4), "k": round(err_k, 4), "v": round(err_v, 4)}
 
+    def gqa_m1_speed():
+        from zluda_ops.gqa_decode import gqa_decode_m1
+
+        b, hq, hkv, d, n = 1, 14, 2, 64, 2048
+        q = torch.randn(b, hq, 1, d, device="cuda", dtype=torch.float16)
+        k = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
+        v = torch.randn(b, hkv, n, d, device="cuda", dtype=torch.float16)
+        ref = math_ref(q, k, v, False)
+        got = gqa_decode_m1(q, k, v)
+        err = float((got.float() - ref.float()).abs().max())
+        m1_us = bench(lambda: gqa_decode_m1(q, k, v))
+        old_us = bench(lambda: flash_decode_attn(q, k, v))
+        return {"m1_us": round(m1_us, 1), "old_us": round(old_us, 1),
+                "speedup": round(old_us / m1_us, 2), "err": round(err, 6)}
+
+    check("gqa_decode_m1_speed", gqa_m1_speed)
+    def embedding_check():
+        from zluda_ops.embedding import embedding_lookup
+
+        torch.manual_seed(0)
+        w = torch.randn(1000, 896, device="cuda", dtype=torch.float16)
+        idx = torch.randint(0, 1000, (7,), device="cuda")
+        y = embedding_lookup(idx, w, scale=2.0)
+        ref = w[idx].float() * 2.0
+        err = float((y.float() - ref).abs().max())
+        us = bench(lambda: embedding_lookup(idx, w, scale=2.0))
+        return {"err": round(err, 5), "us": round(us, 1)}
+
+    check("embedding_gather_scale", embedding_check)
+
     check("qkv_rope_append_correctness", qkv_rope_append_check)
     ok = sum(1 for r in RESULTS if r["status"] == "OK")
     print(f"SUMMARY {ok}/{len(RESULTS)} phase-2 kernel checks passed", flush=True)

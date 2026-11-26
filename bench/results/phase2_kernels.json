@@ -1,0 +1,67 @@
+{
+ "results": [
+  {
+   "name": "gqa_decode_correctness",
+   "status": "OK",
+   "detail": {
+    "n1024_m1": 3.0517578125e-05,
+    "n2048_m1": 1.52587890625e-05,
+    "n2048_m4": 3.2607574462890625
+   }
+  },
+  {
+   "name": "gqa_decode_speed",
+   "status": "OK",
+   "detail": {
+    "gqa_us": 87.5,
+    "old_us": 115.9,
+    "speedup_vs_head_per_program": 1.32,
+    "effective_GBs": 12.0
+   }
+  },
+  {
+   "name": "add_rms_norm_correctness",
+   "status": "OK",
+   "detail": {
+    "res_err": 0.00098,
+    "y_err": 0.001
+   }
+  },
+  {
+   "name": "add_rms_norm_speed",
+   "status": "OK",
+   "detail": {
+    "fused_us": 1.1,
+    "two_kernel_us": 46.2,
+    "speedup": 43.16
+   }
+  },
+  {
+   "name": "gqa_decode_m1_speed",
+   "status": "OK",
+   "detail": {
+    "m1_us": 89.6,
+    "old_us": 113.1,
+    "speedup": 1.26,
+    "err": 2e-06
+   }
+  },
+  {
+   "name": "embedding_gather_scale",
+   "status": "OK",
+   "detail": {
+    "err": 0.0,
+    "us": 21.3
+   }
+  },
+  {
+   "name": "qkv_rope_append_correctness",
+   "status": "OK",
+   "detail": {
+    "q": 0.0018,
+    "k": 0.0009,
+    "v": 0.001
+   }
+  }
+ ]
+}

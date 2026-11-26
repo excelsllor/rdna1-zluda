@@ -108,6 +108,8 @@ def gqa_decode_attn(q, k, v, causal=False, splits=None):
         splits = _choose_splits(n, b * hq)
     if n % (BLOCK_N * splits):
         return None
+    if m == 1:
+        return gqa_decode_m1(q, k, v, causal=causal, splits=None)
     partials = torch.empty(b * hq * splits * m * d, device=q.device,
                            dtype=torch.float32)
     maxs = torch.empty(b * hq * splits * m, device=q.device, dtype=torch.float32)
@@ -130,4 +132,89 @@ def gqa_decode_attn(q, k, v, causal=False, splits=None):
     return out
 
 
-__all__ = ["gqa_decode_attn"]
+__all__ = ["gqa_decode_attn", "gqa_decode_m1"]
+
+@triton.jit
+def _gqa_decode_m1_kernel(Q, K, V, Out, Max, Lsum,
+                          stride_qz, stride_qh, stride_qm, stride_qk,
+                          stride_kz, stride_kh, stride_kn, stride_kk,
+                          stride_vz, stride_vh, stride_vn, stride_vk,
+                          HQ, HKV, GROUP, N, OFFSET, sm_scale,
+                          SPLITS: tl.constexpr, BLOCK_N: tl.constexpr,
+                          HEAD_DIM: tl.constexpr, CAUSAL: tl.constexpr):
+    pid_split = tl.program_id(0)
+    bhid_kv = tl.program_id(1)
+    off_z = bhid_kv // HKV
+    off_hkv = bhid_kv % HKV
+    k_off = off_z * stride_kz + off_hkv * stride_kh
+    v_off = off_z * stride_vz + off_hkv * stride_vh
+    offs_d = tl.arange(0, HEAD_DIM)
+    qk_scale = sm_scale * 1.44269504
+    chunk = N // SPLITS
+    start = pid_split * chunk
+    end = start + chunk
+    for g in range(GROUP):
+        off_h = off_hkv * GROUP + g
+        q_off = off_z * stride_qz + off_h * stride_qh
+        q = tl.load(Q + q_off + offs_d * stride_qk).to(tl.float32)
+        m_i = -float("inf")
+        l_i = 0.0
+        acc = tl.zeros((HEAD_DIM,), tl.float32)
+        for start_n in range(start, end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            k = tl.load(K + k_off + offs_n[:, None] * stride_kn
+                        + offs_d[None, :] * stride_kk).to(tl.float32)
+            qk = tl.sum(k * q[None, :], axis=1) * qk_scale
+            if CAUSAL:
+                qk = tl.where(offs_n <= OFFSET, qk, -1.0e6)
+            m_new = tl.maximum(m_i, tl.max(qk))
+            p = tl.math.exp2(qk - m_new)
+            alpha = tl.math.exp2(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p)
+            v = tl.load(V + v_off + offs_n[:, None] * stride_vn
+                        + offs_d[None, :] * stride_vk).to(tl.float32)
+            acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+            m_i = m_new
+        part = (off_z * HQ + off_h) * SPLITS + pid_split
+        tl.store(Out + part * HEAD_DIM + offs_d,
+                 acc.to(Out.dtype.element_ty))
+        tl.store(Max + part, m_i)
+        tl.store(Lsum + part, l_i)
+
+
+def gqa_decode_m1(q, k, v, causal=False, splits=None, block_n=128):
+    """Specialised M=1 GQA decode (vector path, no BLOCK_M padding waste)."""
+    if (not q.is_cuda or q.dim() != 4 or q.shape[2] != 1
+            or q.dtype != torch.float16 or q.shape[3] != 64):
+        return None
+    b, hq, _, d = q.shape
+    hkv = k.shape[1]
+    n = k.shape[2]
+    if hq % hkv or n < 512 or n % block_n:
+        return None
+    if splits is None:
+        splits = _choose_splits(n, b * hq, target_programs=256)
+        if n % (block_n * splits):
+            splits = 1
+    if n % (block_n * splits):
+        return None
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    partials = torch.empty(b * hq * splits * d, device=q.device,
+                           dtype=torch.float32)
+    maxs = torch.empty(b * hq * splits, device=q.device, dtype=torch.float32)
+    lsums = torch.empty_like(maxs)
+    out = torch.empty(b, hq, 1, d, device=q.device, dtype=torch.float16)
+    sm_scale = 1.0 / (d ** 0.5)
+    _gqa_decode_m1_kernel[(splits, b * hkv)](
+        q, k, v, partials, maxs, lsums,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        hq, hkv, hq // hkv, n, n - 1, sm_scale,
+        SPLITS=splits, BLOCK_N=block_n, HEAD_DIM=d, CAUSAL=causal,
+        num_warps=4, num_stages=1,
+    )
+    _decode_merge[(b * hq,)](partials, maxs, lsums, out, 1,
+                             SPLITS=splits, BLOCK_M=BLOCK_M, HEAD_DIM=d,
+                             num_warps=4)
+    return out

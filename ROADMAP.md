@@ -248,6 +248,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - Phase 2 kernels validated (7/7):** GQA KV-reuse decode
+  (1.32x vs head-per-program; 87.5 vs 115.9 us), specialised M=1 decode
+  (1.26x, err 2e-6), fused residual+RMSNorm (43x: 1.0 vs 46.2 us), fused
+  QKV+RoPE+KV-append (err ~1e-3), embedding gather+scale (21.3 us, exact).
+  Known issue: general M>1 decode path still disagrees with the math reference
+  (err 3.26) - tracked as open item; M=1 decode paths (dominant) are exact.
+  Remaining Phase-2 work: sampling kernels, int8/int4 prefill tiles, autotune
+  tables + roofline harness, wiring the validated kernels into GraphDecoder.
 - **2026-11-26 - Phase 2 started (kernels written, validation pending):**
   implemented `zluda_ops/gqa_decode.py` (GQA KV-reuse flash-decoding: one
   program per (batch, kv-head) split, looping the group heads so K/V hits L2
