@@ -2171,10 +2171,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..92d37f86c216496b70e84539d1ae4181306e23bb
+index 0000000000000000000000000000000000000000..98426e206d5279898ebc4ad30575dcbc6c0573ff
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,627 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2425,6 +2425,15 @@ index 0000000000000000000000000000000000000000..92d37f86c216496b70e84539d1ae4181
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-26 - fused SwiGLU GEMV merged + model patch:** the earlier NaN in
++  the fused gate/up+SwiGLU kernel was a missing K-bound mask (out-of-bounds tile
++  reads), not a Triton codegen bug; with the mask it is correct (err 0.0078) and
++  faster than the 3-kernel path (70.9 vs 98.3 us at 4864x896 = 1.39x, 32.5 vs
++  70.5 us at 896x896 = 2.17x). zluda_ops/model_patches.py patches the Qwen2 MLP
++  decode path to use it; end-to-end graph-replay decode gain ~1%
++  (10.83 -> 10.74 ms/token at 1k) as the kernel saving is partly hidden by the
++  rest of the layer. Removed leftover debug eprintln from ZLUDA stream/graph
++  capture paths. torch.compile + StaticCache remains blocked.
 +- **2026-11-26 - torch.compile + StaticCache blocked:** compiling the
 +  StaticCache decode path fails in Inductor kernel generation
 +  (`Triton Error [CUDA]: error`); prefill compile (plain model, DynamicCache)
@@ -10961,10 +10970,10 @@ index 0000000000000000000000000000000000000000..978b93b95758eb14bf192e0eed06bda0
 +documented limitations.
 diff --git a/docs/KERNEL_GAPS.md b/docs/KERNEL_GAPS.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..e26ebc00c6b80a4d4f1191e6b7059ecd683adf64
+index 0000000000000000000000000000000000000000..e1501fe5b58a809612b7d5888802c99e9c404bc9
 --- /dev/null
 +++ b/docs/KERNEL_GAPS.md
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,87 @@
 +# Kernel gaps: what should exist and does not (2026-11-26)
 +
 +Audit of kernels that standard GPU stacks provide (cuBLAS/rocBLAS, PyTorch,
@@ -10991,14 +11000,25 @@ index 0000000000000000000000000000000000000000..e26ebc00c6b80a4d4f1191e6b7059ecd
 +GEMV is faster; the fused int8 kernel is the memory-optimal option (1 byte per
 +weight, no fp16 copy). Keep both; pick per use case (VRAM-bound vs speed-bound).
 +
-+### Fused gate/up + SwiGLU GEMV - attempted, NOT merged
-+A Triton kernel computing `silu(x.Wg+bg) * (x.Wu+bu)` in one pass would remove
-+one launch and the intermediate pair (N=4864 each). Two implementations were
-+tried (scalar reduce, then block-of-rows) and both produced wrong/NaN output on
-+this Triton/ZLUDA stack while the same math with two `gemv` calls + `fused.swiglu`
-+is correct - a codegen issue to debug separately (documented as open item).
-+Expected gain when fixed: ~2x vs the 3-kernel path (measured 95 us fused vs
-+195 us torch path in the failing prototype, so the potential is real).
++### Fused gate/up + SwiGLU GEMV - merged (`zluda_ops.fused.swiglu_gemv`)
++Computes `silu(x.Wg + bg) * (x.Wu + bu)` for M=1 decode in one kernel instead of
++two GEMV calls plus a separate swiglu kernel.
++
++Correctness (vs the 3-kernel reference): max abs error 0.0078 (fp16 rounding).
++Performance (fp16, M=1):
++
++| shape | fused | 3-kernel path | speedup |
++|---|---|---|---|
++| 4864 x 896 (gate/up) | 70.9 us | 98.3 us | 1.39x |
++| 896 x 896 | 32.5 us | 70.5 us | 2.17x |
++
++The first prototype returned NaN/large errors; the root cause was not a Triton
++codegen bug but a missing K-bound mask (the last BK tile read past column K).
++With the mask the kernel is correct; integrated into the Qwen2 MLP decode path
++via `zluda_ops/model_patches.py` it gives a small end-to-end gain in
++graph-replayed decode (~1%: 10.83 -> 10.74 ms/token at 1k context; the
++kernel-level win is partly hidden by attention/GEMV/launch costs of the other
++layers).
 +
 +## 2. Missing kernels (not implemented yet, ranked by value)
 +
@@ -15272,17 +15292,10 @@ index d4342e7168a84dcd0329a6073d83163644a56df2..c489cba3f57bdff25ae9b0e07d3f763e
      function::launch_kernel(
          f,
 diff --git a/zluda/src/impl/graph.rs b/zluda/src/impl/graph.rs
-index 9776c16a5a7f4d36f3253f0bc512f00dd927117c..5961295e943ced48d2817b6a230de925f97f515e 100644
+index 9776c16a5a7f4d36f3253f0bc512f00dd927117c..205512310415ab4804f6ef1ce9d086ad95f01192 100644
 --- a/zluda/src/impl/graph.rs
 +++ b/zluda/src/impl/graph.rs
-@@ -73,9 +73,21 @@ pub(crate) unsafe fn instantiate_with_flags(
-     graph: hipGraph_t,
-     flags: u64,
- ) -> hipError_t {
-+    eprintln!("zluda: cuGraphInstantiateWithFlags called");
-     hipGraphInstantiateWithFlags(graph_exec, graph, flags)
- }
- 
+@@ -79,3 +79,13 @@ pub(crate) unsafe fn instantiate_with_flags(
  pub(crate) unsafe fn launch(graph_exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t {
      hipGraphLaunch(graph_exec, stream)
  }
@@ -15294,7 +15307,6 @@ index 9776c16a5a7f4d36f3253f0bc512f00dd927117c..5961295e943ced48d2817b6a230de925
 +    log_buffer: *mut ::core::ffi::c_char,
 +    buffer_size: usize,
 +) -> hipError_t {
-+    eprintln!("zluda: cuGraphInstantiate called");
 +    hipGraphInstantiate(graph_exec, graph, error_node, log_buffer, buffer_size)
 +}
 diff --git a/zluda/src/impl/module.rs b/zluda/src/impl/module.rs
@@ -15383,28 +15395,21 @@ index d3a895b0dc474b2c8765b450a0aa9b6e121f3411..b6e05e9a351a70d180907b5a643d3038
          key.last_access = zluda_cache::ModuleCache::time_now();
          cache.insert_module(key, &elf_module);
 diff --git a/zluda/src/impl/stream.rs b/zluda/src/impl/stream.rs
-index 708b043726b82c2622c2640260299c3d44c20e22..1f798b2f91af9a2645e2247520c52604cb8ac164 100644
+index 708b043726b82c2622c2640260299c3d44c20e22..254902408fdd6e86416b6d5aa02102ac6cedd55d 100644
 --- a/zluda/src/impl/stream.rs
 +++ b/zluda/src/impl/stream.rs
-@@ -20,11 +20,16 @@ pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
+@@ -20,6 +20,11 @@ pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
      unsafe { hipStreamDestroy(stream) }
  }
  
--pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t {
-+pub(crate) fn begin_capture(stream: hipStream_t) -> hipError_t { eprintln!("zluda: cuStreamBeginCapture called");
++pub(crate) fn begin_capture(stream: hipStream_t) -> hipError_t {
 +    // legacy (non-v2) cuStreamBeginCapture has no mode argument; CUDA uses
 +    // CU_STREAM_CAPTURE_MODE_GLOBAL semantics for it.
 +    unsafe { hipStreamBeginCapture(stream, hipStreamCaptureMode(0)) }
 +}
-+pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t { eprintln!("zluda: cuStreamBeginCapture_v2 called");
+ pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t {
      unsafe { hipStreamBeginCapture(stream, mode) }
  }
- 
--pub(crate) fn end_capture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t {
-+pub(crate) fn end_capture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t { eprintln!("zluda: cuStreamEndCapture called");
-     unsafe { hipStreamEndCapture(stream, graph) }
- }
- 
 @@ -35,6 +40,13 @@ pub(crate) fn is_capturing(
      unsafe { hipStreamIsCapturing(stream, capture_status) }
  }
@@ -18000,10 +18005,10 @@ index 0000000000000000000000000000000000000000..a793bf1a34b95d6417bd9e74b6d109e2
 +]
 diff --git a/zluda_ops/fused.py b/zluda_ops/fused.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..86f31dc90d20ed2cf91f0ee5fa2e3e91e38513a2
+index 0000000000000000000000000000000000000000..e2eb26fb10473a005c02225aac636a1ad17a467a
 --- /dev/null
 +++ b/zluda_ops/fused.py
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,474 @@
 +"""Fused Triton kernels for common transformer operations on gfx1010.
 +
 +Implemented (fp16 tensors, contiguous last dimension):
@@ -18419,11 +18424,65 @@ index 0000000000000000000000000000000000000000..86f31dc90d20ed2cf91f0ee5fa2e3e91
 +    )
 +    return param
 +
-+__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
++__all__ = ["rms_norm", "rope_apply", "swiglu", "swiglu_gemv", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
 +
 +# ---------------------------------------------------------------------------
 +
 +# ---------------------------------------------------------------------------
++
++# ---------------------------------------------------------------------------
++# Fused gate/up + SwiGLU GEMV (decode): y[n] = silu(x.Wg[n]+bg) * (x.Wu[n]+bu)
++# ---------------------------------------------------------------------------
++@triton.jit
++def _swiglu_gemv_kernel(WG, WU, X, Y, BG, BU, N, K,
++                        BLOCK_N: tl.constexpr, BK: tl.constexpr,
++                        HAS_BIAS: tl.constexpr):
++    pid = tl.program_id(0)
++    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
++    rmask = rows < N
++    ag = tl.zeros((BLOCK_N,), tl.float32)
++    au = tl.zeros((BLOCK_N,), tl.float32)
++    for k0 in range(0, K, BK):
++        offs = k0 + tl.arange(0, BK)
++        kmask = offs < K
++        x = tl.load(X + offs, mask=kmask, other=0.0).to(tl.float32)
++        wmask = rmask[:, None] & kmask[None, :]
++        wg = tl.load(WG + rows[:, None] * K + offs[None, :],
++                     mask=wmask, other=0.0).to(tl.float32)
++        wu = tl.load(WU + rows[:, None] * K + offs[None, :],
++                     mask=wmask, other=0.0).to(tl.float32)
++        ag += tl.sum(wg * x[None, :], axis=1)
++        au += tl.sum(wu * x[None, :], axis=1)
++    if HAS_BIAS:
++        ag += tl.load(BG + rows, mask=rmask, other=0.0).to(tl.float32)
++        au += tl.load(BU + rows, mask=rmask, other=0.0).to(tl.float32)
++    tl.store(Y + rows, ((ag * tl.sigmoid(ag)) * au).to(Y.dtype.element_ty),
++             mask=rmask)
++
++
++def swiglu_gemv(x, w_gate, w_up, bias_gate=None, bias_up=None,
++                block_n=64, block_k=256):
++    """Fused silu(x@Wg + bg) * (x@Wu + bu) for M=1 decode. Returns (N,) fp16."""
++    if (not x.is_cuda or x.dtype != torch.float16 or x.dim() != 2
++            or x.shape[0] != 1 or not x.is_contiguous()):
++        return None
++    n, k = w_gate.shape
++    if w_up.shape != (n, k) or not w_gate.is_contiguous() or not w_up.is_contiguous():
++        return None
++    had_bias = bias_gate is not None and bias_up is not None
++    if had_bias and (bias_gate.shape != (n,) or bias_up.shape != (n,)
++                     or bias_gate.dtype != torch.float16
++                     or bias_up.dtype != torch.float16):
++        return None
++    y = torch.empty(n, device=x.device, dtype=torch.float16)
++    grid = (triton.cdiv(n, block_n),)
++    _swiglu_gemv_kernel[grid](
++        w_gate, w_up, x, y,
++        bias_gate if had_bias else y, bias_up if had_bias else y,
++        n, k, BLOCK_N=block_n, BK=block_k, HAS_BIAS=had_bias,
++        num_warps=4, num_stages=1,
++    )
++    return y
 diff --git a/zluda_ops/gemv.py b/zluda_ops/gemv.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..ef18a47deb4135107a7533b6f46c69cbdbbb868d
@@ -18673,6 +18732,76 @@ index 0000000000000000000000000000000000000000..dfc22e22129ff9afe19212172aa216f7
 +
 +
 +__all__ = ["install", "uninstall", "installed"]
+diff --git a/zluda_ops/model_patches.py b/zluda_ops/model_patches.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..61e112d41e93b9cee41973dd011e5141b1bfeeb7
+--- /dev/null
++++ b/zluda_ops/model_patches.py
+@@ -0,0 +1,63 @@
++"""Model-side patches: fused kernels in HF transformer forwards (ZLUDA/RDNA1).
++
++Currently patches Qwen2-style MLP so that single-token decode uses the fused
++`sila(x@Wg + bg) * (x@Wu + bu)` GEMV (`zluda_ops.fused.swiglu_gemv`) instead of
++two separate projections plus an elementwise kernel. Other paths are untouched.
++
++Usage:
++    from zluda_ops import model_patches
++    model_patches.install()   # optional; GraphDecoder users benefit most
++    model_patches.uninstall()
++"""
++
++import torch
++
++_orig = {}
++_installed = False
++
++
++def _mlp_forward(self, x):
++    from . import fused as _fused
++
++    if (x.dim() == 3 and x.shape[0] == 1 and x.shape[1] <= 16
++            and x.dtype == torch.float16 and x.is_contiguous()):
++        flat = x.reshape(-1, x.shape[-1])
++        out = _fused.swiglu_gemv(flat, self.gate_proj.weight,
++                                 self.up_proj.weight, self.gate_proj.bias,
++                                 self.up_proj.bias)
++        if out is not None:
++            return self.down_proj(out.reshape(x.shape[:-1] + (out.shape[0],)))
++    gate = self.gate_proj(x)
++    up = self.up_proj(x)
++    return self.down_proj(self.act_fn(gate) * up)
++
++
++def install():
++    """Patch Qwen2 MLP forward with the fused decode path."""
++    global _installed
++    if _installed:
++        return False
++    from transformers.models.qwen2 import modeling_qwen2 as mq
++
++    _orig["mlp"] = mq.Qwen2MLP.forward
++    mq.Qwen2MLP.forward = _mlp_forward
++    _installed = True
++    return True
++
++
++def uninstall():
++    global _installed
++    if not _installed:
++        return False
++    from transformers.models.qwen2 import modeling_qwen2 as mq
++
++    mq.Qwen2MLP.forward = _orig["mlp"]
++    _installed = False
++    return True
++
++
++def installed():
++    return _installed
++
++
++__all__ = ["install", "uninstall", "installed"]
+\ No newline at end of file
 diff --git a/zluda_ops/optim8bit.py b/zluda_ops/optim8bit.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..2725af6f74a44c2869d5a36973d1c8ae57f58425
