@@ -2171,10 +2171,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..0ac5b12b276da757e3711a836f87a3a8858b575d
+index 0000000000000000000000000000000000000000..92d37f86c216496b70e84539d1ae4181306e23bb
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,618 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2425,6 +2425,12 @@ index 0000000000000000000000000000000000000000..0ac5b12b276da757e3711a836f87a3a8
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-26 - torch.compile + StaticCache blocked:** compiling the
++  StaticCache decode path fails in Inductor kernel generation
++  (`Triton Error [CUDA]: error`); prefill compile (plain model, DynamicCache)
++  still works (+42-49%). Decode delivery stays CUDA-graph replay
++  (`zluda_ops.graph_decode.GraphDecoder`). Open item: identify the failing
++  inductor kernel.
 +- **2026-11-26 - cublasSgemv fixed:** zluda_blas had no level-2 BLAS at all, so
 +  torch.mv on fp32 failed with CUBLAS_STATUS_NOT_SUPPORTED. Added sgemv /
 +  sgemv_v2 / sgemv_v2_64 mapping to rocBLAS (+vtable/implemented wiring);
@@ -11586,10 +11592,10 @@ index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb9
 +ones and uninitialized buffers are not representative.
 diff --git a/docs/ROADMAP_ECOSYSTEM.md b/docs/ROADMAP_ECOSYSTEM.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..c2b151f63022d45efca1a626542672e4c9adcf0b
+index 0000000000000000000000000000000000000000..0956b20511abceb466b936703d48192da286df6d
 --- /dev/null
 +++ b/docs/ROADMAP_ECOSYSTEM.md
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,203 @@
 +# Ecosystem roadmap: close infrastructure, then Triton kernels, then custom BLAS
 +
 +Created 2026-11-25. This is the working plan for turning the ZLUDA/RDNA1 fork
@@ -11781,6 +11787,18 @@ index 0000000000000000000000000000000000000000..c2b151f63022d45efca1a626542672e4
 +   investigation; shims (flash_attn decode, xformers OOM); bnb shim.
 +4. ComfyUI end-to-end smoke (SD1.5/SDXL/Flux) with the conv auto-solver.
 +5. Commit results to `bench/results/infra/` and update this document's matrix.
++
++### torch.compile + StaticCache (2026-11-26): blocked at Inductor codegen
++
++With the GEMV/graph work in place, `torch.compile(model)` on the StaticCache
++decode path fails with `InductorError: Triton Error [CUDA]: error` while
++generating compiled kernels (some op in the StaticCache update path is not
++supported by ZLUDA's Triton backend). The earlier compile win (prefill +42-49%)
++used the plain `model(...)` DynamicCache path without StaticCache and still
++holds. Current practice: use CUDA-graph replay for decode
++(`zluda_ops.graph_decode.GraphDecoder`) and `torch.compile(mode="default")` for
++prefill only. Fixing requires identifying the failing inductor kernel (Triton
++codegen issue on ZLUDA) - open item.
 diff --git a/docs/SOLVER_AUDIT.md b/docs/SOLVER_AUDIT.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..636a04d54cc6d6b12db348899fa35397d27b5dfb

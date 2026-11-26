@@ -189,3 +189,15 @@ target workloads with fallbacks in place.
    investigation; shims (flash_attn decode, xformers OOM); bnb shim.
 4. ComfyUI end-to-end smoke (SD1.5/SDXL/Flux) with the conv auto-solver.
 5. Commit results to `bench/results/infra/` and update this document's matrix.
+
+### torch.compile + StaticCache (2026-11-26): blocked at Inductor codegen
+
+With the GEMV/graph work in place, `torch.compile(model)` on the StaticCache
+decode path fails with `InductorError: Triton Error [CUDA]: error` while
+generating compiled kernels (some op in the StaticCache update path is not
+supported by ZLUDA's Triton backend). The earlier compile win (prefill +42-49%)
+used the plain `model(...)` DynamicCache path without StaticCache and still
+holds. Current practice: use CUDA-graph replay for decode
+(`zluda_ops.graph_decode.GraphDecoder`) and `torch.compile(mode="default")` for
+prefill only. Fixing requires identifying the failing inductor kernel (Triton
+codegen issue on ZLUDA) - open item.
