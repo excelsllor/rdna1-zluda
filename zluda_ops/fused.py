@@ -413,8 +413,62 @@ def adamw_step_(param, grad, exp_avg, exp_avg_sq, lr=1e-3, beta1=0.9,
     )
     return param
 
-__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
+__all__ = ["rms_norm", "rope_apply", "swiglu", "swiglu_gemv", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
 
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Fused gate/up + SwiGLU GEMV (decode): y[n] = silu(x.Wg[n]+bg) * (x.Wu[n]+bu)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _swiglu_gemv_kernel(WG, WU, X, Y, BG, BU, N, K,
+                        BLOCK_N: tl.constexpr, BK: tl.constexpr,
+                        HAS_BIAS: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    ag = tl.zeros((BLOCK_N,), tl.float32)
+    au = tl.zeros((BLOCK_N,), tl.float32)
+    for k0 in range(0, K, BK):
+        offs = k0 + tl.arange(0, BK)
+        kmask = offs < K
+        x = tl.load(X + offs, mask=kmask, other=0.0).to(tl.float32)
+        wmask = rmask[:, None] & kmask[None, :]
+        wg = tl.load(WG + rows[:, None] * K + offs[None, :],
+                     mask=wmask, other=0.0).to(tl.float32)
+        wu = tl.load(WU + rows[:, None] * K + offs[None, :],
+                     mask=wmask, other=0.0).to(tl.float32)
+        ag += tl.sum(wg * x[None, :], axis=1)
+        au += tl.sum(wu * x[None, :], axis=1)
+    if HAS_BIAS:
+        ag += tl.load(BG + rows, mask=rmask, other=0.0).to(tl.float32)
+        au += tl.load(BU + rows, mask=rmask, other=0.0).to(tl.float32)
+    tl.store(Y + rows, ((ag * tl.sigmoid(ag)) * au).to(Y.dtype.element_ty),
+             mask=rmask)
+
+
+def swiglu_gemv(x, w_gate, w_up, bias_gate=None, bias_up=None,
+                block_n=64, block_k=256):
+    """Fused silu(x@Wg + bg) * (x@Wu + bu) for M=1 decode. Returns (N,) fp16."""
+    if (not x.is_cuda or x.dtype != torch.float16 or x.dim() != 2
+            or x.shape[0] != 1 or not x.is_contiguous()):
+        return None
+    n, k = w_gate.shape
+    if w_up.shape != (n, k) or not w_gate.is_contiguous() or not w_up.is_contiguous():
+        return None
+    had_bias = bias_gate is not None and bias_up is not None
+    if had_bias and (bias_gate.shape != (n,) or bias_up.shape != (n,)
+                     or bias_gate.dtype != torch.float16
+                     or bias_up.dtype != torch.float16):
+        return None
+    y = torch.empty(n, device=x.device, dtype=torch.float16)
+    grid = (triton.cdiv(n, block_n),)
+    _swiglu_gemv_kernel[grid](
+        w_gate, w_up, x, y,
+        bias_gate if had_bias else y, bias_up if had_bias else y,
+        n, k, BLOCK_N=block_n, BK=block_k, HAS_BIAS=had_bias,
+        num_warps=4, num_stages=1,
+    )
+    return y

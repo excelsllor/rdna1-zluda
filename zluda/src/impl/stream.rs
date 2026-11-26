@@ -20,16 +20,16 @@ pub(crate) fn destroy_v2(stream: hipStream_t) -> hipError_t {
     unsafe { hipStreamDestroy(stream) }
 }
 
-pub(crate) fn begin_capture(stream: hipStream_t) -> hipError_t { eprintln!("zluda: cuStreamBeginCapture called");
+pub(crate) fn begin_capture(stream: hipStream_t) -> hipError_t {
     // legacy (non-v2) cuStreamBeginCapture has no mode argument; CUDA uses
     // CU_STREAM_CAPTURE_MODE_GLOBAL semantics for it.
     unsafe { hipStreamBeginCapture(stream, hipStreamCaptureMode(0)) }
 }
-pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t { eprintln!("zluda: cuStreamBeginCapture_v2 called");
+pub(crate) fn begin_capture_v2(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t {
     unsafe { hipStreamBeginCapture(stream, mode) }
 }
 
-pub(crate) fn end_capture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t { eprintln!("zluda: cuStreamEndCapture called");
+pub(crate) fn end_capture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t {
     unsafe { hipStreamEndCapture(stream, graph) }
 }
 
