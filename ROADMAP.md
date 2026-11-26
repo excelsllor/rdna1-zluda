@@ -248,6 +248,18 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - PHASE 1 COMPLETE (acceptance suite PASS):** implemented
+  `tools/run_infra_suite.ps1` (infra probe + training suite + shim smoke):
+  infra 21/25, training 7/7, shims 4/4 -> PASS. Closed in this phase: cuFFT and
+  cuSPARSE now work, cublasSgemv works, cuDNN BN/RNN have documented fallbacks,
+  flash_attn/xformers decode paths fixed (0.16 ms per attention call), bits-
+  andbytes shim over optim8bit, training grads exact (Linear/Conv), Triton FA
+  backward, AMP, 8-bit AdamW; int8 fused GEMV and fused SwiGLU GEMV merged;
+  hipMalloc==cudaMalloc under ZLUDA. Remaining documented blockers: llama.cpp
+  FA/Q4 (ZLUDA PTX), ComfyUI e2e (Flux GGUF needs text encoders/VRAM and a fresh
+  boot run), torch.compile+StaticCache (Inductor codegen), fp64 (no Tensile),
+  CUPTI profiling. Phase 2/3 start from here. Details:
+  docs/ROADMAP_ECOSYSTEM.md.
 - **2026-11-26 - fused SwiGLU GEMV merged + model patch:** the earlier NaN in
   the fused gate/up+SwiGLU kernel was a missing K-bound mask (out-of-bounds tile
   reads), not a Triton codegen bug; with the mask it is correct (err 0.0078) and

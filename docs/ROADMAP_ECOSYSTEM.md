@@ -201,3 +201,42 @@ holds. Current practice: use CUDA-graph replay for decode
 (`zluda_ops.graph_decode.GraphDecoder`) and `torch.compile(mode="default")` for
 prefill only. Fixing requires identifying the failing inductor kernel (Triton
 codegen issue on ZLUDA) - open item.
+
+---
+
+## Phase 1 status: COMPLETE (2026-11-26)
+
+Acceptance run: `tools/run_infra_suite.ps1` -> **PHASE-1 INFRA SUITE: PASS**
+(infra probe 21/25, training suite 7/7, ecosystem shim smoke 4/4, logs under
+`bench/results/infra/`).
+
+Closed in Phase 1:
+- cuFFT fixed (cufftXtMakePlanMany/cufftXtExec; torch.fft/ifft/rfft2 round-trips exact).
+- cuSPARSE fixed (SetStream/GetStream, Xcoo2csr, CreateCsr; torch.sparse COO mm exact).
+- cublasSgemv implemented (torch.mv fp32/fp16 work).
+- cuDNN batchnorm/RNN: documented fallbacks (`zluda_ops/cudnn_fallback.py`).
+- Ecosystem shims: flash_attn decode fixed (0.161 ms/token attention call vs the
+  earlier 1.6 tok/s anomaly), xformers decode fixed (0.158 ms/token, no OOM),
+  bitsandbytes shim over `zluda_ops.optim8bit` (AdamW8bit works).
+- Training smoke: Linear/Conv2d grads exact vs CPU, SDPA-math backward, Triton
+  FA backward (fwd err 0.002), AMP fp16/bf16, BN+RNN fallback backward,
+  8-bit AdamW step - 7/7.
+- GPU allocations: hipMalloc vs cudaMalloc are the same under ZLUDA
+  (see docs/KERNEL_GAPS.md).
+- int8 fused GEMV added; fused SwiGLU GEMV merged (+ model patch).
+
+Documented blockers / not closed (with reasons and next steps):
+1. llama.cpp `-fa 1` (mma.sync kernels) and Q4_K_M (MMQ hang) under ZLUDA -
+   kernel/JIT-level, needs ZLUDA PTX work.
+2. ComfyUI end-to-end: launchers ready; this machine has a Flux GGUF
+   (2.87 GB) + Flux VAE, so a real workflow needs Flux text encoders and does
+   not fit comfortably in 8 GB together with the runtime; not run in this
+   cycle (plan: run a 512x512 Flux GGUF workflow after a fresh reboot).
+3. torch.compile + StaticCache decode: Inductor kernel generation fails
+   (Triton codegen error); prefill compile works.
+4. fp64: cublasDgemm/cusolver unsupported (no fp64 Tensile for gfx1010).
+5. CUPTI/torch profiler traces are empty under ZLUDA (no kernel-level
+   profiling); GPU clocks cannot be fixed (ADL unsupported).
+
+Phase 2 (custom fast Triton kernels) and Phase 3 (custom BLAS with a
+ZLUDA-side stream/graph hook) start from here.

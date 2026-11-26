@@ -55,6 +55,19 @@ def memory_efficient_attention_forward(query, key, value, attn_bias=None,
         output_dtype = query.dtype
     q_bhsd, k_bhsd, v_bhsd = _to_bhsd(query), _to_bhsd(key), _to_bhsd(value)
     mask, causal = _bias_to_mask(attn_bias, query, key)
+    # decode fast path (split-KV flash-decoding, GQA-aware)
+    if (mask is None and p == 0.0 and scale is None
+            and q_bhsd.dtype == torch.float16
+            and 1 <= q_bhsd.shape[2] <= 16 and k_bhsd.shape[2] >= 512
+            and k_bhsd.shape[2] % 128 == 0
+            and q_bhsd.shape[1] % k_bhsd.shape[1] == 0):
+        try:
+            from zluda_ops import flash_decode as _fd
+            out = _fd.flash_decode_attn(q_bhsd, k_bhsd, v_bhsd,
+                                        causal=bool(causal))
+            return out.transpose(1, 2).contiguous().to(output_dtype)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         from zluda_ops.flash_attention import scaled_dot_product_attention as _fa
 
