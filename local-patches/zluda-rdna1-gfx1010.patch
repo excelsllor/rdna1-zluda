@@ -2171,10 +2171,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8892dbc8b3954b5de59ab45dee7ff7f4831b80c
+index 0000000000000000000000000000000000000000..0ac5b12b276da757e3711a836f87a3a8858b575d
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,606 @@
+@@ -0,0 +1,612 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2425,6 +2425,12 @@ index 0000000000000000000000000000000000000000..d8892dbc8b3954b5de59ab45dee7ff7f
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-26 - cublasSgemv fixed:** zluda_blas had no level-2 BLAS at all, so
++  torch.mv on fp32 failed with CUBLAS_STATUS_NOT_SUPPORTED. Added sgemv /
++  sgemv_v2 / sgemv_v2_64 mapping to rocBLAS (+vtable/implemented wiring);
++  torch.mv fp32 and fp16 now work. cublasDgemv (fp64) remains unsupported (no
++  FromCuda conversion for *const f64; fp64 BLAS absent on this gfx1010 build).
++  Infra probe: 21/25 OK.
 +- **2026-11-26 - kernel gaps + allocation audit:** added fused int8 GEMV
 +  (`quant.int8_linear`, correct 2e-4..4e-3) - fused is memory-optimal but
 +  dequant-once+tuned fp16 GEMV is faster for compute (45.6 vs 61.9 us qkv,
@@ -8243,10 +8249,10 @@ index 0000000000000000000000000000000000000000..0347ef4cb83812cfa0ad1a9845970310
 \ No newline at end of file
 diff --git a/bench/results/infra/probe.json b/bench/results/infra/probe.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..9cce530b35be11202441b51f00a8d76df45d0d89
+index 0000000000000000000000000000000000000000..e38f48ff5c74b1caa113bdb949d10b8d99bd99a0
 --- /dev/null
 +++ b/bench/results/infra/probe.json
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,213 @@
 +[
 + {
 +  "name": "device",
@@ -8274,7 +8280,7 @@ index 0000000000000000000000000000000000000000..9cce530b35be11202441b51f00a8d76d
 +  "detail": "",
 +  "streams": 2,
 +  "events": 2,
-+  "elapsed_ms": 148.411,
++  "elapsed_ms": 146.642,
 +  "y1_ok": true,
 +  "y2_ok": true
 + },
@@ -8291,7 +8297,7 @@ index 0000000000000000000000000000000000000000..9cce530b35be11202441b51f00a8d76d
 +  "status": "OK",
 +  "detail": "",
 +  "dtype": "fp32",
-+  "max_err": 0.00021
++  "max_err": 0.00022
 + },
 + {
 +  "name": "cublas_gemm_fp16",
@@ -8317,20 +8323,19 @@ index 0000000000000000000000000000000000000000..9cce530b35be11202441b51f00a8d76d
 +  "name": "cublas_gemv",
 +  "status": "OK",
 +  "detail": "",
-+  "max_err": 0.0621
++  "max_err": 0.0624
 + },
 + {
 +  "name": "cublas_addmm_epilogue",
 +  "status": "OK",
 +  "detail": "",
-+  "max_err": 0.041
++  "max_err": 0.052
 + },
 + {
 +  "name": "cublas_sgemv_fp32",
 +  "status": "OK",
 +  "detail": "",
 +  "shape": [
-+   1,
 +   4096
 +  ]
 + },
@@ -10840,10 +10845,10 @@ index 0000000000000000000000000000000000000000..2a6adcece6ca143824ffe0c981961c93
 +decode on this card.
 diff --git a/docs/INFRA_FIXES.md b/docs/INFRA_FIXES.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8410ef6384e251f9d757f2ae1fa89250f16459e
+index 0000000000000000000000000000000000000000..978b93b95758eb14bf192e0eed06bda002c420e9
 --- /dev/null
 +++ b/docs/INFRA_FIXES.md
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,104 @@
 +# Phase-1 infrastructure fixes log
 +
 +## 2026-11-26: cuFFT and cuSPARSE now work
@@ -10930,6 +10935,24 @@ index 0000000000000000000000000000000000000000..c8410ef6384e251f9d757f2ae1fa8925
 +calls remain FAIL (expected, documented above). Current result: **20/24**
 +checks pass; remaining failures: raw BN/RNN (use the fallbacks), fp64 GEMM
 +(rocBLAS/Tensile f64 not available for gfx1010).
++
++## 2026-11-26: cublasSgemv (fp32 1-D GEMV) implemented
++
++Found by the infra probe: `torch.mv` on fp32 tensors failed with
++`CUBLAS_STATUS_NOT_SUPPORTED` (calling `cublasSgemv`). zluda_blas implemented
++only GEMM variants; GEMV was never mapped.
++
++Fix: added `sgemv`, `sgemv_v2`, `sgemv_v2_64` in `zluda_blas/src/impl.rs`
++(mapping to `rocblas_sgemv` / `rocblas_sgemv_64`), registered the rocBLAS
++symbols in the vtable and the cublas entry points in the implemented list.
++
++Verified: `torch.mv` fp32 and fp16 now work (512-element output, fp16 path uses
++the existing Hgemm? - `torch.mv` fp16 also OK), `w @ x` 1-D works.
++
++Still unsupported: `cublasDgemv` (fp64 GEMV) - the crate has no `FromCuda`
++conversion for `*const f64` arguments, and fp64 BLAS is generally unavailable on
++this gfx1010 build (no f64 Tensile). fp64 `torch.mv`/`torch.linalg` remain
++documented limitations.
 diff --git a/docs/KERNEL_GAPS.md b/docs/KERNEL_GAPS.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..e26ebc00c6b80a4d4f1191e6b7059ecd683adf64
@@ -11563,7 +11586,7 @@ index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb9
 +ones and uninitialized buffers are not representative.
 diff --git a/docs/ROADMAP_ECOSYSTEM.md b/docs/ROADMAP_ECOSYSTEM.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..94298a850e7576acef2736fbaf04020a3f7c45ae
+index 0000000000000000000000000000000000000000..c2b151f63022d45efca1a626542672e4c9adcf0b
 --- /dev/null
 +++ b/docs/ROADMAP_ECOSYSTEM.md
 @@ -0,0 +1,191 @@
@@ -11590,7 +11613,7 @@ index 0000000000000000000000000000000000000000..94298a850e7576acef2736fbaf04020a
 +| ZLUDA core (nvcuda.dll) | WORKS | PyTorch 2.7.1+cu118, llama.cpp, custom kernels; CUDA graphs now implemented (capture/instantiate/launch; launch-time attributes/PDL accepted) | keep; add regression tests |
 +| CUDA graphs | WORKS (basic) | torch.cuda.CUDAGraph capture/replay on side streams; self-loop update-in-graph variant broken | verify capture with cuBLAS in graph; document restrictions |
 +| cuBLAS -> rocBLAS (GEMM) | WORKS, near peak | 8.18 TF fp32 of 9.75 TF peak with tuned gfx1010 Tensile overrides; native ROCm torch without overrides is 4.6x slower | keep (phase 3 optional) |
-+| cuBLAS GEMV (small M) | WORKS but SLOW | 24-284 us per matvec; 15-40% of bandwidth; Triton/HIP GEMV prototypes 1.1-4.8x faster | phase 2 (Triton) then phase 3 |
++| cuBLAS GEMV (small M) | WORKS but SLOW (Triton path used) | cublasSgemv was unimplemented and is now mapped (torch.mv fp32/fp16 work); for ULMs the Triton GEMV is used. Bandwidth 15-40% of peak -> phase 2/3. | phase 2 then phase 3 |
 +| cuBLASLt (cublasLt64_11/12/13.dll) | MAPPED, UNVERIFIED | DLLs exist; PyTorch rarely exercises the epilogue paths | probe with a bias-epilogue GEMM / vendor code |
 +| cuDNN -> MIOpen: conv2d | WORKS (with solver selection) | fp16 3x3 picks GEMM solver; per-shape auto-selection implemented (fp32 Winograd cached-weight path 1.4-2.7x) | keep; extend to conv1d/3d/transposed |
 +| cuDNN: pool2d / avgpool / conv_transpose | WORKS | probe OK | regression tests |
@@ -15414,6 +15437,98 @@ index 666f926b2797f9f4f86b5ad1e2096161d11e5e65..b1137794a6a60db32f846cd2cda4fbf7
              cuStreamGetCaptureInfo_v2,
              cuStreamGetCaptureInfo_v3,
              cuStreamIsCapturing,
+diff --git a/zluda_blas/src/impl.rs b/zluda_blas/src/impl.rs
+index 671e24b8f4c3f2dffd4493fbe22dd20dded24240..8a18dd49170ecf4a555283784d615ead44d3ab2b 100644
+--- a/zluda_blas/src/impl.rs
++++ b/zluda_blas/src/impl.rs
+@@ -559,3 +559,64 @@ mod tests {
+         api.cublasDestroy_v2(handle);
+     }
+ }
++
++// --- GEMV (level-2 BLAS) ---------------------------------------------------
++// zluda_blas previously only implemented GEMM, so cublasSgemv/Dgemv fell to the
++// unimplemented stub (CUBLAS_STATUS_NOT_SUPPORTED). Map them to rocBLAS.
++
++pub(crate) fn sgemv_v2(
++    handle: &Handle,
++    trans: rocblas_operation,
++    m: ::core::ffi::c_int,
++    n: ::core::ffi::c_int,
++    alpha: *const f32,
++    a: *const f32,
++    lda: ::core::ffi::c_int,
++    x: *const f32,
++    incx: ::core::ffi::c_int,
++    beta: *const f32,
++    y: *mut f32,
++    incy: ::core::ffi::c_int,
++) -> cublasStatus_t {
++    unsafe {
++        rocblas()?.rocblas_sgemv(handle.rocm_handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
++    }?;
++    Ok(())
++}
++
++pub(crate) fn sgemv(
++    handle: &Handle,
++    trans: rocblas_operation,
++    m: ::core::ffi::c_int,
++    n: ::core::ffi::c_int,
++    alpha: *const f32,
++    a: *const f32,
++    lda: ::core::ffi::c_int,
++    x: *const f32,
++    incx: ::core::ffi::c_int,
++    beta: *const f32,
++    y: *mut f32,
++    incy: ::core::ffi::c_int,
++) -> cublasStatus_t {
++    sgemv_v2(handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
++}
++
++pub(crate) fn sgemv_v2_64(
++    handle: &Handle,
++    trans: rocblas_operation,
++    m: i64,
++    n: i64,
++    alpha: *const f32,
++    a: *const f32,
++    lda: i64,
++    x: *const f32,
++    incx: i64,
++    beta: *const f32,
++    y: *mut f32,
++    incy: i64,
++) -> cublasStatus_t {
++    unsafe {
++        rocblas()?.rocblas_sgemv_64(handle.rocm_handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)
++    }?;
++    Ok(())
++}
+diff --git a/zluda_blas/src/lib.rs b/zluda_blas/src/lib.rs
+index f7b190d270d76e66455f865c38f948e1b54540e3..4561a1d1e28cb3f9c220f809be32822989a33be2 100644
+--- a/zluda_blas/src/lib.rs
++++ b/zluda_blas/src/lib.rs
+@@ -61,6 +61,9 @@ cuda_macros::cublas_function_declarations!(
+             cublasSetWorkspace_v2,
+             cublasSetVector,
+             cublasSgemmStridedBatched,
++            cublasSgemv,
++            cublasSgemv_v2,
++            cublasSgemv_v2_64,
+             cublasSgemm_v2,
+         ],
+     implemented_and_always_succeeds
+@@ -155,6 +158,8 @@ cuda_macros::rocblas_function_declarations!(
+             rocblas_set_workspace,
+             rocblas_sgemm_strided_batched,
+             rocblas_sgemm,
++            rocblas_sgemv,
++            rocblas_sgemv_64,
+         ]
+ );
+ 
 diff --git a/zluda_blaslt/src/impl.rs b/zluda_blaslt/src/impl.rs
 index b5cb70c41a102cfd91272c3396f7900b9638a9e4..1987bb1289aec273cc67eaafb7333039312ffdeb 100644
 --- a/zluda_blaslt/src/impl.rs
