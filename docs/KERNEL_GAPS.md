@@ -24,14 +24,25 @@ Verdict (same as int4): for compute at decode the dequant-once + tuned fp16
 GEMV is faster; the fused int8 kernel is the memory-optimal option (1 byte per
 weight, no fp16 copy). Keep both; pick per use case (VRAM-bound vs speed-bound).
 
-### Fused gate/up + SwiGLU GEMV - attempted, NOT merged
-A Triton kernel computing `silu(x.Wg+bg) * (x.Wu+bu)` in one pass would remove
-one launch and the intermediate pair (N=4864 each). Two implementations were
-tried (scalar reduce, then block-of-rows) and both produced wrong/NaN output on
-this Triton/ZLUDA stack while the same math with two `gemv` calls + `fused.swiglu`
-is correct - a codegen issue to debug separately (documented as open item).
-Expected gain when fixed: ~2x vs the 3-kernel path (measured 95 us fused vs
-195 us torch path in the failing prototype, so the potential is real).
+### Fused gate/up + SwiGLU GEMV - merged (`zluda_ops.fused.swiglu_gemv`)
+Computes `silu(x.Wg + bg) * (x.Wu + bu)` for M=1 decode in one kernel instead of
+two GEMV calls plus a separate swiglu kernel.
+
+Correctness (vs the 3-kernel reference): max abs error 0.0078 (fp16 rounding).
+Performance (fp16, M=1):
+
+| shape | fused | 3-kernel path | speedup |
+|---|---|---|---|
+| 4864 x 896 (gate/up) | 70.9 us | 98.3 us | 1.39x |
+| 896 x 896 | 32.5 us | 70.5 us | 2.17x |
+
+The first prototype returned NaN/large errors; the root cause was not a Triton
+codegen bug but a missing K-bound mask (the last BK tile read past column K).
+With the mask the kernel is correct; integrated into the Qwen2 MLP decode path
+via `zluda_ops/model_patches.py` it gives a small end-to-end gain in
+graph-replayed decode (~1%: 10.83 -> 10.74 ms/token at 1k context; the
+kernel-level win is partly hidden by attention/GEMV/launch costs of the other
+layers).
 
 ## 2. Missing kernels (not implemented yet, ranked by value)
 

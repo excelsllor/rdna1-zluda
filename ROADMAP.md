@@ -248,6 +248,15 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - fused SwiGLU GEMV merged + model patch:** the earlier NaN in
+  the fused gate/up+SwiGLU kernel was a missing K-bound mask (out-of-bounds tile
+  reads), not a Triton codegen bug; with the mask it is correct (err 0.0078) and
+  faster than the 3-kernel path (70.9 vs 98.3 us at 4864x896 = 1.39x, 32.5 vs
+  70.5 us at 896x896 = 2.17x). zluda_ops/model_patches.py patches the Qwen2 MLP
+  decode path to use it; end-to-end graph-replay decode gain ~1%
+  (10.83 -> 10.74 ms/token at 1k) as the kernel saving is partly hidden by the
+  rest of the layer. Removed leftover debug eprintln from ZLUDA stream/graph
+  capture paths. torch.compile + StaticCache remains blocked.
 - **2026-11-26 - torch.compile + StaticCache blocked:** compiling the
   StaticCache decode path fails in Inductor kernel generation
   (`Triton Error [CUDA]: error`); prefill compile (plain model, DynamicCache)

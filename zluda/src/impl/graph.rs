@@ -73,7 +73,6 @@ pub(crate) unsafe fn instantiate_with_flags(
     graph: hipGraph_t,
     flags: u64,
 ) -> hipError_t {
-    eprintln!("zluda: cuGraphInstantiateWithFlags called");
     hipGraphInstantiateWithFlags(graph_exec, graph, flags)
 }
 
@@ -88,6 +87,5 @@ pub(crate) unsafe fn instantiate(
     log_buffer: *mut ::core::ffi::c_char,
     buffer_size: usize,
 ) -> hipError_t {
-    eprintln!("zluda: cuGraphInstantiate called");
     hipGraphInstantiate(graph_exec, graph, error_node, log_buffer, buffer_size)
 }
