@@ -12,6 +12,9 @@ macro_rules! unimplemented {
             #[allow(improper_ctypes_definitions)]
             #[allow(unused_variables)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
+                if std::env::var_os("ZLUDA_DEBUG_UNIMPLEMENTED").is_some() {
+                    eprintln!("zluda_fft: UNIMPLEMENTED called: {}", stringify!($fn_name));
+                }
                 crate::r#impl::unimplemented()
             }
         )*
@@ -32,8 +35,14 @@ macro_rules! implemented {
     };
 }
 
+macro_rules! noop_extra {
+    ($($t:tt)*) => {};
+}
+
 cuda_macros::cufft_function_declarations!(
     unimplemented,
+    noop_extra <= [cufftXtMakePlanMany],
+    noop_extra <= [cufftXtExec],
     implemented
         <= [
             cufftCreate,
@@ -171,3 +180,36 @@ cuda_macros::hipfft_function_declarations!(
             hipfftDestroy,
         ]
 );
+
+#[no_mangle]
+pub unsafe extern "C" fn cufftXtMakePlanMany(
+    plan: cuda_types::cufft::cufftHandle,
+    rank: ::core::ffi::c_int,
+    n: *mut ::core::ffi::c_longlong,
+    inembed: *mut ::core::ffi::c_longlong,
+    istride: ::core::ffi::c_longlong,
+    idist: ::core::ffi::c_longlong,
+    inputtype: cuda_types::cufft::cudaDataType,
+    onembed: *mut ::core::ffi::c_longlong,
+    ostride: ::core::ffi::c_longlong,
+    odist: ::core::ffi::c_longlong,
+    outputtype: cuda_types::cufft::cudaDataType,
+    batch: ::core::ffi::c_longlong,
+    workSize: *mut usize,
+    executiontype: cuda_types::cufft::cudaDataType,
+) -> cuda_types::cufft::cufftResult {
+    crate::r#impl::xt_make_plan_many(
+        plan, rank, n, inembed, istride, idist, inputtype, onembed, ostride, odist,
+        outputtype, batch, workSize, executiontype,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cufftXtExec(
+    plan: cuda_types::cufft::cufftHandle,
+    input: *mut ::core::ffi::c_void,
+    output: *mut ::core::ffi::c_void,
+    direction: ::core::ffi::c_int,
+) -> cuda_types::cufft::cufftResult {
+    crate::r#impl::xt_exec(plan, input, output, direction)
+}

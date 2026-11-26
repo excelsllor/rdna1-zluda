@@ -27,6 +27,7 @@ fn hipfft() -> Result<&'static super::HipfftVtable, hipfftError> {
 }
 
 struct GlobalState {
+    xt_kinds: std::collections::HashMap<i32, hipfftType>,
     registry: plan::Registry,
 }
 
@@ -36,6 +37,7 @@ impl GlobalState {
         LOCK.get_or_init(|| {
             Mutex::new(GlobalState {
                 registry: plan::Registry::new(),
+                xt_kinds: std::collections::HashMap::new(),
             })
         })
     }
@@ -458,5 +460,87 @@ pub(crate) unsafe fn exec_z_2d(
 ) -> cufftResult {
     with_plan(plan, |hipfft, plan| {
         hipfft.hipfftExecZ2D(plan, idata.cast(), odata)
+    })
+}
+
+fn data_type_to_hipfft(
+    inputtype: cudaDataType,
+    outputtype: cudaDataType,
+) -> Result<hipfftType, cufftError_t> {
+    use cuda_types::cuda::cudaDataType_t;
+    let i = inputtype.0;
+    let o = outputtype.0;
+    let result = if i == cudaDataType_t::CUDA_R_32F.0 && o == cudaDataType_t::CUDA_C_32F.0 {
+        hipfftType_t::HIPFFT_R2C
+    } else if i == cudaDataType_t::CUDA_C_32F.0 && o == cudaDataType_t::CUDA_R_32F.0 {
+        hipfftType_t::HIPFFT_C2R
+    } else if i == cudaDataType_t::CUDA_C_32F.0 && o == cudaDataType_t::CUDA_C_32F.0 {
+        hipfftType_t::HIPFFT_C2C
+    } else if i == cudaDataType_t::CUDA_R_64F.0 && o == cudaDataType_t::CUDA_C_64F.0 {
+        hipfftType_t::HIPFFT_D2Z
+    } else if i == cudaDataType_t::CUDA_C_64F.0 && o == cudaDataType_t::CUDA_R_64F.0 {
+        hipfftType_t::HIPFFT_Z2D
+    } else if i == cudaDataType_t::CUDA_C_64F.0 && o == cudaDataType_t::CUDA_C_64F.0 {
+        hipfftType_t::HIPFFT_Z2Z
+    } else {
+        return Err(cufftError_t::r#NOT_SUPPORTED);
+    };
+    Ok(result)
+}
+
+pub(crate) unsafe fn xt_make_plan_many(
+    plan: cufftHandle,
+    rank: ::core::ffi::c_int,
+    n: *mut ::core::ffi::c_longlong,
+    inembed: *mut ::core::ffi::c_longlong,
+    istride: ::core::ffi::c_longlong,
+    idist: ::core::ffi::c_longlong,
+    inputtype: cudaDataType,
+    onembed: *mut ::core::ffi::c_longlong,
+    ostride: ::core::ffi::c_longlong,
+    odist: ::core::ffi::c_longlong,
+    outputtype: cudaDataType,
+    batch: ::core::ffi::c_longlong,
+    work_size: *mut usize,
+    _executiontype: cudaDataType,
+) -> Result<(), cufftError_t> {
+    let htype = data_type_to_hipfft(inputtype, outputtype)?;
+    GlobalState::with(|state| {
+        state.xt_kinds.insert(plan.0, htype);
+        Ok(())
+    })?;
+    with_plan(plan, |hipfft, plan| {
+        hipfft.hipfftMakePlanMany64(
+            plan, rank, n, inembed, istride, idist, onembed, ostride, odist, htype, batch,
+            work_size,
+        )
+    })
+}
+
+pub(crate) unsafe fn xt_exec(
+    plan: cufftHandle,
+    input: *mut ::core::ffi::c_void,
+    output: *mut ::core::ffi::c_void,
+    direction: ::core::ffi::c_int,
+) -> Result<(), cufftError_t> {
+    let kind = GlobalState::with(|state| {
+        state
+            .xt_kinds
+            .get(&plan.0)
+            .copied()
+            .ok_or(cufftError_t::r#NOT_SUPPORTED)
+    })?;
+    with_plan(plan, |hipfft, plan| match kind {
+        hipfftType_t::HIPFFT_R2C => hipfft.hipfftExecR2C(plan, input as *mut _, output as *mut _),
+        hipfftType_t::HIPFFT_C2R => hipfft.hipfftExecC2R(plan, input as *mut _, output as *mut _),
+        hipfftType_t::HIPFFT_C2C => {
+            hipfft.hipfftExecC2C(plan, input as *mut _, output as *mut _, direction)
+        }
+        hipfftType_t::HIPFFT_D2Z => hipfft.hipfftExecD2Z(plan, input as *mut _, output as *mut _),
+        hipfftType_t::HIPFFT_Z2D => hipfft.hipfftExecZ2D(plan, input as *mut _, output as *mut _),
+        hipfftType_t::HIPFFT_Z2Z => {
+            hipfft.hipfftExecZ2Z(plan, input as *mut _, output as *mut _, direction)
+        }
+        _ => Err(hipfftError::r#NOT_SUPPORTED),
     })
 }

@@ -28,8 +28,8 @@ blockers fixed.
 | cuDNN: batchnorm | **FAIL** | `CUDNN_STATUS_NOT_SUPPORTED` on BatchNorm2d (contiguous fp32 input) | fix or fallback: torch native batch_norm path |
 | cuDNN: RNN (LSTM/GRU) | **FAIL/crash** | `CUDNN_STATUS_INTERNAL_ERROR` + MIOpen "Failed to launch kernel: invalid argument"; process died at exit | high priority: fix mapping or force native fallback |
 | cuDNN: attention/FMHA, conv3d, RNN variants | UNTESTED | not exercised yet | probe matrix |
-| cuFFT -> rocFFT (torch.fft) | **FAIL** | `CUFFT_NOT_SUPPORTED` for torch.fft.fft (plan type/transform size mapping) | fix basic 1D/2D C2C/R2C plans; needed by audio/video/diffusion tooling |
-| cuSPARSE -> rocSPARSE | **FAIL** | `CUSPARSE_STATUS_NOT_SUPPORTED` at `cusparseSetStream` | likely easy stream-mapping fix; then spmm/spmv/geam probes |
+| cuFFT -> rocFFT (torch.fft) | **WORKS (fixed 2026-11-26)** | implemented `cufftXtMakePlanMany` + `cufftXtExec` (hipFFT type mapping); fft/ifft and rfft2/irfft2 round-trips exact | keep; add 3D/batched tests |
+| cuSPARSE -> rocSPARSE | **WORKS (fixed 2026-11-26)** | implemented SetStream/GetStream, Xcoo2csr, CreateCsr (rocsparse mappings); torch.sparse COO mm exact | keep; add CSR/spmv/geam tests |
 | cuRAND (philox) | WORKS (probe) | torch.randn OK; determinism/philox offset unverified | verify reproducibility |
 | cuSOLVER (linalg.solve/svd/qr/cholesky) | NOT MAPPED | no cuSOLVER DLL in target/release | probe torch.linalg; add fallback to CPU or rocSOLVER mapping |
 | NVML / NVAPI | MAPPED | nvml.dll/nvapi64.dll forwarding DLLs exist; on AMD NVML is absent (llama.cpp disables monitoring) | verify torch.cuda.memory stats + apps that require NVML |

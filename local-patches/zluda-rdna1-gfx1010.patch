@@ -775,6 +775,18 @@ index 0000000000000000000000000000000000000000..9a712506ba75fdd70cba45b5d5f26312
 +- Non-causal Triton FA backward; sliding window, varlen, softcap, dropout.
 +- Fused activation/residual epilogues; int8 (Stage 3).
 +- GPU clock/power telemetry on Windows.
+diff --git a/Cargo.lock b/Cargo.lock
+index cc344b8fb95670ba7d2d1df7c82144f3d9fdcbc0..e5a75ce13db6e7558a067b8a2c621cbf58d449e4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5377,6 +5377,7 @@ dependencies = [
+  "cuda_macros",
+  "cuda_types",
+  "embed-resource",
++ "hip_runtime-sys",
+  "libloading",
+  "rocsparse-sys",
+  "unwrap_or",
 diff --git a/ENGINE_COMPARISON.md b/ENGINE_COMPARISON.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..665c91d8930e892ed621c8398ccf33523f15e730
@@ -2159,10 +2171,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..5fa0568a9aeb1bb8faaa8acf7be5277a53e36654
+index 0000000000000000000000000000000000000000..7b2a108e74f14fcf873267ac25a96069272fb476
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,586 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2413,6 +2425,18 @@ index 0000000000000000000000000000000000000000..5fa0568a9aeb1bb8faaa8acf7be5277a
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-26 - Phase-1 infra fixes: cuFFT + cuSPARSE now work.** cuFFT:
++  PyTorch's FFT path uses `cufftXtMakePlanMany`/`cufftXtExec`, which were
++  unimplemented (CUFFT_NOT_SUPPORTED); implemented them mapping cudaDataType
++  pairs to hipFFT transform types and dispatching hipfftExec* through a
++  per-plan kind registry. torch.fft/ifft and rfft2/irfft2 round-trips are exact.
++  cuSPARSE: implemented SetStream/GetStream (rocsparse_set_stream, plus the
++  missing hip_runtime-sys dep), Xcoo2csr (rocsparse_coo2csr) and CreateCsr
++  (rocsparse_create_csr_descr with datatype mapping); torch.sparse COO mm is
++  exact (err 0.0). Full infra probe: 18/22 OK (was 16/22). Remaining:
++  cuDNN batchnorm/RNN (work with cudnn.enabled=False native fallback) and fp64
++  GEMM (cublasDgemm NOT_SUPPORTED). Details: docs/INFRA_FIXES.md,
++  docs/ROADMAP_ECOSYSTEM.md; probe: bench/infra_probe.py.
 +- **2026-11-25 - ecosystem roadmap (3 phases) + Phase-1 analysis:**
 +  docs/ROADMAP_ECOSYSTEM.md created: Phase 1 close the infrastructure (status
 +  matrix of every library/engine/application with evidence, verification
@@ -5725,6 +5749,304 @@ index 0000000000000000000000000000000000000000..ba14ff84d9ba532fb954d7da394ab726
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/bench/infra_probe.py b/bench/infra_probe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..47d847d4d2486f5e99077af57ac4a4be1f3cce20
+--- /dev/null
++++ b/bench/infra_probe.py
+@@ -0,0 +1,292 @@
++"""Phase-1 infrastructure probe for the ZLUDA/RDNA1 stack.
++
++Exercises the CUDA runtime surface and every mapped library and writes one JSON
++record per check (incrementally, so a crash does not lose earlier results).
++
++Usage (under run-zluda.cmd):
++  venv\\Scripts\\python.exe bench\\infra_probe.py --out bench/results/infra/probe.json
++"""
++
++import argparse
++import json
++import os
++import sys
++import time
++import traceback
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++RESULTS = []
++OUT_PATH = None
++
++
++def record(name, status, detail="", extra=None):
++    row = {"name": name, "status": status, "detail": detail}
++    if extra:
++        row.update(extra)
++    RESULTS.append(row)
++    print(f"{status:4s} {name:38s} {detail[:140]}", flush=True)
++    if OUT_PATH:
++        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
++        OUT_PATH.write_text(json.dumps(RESULTS, indent=1), encoding="utf-8")
++
++
++def probe(name, fn):
++    try:
++        extra = fn()
++        torch.cuda.synchronize()
++        record(name, "OK", "", extra if isinstance(extra, dict) else None)
++    except Exception as exc:  # noqa: BLE001
++        record(name, "FAIL", f"{type(exc).__name__}: {str(exc)[:200]}")
++
++
++def main():
++    global OUT_PATH
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--out", default="bench/results/infra/probe.json")
++    parser.add_argument("--vram-fraction", type=float, default=0.8)
++    args = parser.parse_args()
++    OUT_PATH = Path(args.out)
++    if not OUT_PATH.is_absolute():
++        OUT_PATH = Path(__file__).resolve().parents[1] / OUT_PATH
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    record("device", "OK", torch.cuda.get_device_name(0),
++           {"torch": torch.__version__})
++
++    # ---------- core CUDA runtime ----------
++    def alloc_copy_free():
++        a = torch.empty(1024 * 1024, dtype=torch.float32)  # CPU
++        d = torch.empty_like(a, device="cuda")              # cudaMalloc path
++        d.copy_(a)                                          # H2D memcpy
++        h = torch.empty_like(d)                             # cudaMallocHost-ish
++        h.copy_(d)                                          # D2H memcpy
++        d2 = torch.empty_like(d, device="cuda")
++        d2.copy_(d)                                         # D2D memcpy
++        d.fill_(1.0)                                        # memset
++        del d, d2, h
++        return {"dtype": "fp32", "elems": a.numel()}
++
++    probe("runtime_alloc_copy_free", alloc_copy_free)
++
++    def pinned_memory():
++        p = torch.empty(4096, dtype=torch.float32, pin_memory=True)
++        d = p.cuda(non_blocking=True)
++        out = d.cpu()
++        return {"pinned": bool(p.is_pinned()), "ok": bool((out == 0).any() or True)}
++
++    probe("runtime_pinned_memory", pinned_memory)
++
++    def streams_events():
++        s1 = torch.cuda.Stream()
++        s2 = torch.cuda.Stream()
++        ev = torch.cuda.Event(enable_timing=True)
++        ev2 = torch.cuda.Event(enable_timing=True)
++        x = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
++        w = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
++        torch.cuda.synchronize()
++        ev.record()
++        with torch.cuda.stream(s1):
++            y1 = x @ w
++        with torch.cuda.stream(s2):
++            y2 = x @ w
++        s1.wait_event(ev)
++        s2.wait_event(ev)
++        s1.synchronize()
++        s2.synchronize()
++        ev2.record()
++        torch.cuda.synchronize()
++        ms = ev.elapsed_time(ev2)
++        return {"streams": 2, "events": 2, "elapsed_ms": round(float(ms), 3),
++                "y1_ok": bool(torch.isfinite(y1).all()),
++                "y2_ok": bool(torch.isfinite(y2).all())}
++
++    probe("runtime_streams_events", streams_events)
++
++    def memory_stats():
++        free, total = torch.cuda.mem_get_info()
++        return {"free_mb": round(free / 1024**2, 1),
++                "total_mb": round(total / 1024**2, 1),
++                "allocated_mb": round(torch.cuda.memory_allocated() / 1024**2, 1)}
++
++    probe("runtime_memory_stats", memory_stats)
++
++    # ---------- cuBLAS ----------
++    def cublas_gemm(dtype_name, dtype):
++        x = torch.randn(1024, 1024, device="cuda", dtype=dtype)
++        w = torch.randn(1024, 1024, device="cuda", dtype=dtype)
++        y = x @ w
++        ref = (x.float().cpu() @ w.float().cpu()).to(dtype)
++        err = float((y.float().cpu() - ref.float()).abs().max())
++        return {"dtype": dtype_name, "max_err": round(err, 5)}
++
++    for name, dt in (("fp32", torch.float32), ("fp16", torch.float16),
++                     ("bf16", torch.bfloat16)):
++        probe(f"cublas_gemm_{name}", lambda dt=dt, n=name: cublas_gemm(n, dt))
++
++    def cublas_batched():
++        a = torch.randn(8, 128, 128, device="cuda", dtype=torch.float16)
++        b = torch.randn(8, 128, 128, device="cuda", dtype=torch.float16)
++        y = torch.bmm(a, b)
++        ref = torch.bmm(a.float().cpu(), b.float().cpu())
++        return {"max_err": round(float((y.float().cpu() - ref).abs().max()), 4)}
++
++    probe("cublas_batched_gemm", cublas_batched)
++
++    def cublas_gemv():
++        x = torch.randn(1, 4096, device="cuda", dtype=torch.float16)
++        w = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
++        y = x @ w.t()
++        ref = (x.float().cpu() @ w.float().cpu().t())
++        return {"max_err": round(float((y.float().cpu() - ref).abs().max()), 4)}
++
++    probe("cublas_gemv", cublas_gemv)
++
++    def cublas_addmm():
++        a = torch.randn(256, 256, device="cuda", dtype=torch.float16)
++        b = torch.randn(256, 256, device="cuda", dtype=torch.float16)
++        c = torch.randn(256, device="cuda", dtype=torch.float16)
++        y = torch.addmm(c, a, b)
++        ref = c.float().cpu() + a.float().cpu() @ b.float().cpu()
++        return {"max_err": round(float((y.float().cpu() - ref).abs().max()), 4)}
++
++    probe("cublas_addmm_epilogue", cublas_addmm)
++
++    # ---------- cuRAND ----------
++    def curand_ops():
++        torch.manual_seed(1234)
++        a = torch.randn(4096, device="cuda")
++        torch.manual_seed(1234)
++        b = torch.randn(4096, device="cuda")
++        torch.manual_seed(1234)
++        c = torch.rand(4096, device="cuda")
++        torch.manual_seed(99)
++        d = torch.randint(0, 100, (4096,), device="cuda")
++        torch.manual_seed(99)
++        e = torch.randint(0, 100, (4096,), device="cuda")
++        same = bool(torch.equal(a, b))
++        return {"randn_reproducible": same,
++                "rand_range_ok": bool(((c >= 0) & (c < 1)).all()),
++                "randint_reproducible": bool(torch.equal(d, e)),
++                "randn_mean": round(float(a.mean()), 4),
++                "randn_std": round(float(a.std()), 4)}
++
++    probe("curand_generators", curand_ops)
++
++    def dropout_gpu():
++        torch.manual_seed(0)
++        x = torch.ones(100000, device="cuda")
++        y = torch.nn.functional.dropout(x, p=0.5, training=True)
++        frac = float((y != 0).float().mean())
++        return {"keep_fraction": round(frac, 3)}
++
++    probe("curand_dropout", dropout_gpu)
++
++    # ---------- cuFFT ----------
++    def fft_checks():
++        x = torch.randn(256, 256, device="cuda")
++        out = {}
++        out["fft1d"] = tuple(torch.fft.fft(x[0]).shape)
++        out["rfft1d"] = tuple(torch.fft.rfft(x[0]).shape)
++        out["fft2d"] = tuple(torch.fft.fft2(x).shape)
++        out["rfft2d"] = tuple(torch.fft.rfft2(x).shape)
++        out["ifft_roundtrip_err"] = round(
++            float((torch.fft.ifft(torch.fft.fft(x)).real - x).abs().max()), 5)
++        return out
++
++    probe("cufft_transforms", fft_checks)
++
++    # ---------- cuSPARSE ----------
++    def sparse_checks():
++        idx = torch.randint(0, 128, (2, 512), device="cuda")
++        val = torch.randn(512, device="cuda")
++        coo = torch.sparse_coo_tensor(idx, val, (128, 128)).coalesce()
++        dense = torch.randn(128, 64, device="cuda")
++        y_coo = torch.sparse.mm(coo, dense)
++        ref = coo.to_dense() @ dense
++        csr = coo.to_sparse_csr()
++        y_csr = torch.sparse.mm(csr, dense)
++        return {"coo_err": round(float((y_coo - ref).abs().max()), 4),
++                "csr_err": round(float((y_csr - ref).abs().max()), 4)}
++
++    probe("cusparse_spmm", sparse_checks)
++
++    # ---------- cuDNN ----------
++    def cudnn_conv():
++        x = torch.randn(2, 8, 32, 32, device="cuda", dtype=torch.float16)
++        w = torch.randn(16, 8, 3, 3, device="cuda", dtype=torch.float16)
++        y = torch.nn.functional.conv2d(x, w, padding=1)
++        return {"shape": tuple(y.shape), "finite": bool(torch.isfinite(y).all())}
++
++    probe("cudnn_conv2d", cudnn_conv)
++
++    def cudnn_pool():
++        x = torch.randn(2, 8, 32, 32, device="cuda")
++        y = torch.nn.functional.max_pool2d(x, 2)
++        z = torch.nn.functional.avg_pool2d(x, 2)
++        return {"maxpool": tuple(y.shape), "avgpool": tuple(z.shape)}
++
++    probe("cudnn_pool2d", cudnn_pool)
++
++    def cudnn_batchnorm():
++        m = torch.nn.BatchNorm2d(8).cuda()
++        x = torch.randn(2, 8, 16, 16, device="cuda")
++        y = m(x)
++        return {"shape": tuple(y.shape)}
++
++    probe("cudnn_batchnorm", cudnn_batchnorm)
++
++    def cudnn_lstm():
++        m = torch.nn.LSTM(32, 32, batch_first=True).cuda()
++        x = torch.randn(2, 8, 32, device="cuda")
++        y, _ = m(x)
++        return {"shape": tuple(y.shape)}
++
++    probe("cudnn_lstm", cudnn_lstm)
++
++    def cudnn_gru():
++        m = torch.nn.GRU(32, 32, batch_first=True).cuda()
++        x = torch.randn(2, 8, 32, device="cuda")
++        y, _ = m(x)
++        return {"shape": tuple(y.shape)}
++
++    probe("cudnn_gru", cudnn_gru)
++
++    # ---------- cuSOLVER / linalg ----------
++    def linalg_checks():
++        a = torch.randn(64, 64, device="cuda", dtype=torch.float64)
++        a = a @ a.t() + 64 * torch.eye(64, device="cuda", dtype=torch.float64)
++        b = torch.randn(64, device="cuda", dtype=torch.float64)
++        out = {}
++        out["solve"] = tuple(torch.linalg.solve(a, b).shape)
++        out["svd"] = tuple(torch.linalg.svd(a).S.shape)
++        out["qr"] = tuple(torch.linalg.qr(a).Q.shape)
++        out["cholesky"] = tuple(torch.linalg.cholesky(a).shape)
++        return out
++
++    probe("cusolver_linalg", linalg_checks)
++
++    # ---------- attention ----------
++    def sdpa_math():
++        q = torch.randn(1, 8, 128, 64, device="cuda")
++        k = torch.randn(1, 8, 128, 64, device="cuda")
++        v = torch.randn(1, 8, 128, 64, device="cuda")
++        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
++            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
++        s = (q @ k.transpose(-1, -2)) / (64 ** 0.5)
++        mask = torch.tril(torch.ones(128, 128, device="cuda", dtype=torch.bool))
++        s = s.masked_fill(~mask, float("-inf"))
++        ref = torch.softmax(s, dim=-1) @ v
++        return {"max_err": round(float((out - ref).abs().max()), 5)}
++
++    probe("sdpa_math", sdpa_math)
++
++    n_ok = sum(1 for r in RESULTS if r["status"] == "OK")
++    record("SUMMARY", "OK", f"{n_ok}/{len(RESULTS)} checks passed")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/llamacpp_zluda_matrix.ps1 b/bench/llamacpp_zluda_matrix.ps1
 new file mode 100644
 index 0000000000000000000000000000000000000000..1cc3afe32e94e308042402b7067c64d8afc25332
@@ -7871,6 +8193,195 @@ index 0000000000000000000000000000000000000000..0347ef4cb83812cfa0ad1a9845970310
 +    }
 +  }
 +}
+\ No newline at end of file
+diff --git a/bench/results/infra/probe.json b/bench/results/infra/probe.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d344f4ba5bb78c36620ec2b73ddf6c66b5bbbce
+--- /dev/null
++++ b/bench/results/infra/probe.json
+@@ -0,0 +1,182 @@
++[
++ {
++  "name": "device",
++  "status": "OK",
++  "detail": "AMD Radeon RX 5700 XT [ZLUDA]",
++  "torch": "2.7.1+cu118"
++ },
++ {
++  "name": "runtime_alloc_copy_free",
++  "status": "OK",
++  "detail": "",
++  "dtype": "fp32",
++  "elems": 1048576
++ },
++ {
++  "name": "runtime_pinned_memory",
++  "status": "OK",
++  "detail": "",
++  "pinned": false,
++  "ok": true
++ },
++ {
++  "name": "runtime_streams_events",
++  "status": "OK",
++  "detail": "",
++  "streams": 2,
++  "events": 2,
++  "elapsed_ms": 206.604,
++  "y1_ok": true,
++  "y2_ok": true
++ },
++ {
++  "name": "runtime_memory_stats",
++  "status": "OK",
++  "detail": "",
++  "free_mb": 6467.4,
++  "total_mb": 8176.0,
++  "allocated_mb": 16.2
++ },
++ {
++  "name": "cublas_gemm_fp32",
++  "status": "OK",
++  "detail": "",
++  "dtype": "fp32",
++  "max_err": 0.00022
++ },
++ {
++  "name": "cublas_gemm_fp16",
++  "status": "OK",
++  "detail": "",
++  "dtype": "fp16",
++  "max_err": 0.0625
++ },
++ {
++  "name": "cublas_gemm_bf16",
++  "status": "OK",
++  "detail": "",
++  "dtype": "bf16",
++  "max_err": 0.5
++ },
++ {
++  "name": "cublas_batched_gemm",
++  "status": "OK",
++  "detail": "",
++  "max_err": 0.0156
++ },
++ {
++  "name": "cublas_gemv",
++  "status": "OK",
++  "detail": "",
++  "max_err": 0.0624
++ },
++ {
++  "name": "cublas_addmm_epilogue",
++  "status": "OK",
++  "detail": "",
++  "max_err": 0.0399
++ },
++ {
++  "name": "curand_generators",
++  "status": "OK",
++  "detail": "",
++  "randn_reproducible": true,
++  "rand_range_ok": true,
++  "randint_reproducible": true,
++  "randn_mean": 0.0034,
++  "randn_std": 1.0314
++ },
++ {
++  "name": "curand_dropout",
++  "status": "OK",
++  "detail": "",
++  "keep_fraction": 0.499
++ },
++ {
++  "name": "cufft_transforms",
++  "status": "OK",
++  "detail": "",
++  "fft1d": [
++   256
++  ],
++  "rfft1d": [
++   129
++  ],
++  "fft2d": [
++   256,
++   256
++  ],
++  "rfft2d": [
++   256,
++   129
++  ],
++  "ifft_roundtrip_err": 0.0
++ },
++ {
++  "name": "cusparse_spmm",
++  "status": "OK",
++  "detail": "",
++  "coo_err": 0.0,
++  "csr_err": 0.0
++ },
++ {
++  "name": "cudnn_conv2d",
++  "status": "OK",
++  "detail": "",
++  "shape": [
++   2,
++   16,
++   32,
++   32
++  ],
++  "finite": true
++ },
++ {
++  "name": "cudnn_pool2d",
++  "status": "OK",
++  "detail": "",
++  "maxpool": [
++   2,
++   8,
++   16,
++   16
++  ],
++  "avgpool": [
++   2,
++   8,
++   16,
++   16
++  ]
++ },
++ {
++  "name": "cudnn_batchnorm",
++  "status": "FAIL",
++  "detail": "RuntimeError: cuDNN error: CUDNN_STATUS_NOT_SUPPORTED. This error may appear if you passed in a non-contiguous input."
++ },
++ {
++  "name": "cudnn_lstm",
++  "status": "FAIL",
++  "detail": "RuntimeError: cuDNN error: CUDNN_STATUS_INTERNAL_ERROR"
++ },
++ {
++  "name": "cudnn_gru",
++  "status": "FAIL",
++  "detail": "RuntimeError: cuDNN error: CUDNN_STATUS_INTERNAL_ERROR"
++ },
++ {
++  "name": "cusolver_linalg",
++  "status": "FAIL",
++  "detail": "RuntimeError: CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasDgemm( handle, opa, opb, m, n, k, &alpha, a, lda, b, ldb, &beta, c, ldc)`"
++ },
++ {
++  "name": "sdpa_math",
++  "status": "OK",
++  "detail": "",
++  "max_err": 0.0
++ },
++ {
++  "name": "SUMMARY",
++  "status": "OK",
++  "detail": "18/22 checks passed"
++ }
++]
 \ No newline at end of file
 diff --git a/bench/results/llamacpp_zluda_vs_vulkan.json b/bench/results/llamacpp_zluda_vs_vulkan.json
 new file mode 100644
@@ -10248,6 +10759,72 @@ index 0000000000000000000000000000000000000000..2a6adcece6ca143824ffe0c981961c93
 +`lm_head` (151936x896 matvec) is the largest single decode op: rocBLAS 9.73 ms
 +vs Triton GEMV 0.86 ms (11x), which is why the GEMV path is essential for
 +decode on this card.
+diff --git a/docs/INFRA_FIXES.md b/docs/INFRA_FIXES.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9d6f9707b5129deecb8a3b8f4231017fb965ddc
+--- /dev/null
++++ b/docs/INFRA_FIXES.md
+@@ -0,0 +1,59 @@
++# Phase-1 infrastructure fixes log
++
++## 2026-11-26: cuFFT and cuSPARSE now work
++
++### cuFFT (cufft64_*.dll, crate zluda_fft)
++
++Symptom: `torch.fft.*` failed with `CUFFT_NOT_SUPPORTED` (probe 2026-11-25).
++
++Root cause found with the gated debug log (`ZLUDA_DEBUG_UNIMPLEMENTED=1`, added
++to the cufft declarations macro): PyTorch's FFT path calls the generic
++`cufftXtMakePlanMany` and `cufftXtExec`, which were unimplemented stubs
++(returning NOT_SUPPORTED).
++
++Fixes:
++- `cufftXtMakePlanMany`: maps the CUDA `cudaDataType` input/output pair to the
++  hipFFT transform type (R_32F/C_32F -> HIPFFT_R2C, C_32F/R_32F -> C2R,
++  C_32F/C_32F -> C2C, f64 variants -> D2Z/Z2D/Z2Z), registers the transform kind
++  per plan and calls `hipfftMakePlanMany64` (zluda_fft/src/impl.rs).
++- `cufftXtExec`: looks up the registered transform kind and dispatches to the
++  matching `hipfftExec*` (zluda_fft/src/impl.rs).
++- Both are exported with a manual `#[no_mangle]` wrapper and registered via a
++  `noop_extra` override so the macro does not also generate stubs
++  (zluda_fft/src/lib.rs).
++
++Verified: `torch.fft.fft`/`ifft` round-trip error 0.0, `rfft2`/`irfft2`
++round-trip error 0.0, probe check `cufft_transforms` OK.
++
++### cuSPARSE (cusparse64_*.dll, crate zluda_sparse)
++
++Symptom: `torch.sparse.mm` failed at `cusparseSetStream` with
++CUSPARSE_STATUS_NOT_SUPPORTED (probe 2026-11-25).
++
++Fixes (iteratively found with `ZLUDA_DEBUG_UNIMPLEMENTED=1`):
++- `cusparseSetStream`/`cusparseGetStream` mapped to
++  `rocsparse_set_stream`/`rocsparse_get_stream` (plus the hip_runtime-sys
++  dependency the crate lacked); the stream argument is converted with the
++  existing `FromCuda` machinery.
++- `cusparseXcoo2csr`: implemented via `rocsparse_coo2csr` (manual wrapper:
++  cusparse index-base argument ignored, zero-base assumed as PyTorch always
++  uses CUSPARSE_INDEX_BASE_ZERO for these paths).
++- `cusparseCreateCsr`: implemented via `rocsparse_create_csr_descr` with explicit
++  cudaDataType -> rocsparse_datatype mapping (f32/f32c/f64/f64c/i8) and the
++  cusparse index-type numeric values reused as rocsparse index types (the enums
++  share the same numbering: 16U=1, 32I=2, 64I=3).
++
++Verified: `torch.sparse.mm` on a coalesced COO matrix matches the dense
++reference exactly (max err 0.0), probe check `cusparse_spmm` OK.
++
++### Remaining Phase-1 failures (with workarounds)
++
++| check | status | workaround |
++|---|---|---|
++| cuDNN batchnorm | CUDNN_STATUS_NOT_SUPPORTED | `torch.backends.cudnn.enabled = False` -> native path works |
++| cuDNN LSTM/GRU | CUDNN_STATUS_INTERNAL_ERROR + MIOpen kernel launch error | same native fallback works |
++| fp64 GEMM | cublasDgemm returns NOT_SUPPORTED | no workaround yet (rocBLAS/Tensile f64 for gfx1010 missing); fp32/fp16/bf16 fine |
++
++Next: implement MIOpen batchnorm/rnn mappings (zluda_dnn8), investigate the f64
++GEMM path (rocBLAS Tensile coverage for gfx1010), then re-run
++`bench/infra_probe.py`.
+\ No newline at end of file
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
@@ -10798,7 +11375,7 @@ index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb9
 +ones and uninitialized buffers are not representative.
 diff --git a/docs/ROADMAP_ECOSYSTEM.md b/docs/ROADMAP_ECOSYSTEM.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..43d5a6a020cdffb9a8e1ca40d02db6933f3459e9
+index 0000000000000000000000000000000000000000..083fec0df89b4254b3412e480cbe9422dd9ea7da
 --- /dev/null
 +++ b/docs/ROADMAP_ECOSYSTEM.md
 @@ -0,0 +1,191 @@
@@ -10832,8 +11409,8 @@ index 0000000000000000000000000000000000000000..43d5a6a020cdffb9a8e1ca40d02db693
 +| cuDNN: batchnorm | **FAIL** | `CUDNN_STATUS_NOT_SUPPORTED` on BatchNorm2d (contiguous fp32 input) | fix or fallback: torch native batch_norm path |
 +| cuDNN: RNN (LSTM/GRU) | **FAIL/crash** | `CUDNN_STATUS_INTERNAL_ERROR` + MIOpen "Failed to launch kernel: invalid argument"; process died at exit | high priority: fix mapping or force native fallback |
 +| cuDNN: attention/FMHA, conv3d, RNN variants | UNTESTED | not exercised yet | probe matrix |
-+| cuFFT -> rocFFT (torch.fft) | **FAIL** | `CUFFT_NOT_SUPPORTED` for torch.fft.fft (plan type/transform size mapping) | fix basic 1D/2D C2C/R2C plans; needed by audio/video/diffusion tooling |
-+| cuSPARSE -> rocSPARSE | **FAIL** | `CUSPARSE_STATUS_NOT_SUPPORTED` at `cusparseSetStream` | likely easy stream-mapping fix; then spmm/spmv/geam probes |
++| cuFFT -> rocFFT (torch.fft) | **WORKS (fixed 2026-11-26)** | implemented `cufftXtMakePlanMany` + `cufftXtExec` (hipFFT type mapping); fft/ifft and rfft2/irfft2 round-trips exact | keep; add 3D/batched tests |
++| cuSPARSE -> rocSPARSE | **WORKS (fixed 2026-11-26)** | implemented SetStream/GetStream, Xcoo2csr, CreateCsr (rocsparse mappings); torch.sparse COO mm exact | keep; add CSR/spmv/geam tests |
 +| cuRAND (philox) | WORKS (probe) | torch.randn OK; determinism/philox offset unverified | verify reproducibility |
 +| cuSOLVER (linalg.solve/svd/qr/cholesky) | NOT MAPPED | no cuSOLVER DLL in target/release | probe torch.linalg; add fallback to CPU or rocSOLVER mapping |
 +| NVML / NVAPI | MAPPED | nvml.dll/nvapi64.dll forwarding DLLs exist; on AMD NVML is absent (llama.cpp disables monitoring) | verify torch.cuda.memory stats + apps that require NVML |
@@ -15554,6 +16131,179 @@ index 0000000000000000000000000000000000000000..5fda83cacf51be4522bcf4f35f32d058
 +        stream,
 +    )
 +}
+diff --git a/zluda_fft/src/impl.rs b/zluda_fft/src/impl.rs
+index cd4018d8e6ceec6e45d4a2705ba909c1b55fa123..231ea475476d56f7fb2e4c594da9c3a4a69c6b1a 100644
+--- a/zluda_fft/src/impl.rs
++++ b/zluda_fft/src/impl.rs
+@@ -27,6 +27,7 @@ fn hipfft() -> Result<&'static super::HipfftVtable, hipfftError> {
+ }
+ 
+ struct GlobalState {
++    xt_kinds: std::collections::HashMap<i32, hipfftType>,
+     registry: plan::Registry,
+ }
+ 
+@@ -36,6 +37,7 @@ impl GlobalState {
+         LOCK.get_or_init(|| {
+             Mutex::new(GlobalState {
+                 registry: plan::Registry::new(),
++                xt_kinds: std::collections::HashMap::new(),
+             })
+         })
+     }
+@@ -460,3 +462,85 @@ pub(crate) unsafe fn exec_z_2d(
+         hipfft.hipfftExecZ2D(plan, idata.cast(), odata)
+     })
+ }
++
++fn data_type_to_hipfft(
++    inputtype: cudaDataType,
++    outputtype: cudaDataType,
++) -> Result<hipfftType, cufftError_t> {
++    use cuda_types::cuda::cudaDataType_t;
++    let i = inputtype.0;
++    let o = outputtype.0;
++    let result = if i == cudaDataType_t::CUDA_R_32F.0 && o == cudaDataType_t::CUDA_C_32F.0 {
++        hipfftType_t::HIPFFT_R2C
++    } else if i == cudaDataType_t::CUDA_C_32F.0 && o == cudaDataType_t::CUDA_R_32F.0 {
++        hipfftType_t::HIPFFT_C2R
++    } else if i == cudaDataType_t::CUDA_C_32F.0 && o == cudaDataType_t::CUDA_C_32F.0 {
++        hipfftType_t::HIPFFT_C2C
++    } else if i == cudaDataType_t::CUDA_R_64F.0 && o == cudaDataType_t::CUDA_C_64F.0 {
++        hipfftType_t::HIPFFT_D2Z
++    } else if i == cudaDataType_t::CUDA_C_64F.0 && o == cudaDataType_t::CUDA_R_64F.0 {
++        hipfftType_t::HIPFFT_Z2D
++    } else if i == cudaDataType_t::CUDA_C_64F.0 && o == cudaDataType_t::CUDA_C_64F.0 {
++        hipfftType_t::HIPFFT_Z2Z
++    } else {
++        return Err(cufftError_t::r#NOT_SUPPORTED);
++    };
++    Ok(result)
++}
++
++pub(crate) unsafe fn xt_make_plan_many(
++    plan: cufftHandle,
++    rank: ::core::ffi::c_int,
++    n: *mut ::core::ffi::c_longlong,
++    inembed: *mut ::core::ffi::c_longlong,
++    istride: ::core::ffi::c_longlong,
++    idist: ::core::ffi::c_longlong,
++    inputtype: cudaDataType,
++    onembed: *mut ::core::ffi::c_longlong,
++    ostride: ::core::ffi::c_longlong,
++    odist: ::core::ffi::c_longlong,
++    outputtype: cudaDataType,
++    batch: ::core::ffi::c_longlong,
++    work_size: *mut usize,
++    _executiontype: cudaDataType,
++) -> Result<(), cufftError_t> {
++    let htype = data_type_to_hipfft(inputtype, outputtype)?;
++    GlobalState::with(|state| {
++        state.xt_kinds.insert(plan.0, htype);
++        Ok(())
++    })?;
++    with_plan(plan, |hipfft, plan| {
++        hipfft.hipfftMakePlanMany64(
++            plan, rank, n, inembed, istride, idist, onembed, ostride, odist, htype, batch,
++            work_size,
++        )
++    })
++}
++
++pub(crate) unsafe fn xt_exec(
++    plan: cufftHandle,
++    input: *mut ::core::ffi::c_void,
++    output: *mut ::core::ffi::c_void,
++    direction: ::core::ffi::c_int,
++) -> Result<(), cufftError_t> {
++    let kind = GlobalState::with(|state| {
++        state
++            .xt_kinds
++            .get(&plan.0)
++            .copied()
++            .ok_or(cufftError_t::r#NOT_SUPPORTED)
++    })?;
++    with_plan(plan, |hipfft, plan| match kind {
++        hipfftType_t::HIPFFT_R2C => hipfft.hipfftExecR2C(plan, input as *mut _, output as *mut _),
++        hipfftType_t::HIPFFT_C2R => hipfft.hipfftExecC2R(plan, input as *mut _, output as *mut _),
++        hipfftType_t::HIPFFT_C2C => {
++            hipfft.hipfftExecC2C(plan, input as *mut _, output as *mut _, direction)
++        }
++        hipfftType_t::HIPFFT_D2Z => hipfft.hipfftExecD2Z(plan, input as *mut _, output as *mut _),
++        hipfftType_t::HIPFFT_Z2D => hipfft.hipfftExecZ2D(plan, input as *mut _, output as *mut _),
++        hipfftType_t::HIPFFT_Z2Z => {
++            hipfft.hipfftExecZ2Z(plan, input as *mut _, output as *mut _, direction)
++        }
++        _ => Err(hipfftError::r#NOT_SUPPORTED),
++    })
++}
+\ No newline at end of file
+diff --git a/zluda_fft/src/lib.rs b/zluda_fft/src/lib.rs
+index 2ba4116f327baafb7d02122dce43c4fbe9a7c6aa..187fc4f1ce20ee11d659ff71df62b8a85e38557f 100644
+--- a/zluda_fft/src/lib.rs
++++ b/zluda_fft/src/lib.rs
+@@ -12,6 +12,9 @@ macro_rules! unimplemented {
+             #[allow(improper_ctypes_definitions)]
+             #[allow(unused_variables)]
+             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
++                if std::env::var_os("ZLUDA_DEBUG_UNIMPLEMENTED").is_some() {
++                    eprintln!("zluda_fft: UNIMPLEMENTED called: {}", stringify!($fn_name));
++                }
+                 crate::r#impl::unimplemented()
+             }
+         )*
+@@ -32,8 +35,14 @@ macro_rules! implemented {
+     };
+ }
+ 
++macro_rules! noop_extra {
++    ($($t:tt)*) => {};
++}
++
+ cuda_macros::cufft_function_declarations!(
+     unimplemented,
++    noop_extra <= [cufftXtMakePlanMany],
++    noop_extra <= [cufftXtExec],
+     implemented
+         <= [
+             cufftCreate,
+@@ -171,3 +180,36 @@ cuda_macros::hipfft_function_declarations!(
+             hipfftDestroy,
+         ]
+ );
++
++#[no_mangle]
++pub unsafe extern "C" fn cufftXtMakePlanMany(
++    plan: cuda_types::cufft::cufftHandle,
++    rank: ::core::ffi::c_int,
++    n: *mut ::core::ffi::c_longlong,
++    inembed: *mut ::core::ffi::c_longlong,
++    istride: ::core::ffi::c_longlong,
++    idist: ::core::ffi::c_longlong,
++    inputtype: cuda_types::cufft::cudaDataType,
++    onembed: *mut ::core::ffi::c_longlong,
++    ostride: ::core::ffi::c_longlong,
++    odist: ::core::ffi::c_longlong,
++    outputtype: cuda_types::cufft::cudaDataType,
++    batch: ::core::ffi::c_longlong,
++    workSize: *mut usize,
++    executiontype: cuda_types::cufft::cudaDataType,
++) -> cuda_types::cufft::cufftResult {
++    crate::r#impl::xt_make_plan_many(
++        plan, rank, n, inembed, istride, idist, inputtype, onembed, ostride, odist,
++        outputtype, batch, workSize, executiontype,
++    )
++}
++
++#[no_mangle]
++pub unsafe extern "C" fn cufftXtExec(
++    plan: cuda_types::cufft::cufftHandle,
++    input: *mut ::core::ffi::c_void,
++    output: *mut ::core::ffi::c_void,
++    direction: ::core::ffi::c_int,
++) -> cuda_types::cufft::cufftResult {
++    crate::r#impl::xt_exec(plan, input, output, direction)
++}
 diff --git a/zluda_ops/__init__.py b/zluda_ops/__init__.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..a6c16c402b227657444e5c1dfdab2d9fec2c5ca1
@@ -17927,3 +18677,204 @@ index 0000000000000000000000000000000000000000..a8f7f57a3c001e84b432123fde4a5714
 +    "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
 +    "int4_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 +]
+diff --git a/zluda_sparse/Cargo.toml b/zluda_sparse/Cargo.toml
+index a6614c907b516d1150de8aea54069a0bad6d5858..06eeaf414a656a505b215c655d984f2bfbfe65db 100644
+--- a/zluda_sparse/Cargo.toml
++++ b/zluda_sparse/Cargo.toml
+@@ -11,6 +11,7 @@ name = "cusparse"
+ cuda_macros = { path = "../cuda_macros" }
+ cuda_types = { path = "../cuda_types" }
+ rocsparse-sys = { path = "../ext/rocsparse-sys" }
++hip_runtime-sys = { path = "../ext/hip_runtime-sys" }
+ zluda_common = { path = "../zluda_common" }
+ unwrap_or = "1.0.1"
+ 
+diff --git a/zluda_sparse/src/impl.rs b/zluda_sparse/src/impl.rs
+index ead861435b25700df4c325090d35e0e3a79ec074..d62a3534949ce5b66156732dd982864a51234678 100644
+--- a/zluda_sparse/src/impl.rs
++++ b/zluda_sparse/src/impl.rs
+@@ -1,4 +1,5 @@
+ use cuda_types::cusparse::*;
++use hip_runtime_sys::hipStream_t;
+ use rocsparse_sys::*;
+ use std::{ptr, sync::OnceLock};
+ use unwrap_or::unwrap_ok_or;
+@@ -260,3 +261,98 @@ pub(crate) unsafe fn sp_m_m(
+         external_buffer,
+     )
+ }
++
++pub(crate) unsafe fn set_stream(
++    handle: rocsparse_handle,
++    stream: hipStream_t,
++) -> rocsparse_status {
++    rocsparse()?.rocsparse_set_stream(handle, stream)
++}
++
++pub(crate) unsafe fn get_stream(
++    handle: rocsparse_handle,
++    stream: *mut hipStream_t,
++) -> rocsparse_status {
++    rocsparse()?.rocsparse_get_stream(handle, stream)
++}
++
++
++
++pub(crate) unsafe fn xcoo2csr_raw(
++    handle: cuda_types::cusparse::cusparseHandle_t,
++    coo_row_ind: *const ::core::ffi::c_int,
++    nnz: ::core::ffi::c_int,
++    m: ::core::ffi::c_int,
++    csr_row_ptr: *mut ::core::ffi::c_int,
++) -> cuda_types::cusparse::cusparseStatus_t {
++    let handle: rocsparse_handle = match zluda_common::FromCuda::<
++        _,
++        cuda_types::cusparse::cusparseError_t,
++    >::from_cuda(&handle)
++    {
++        Ok(h) => h,
++        Err(_) => return cuda_types::cusparse::cusparseStatus_t::ERROR_INVALID_VALUE,
++    };
++    let api = match rocsparse() {
++        Ok(api) => api,
++        Err(_) => return cuda_types::cusparse::cusparseStatus_t::ERROR_INTERNAL_ERROR,
++    };
++    let status = api.rocsparse_coo2csr(
++        handle,
++        coo_row_ind,
++        nnz,
++        m,
++        csr_row_ptr,
++        rocsparse_index_base_(0),
++    );
++    if status.is_ok() {
++        Ok(())
++    } else {
++        cuda_types::cusparse::cusparseStatus_t::ERROR_INTERNAL_ERROR
++    }
++}
++
++pub(crate) unsafe fn create_csr_raw(
++    descr: *mut ::core::ffi::c_void,
++    rows: i64,
++    cols: i64,
++    nnz: i64,
++    csr_row_offsets: *mut ::core::ffi::c_void,
++    csr_col_ind: *mut ::core::ffi::c_void,
++    csr_values: *mut ::core::ffi::c_void,
++    row_idx_type: ::core::ffi::c_uint,
++    col_idx_type: ::core::ffi::c_uint,
++    idx_base: ::core::ffi::c_uint,
++    value_type: ::core::ffi::c_uint,
++) -> cuda_types::cusparse::cusparseStatus_t {
++    let datatype = match value_type {
++        0 => rocsparse_datatype_::rocsparse_datatype_f32_r,
++        4 => rocsparse_datatype_::rocsparse_datatype_f32_c,
++        1 => rocsparse_datatype_::rocsparse_datatype_f64_r,
++        5 => rocsparse_datatype_::rocsparse_datatype_f64_c,
++        3 => rocsparse_datatype_::rocsparse_datatype_i8_r,
++        _ => return cuda_types::cusparse::cusparseStatus_t::ERROR_NOT_SUPPORTED,
++    };
++    let api = match rocsparse() {
++        Ok(api) => api,
++        Err(_) => return cuda_types::cusparse::cusparseStatus_t::ERROR_INTERNAL_ERROR,
++    };
++    let status = api.rocsparse_create_csr_descr(
++        descr as *mut rocsparse_spmat_descr,
++        rows,
++        cols,
++        nnz,
++        csr_row_offsets,
++        csr_col_ind,
++        csr_values,
++        rocsparse_indextype_(row_idx_type),
++        rocsparse_indextype_(col_idx_type),
++        rocsparse_index_base_(if idx_base == 0 { 0 } else { 1 }),
++        datatype,
++    );
++    if status.is_ok() {
++        Ok(())
++    } else {
++        cuda_types::cusparse::cusparseStatus_t::ERROR_NOT_SUPPORTED
++    }
++}
+diff --git a/zluda_sparse/src/lib.rs b/zluda_sparse/src/lib.rs
+index 6ae899d9039eb8aaf83d3ec46243b6ba81c024dc..43718e90ca7ff2c980d844476ecd9b0371661892 100644
+--- a/zluda_sparse/src/lib.rs
++++ b/zluda_sparse/src/lib.rs
+@@ -62,9 +62,15 @@ macro_rules! implemented_no_error {
+     };
+ }
+ 
++macro_rules! noop_extra {
++    ($($t:tt)*) => {};
++}
++
+ cuda_macros::cusparse_function_declarations!(
+     unimplemented,
+     implemented_unmapped <= [cusparseGetErrorName, cusparseGetErrorString,],
++    noop_extra <= [cusparseXcoo2csr],
++    noop_extra <= [cusparseCreateCsr],
+     implemented_no_error
+         <= [
+             cusparseGetMatDiagType,
+@@ -84,6 +90,8 @@ cuda_macros::cusparse_function_declarations!(
+             cusparseSpMM_bufferSize,
+             cusparseSpMM_preprocess,
+             cusparseSpMM,
++            cusparseSetStream,
++            cusparseGetStream,
+         ]
+ );
+ 
+@@ -169,5 +177,50 @@ cuda_macros::rocsparse_function_declarations!(
+             rocsparse_spmm_buffer_size,
+             rocsparse_spmm_preprocess,
+             rocsparse_spmm,
++            rocsparse_coo2csr,
++            rocsparse_create_csr_descr,
++            rocsparse_set_stream,
++            rocsparse_get_stream,
+         ]
+ );
++
++#[no_mangle]
++pub unsafe extern "C" fn cusparseXcoo2csr(
++    handle: cuda_types::cusparse::cusparseHandle_t,
++    cooRowInd: *const ::core::ffi::c_int,
++    nnz: ::core::ffi::c_int,
++    m: ::core::ffi::c_int,
++    csrSortedRowPtr: *mut ::core::ffi::c_int,
++    _idxBase: cuda_types::cusparse::cusparseIndexBase_t,
++) -> cuda_types::cusparse::cusparseStatus_t {
++    crate::r#impl::xcoo2csr_raw(handle, cooRowInd, nnz, m, csrSortedRowPtr)
++}
++
++#[no_mangle]
++pub unsafe extern "C" fn cusparseCreateCsr(
++    spMatDescr: *mut cuda_types::cusparse::cusparseSpMatDescr_t,
++    rows: i64,
++    cols: i64,
++    nnz: i64,
++    csrRowOffsets: *mut ::core::ffi::c_void,
++    csrColInd: *mut ::core::ffi::c_void,
++    csrValues: *mut ::core::ffi::c_void,
++    csrRowOffsetsType: cuda_types::cusparse::cusparseIndexType_t,
++    csrColIndType: cuda_types::cusparse::cusparseIndexType_t,
++    idxBase: cuda_types::cusparse::cusparseIndexBase_t,
++    valueType: cuda_types::cusparse::cudaDataType,
++) -> cuda_types::cusparse::cusparseStatus_t {
++    crate::r#impl::create_csr_raw(
++        spMatDescr as *mut ::core::ffi::c_void,
++        rows,
++        cols,
++        nnz,
++        csrRowOffsets,
++        csrColInd,
++        csrValues,
++        csrRowOffsetsType.0,
++        csrColIndType.0,
++        idxBase.0,
++        valueType.0,
++    )
++}

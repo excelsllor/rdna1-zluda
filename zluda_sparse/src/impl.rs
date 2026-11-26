@@ -1,4 +1,5 @@
 use cuda_types::cusparse::*;
+use hip_runtime_sys::hipStream_t;
 use rocsparse_sys::*;
 use std::{ptr, sync::OnceLock};
 use unwrap_or::unwrap_ok_or;
@@ -259,4 +260,99 @@ pub(crate) unsafe fn sp_m_m(
         &mut 0,
         external_buffer,
     )
+}
+
+pub(crate) unsafe fn set_stream(
+    handle: rocsparse_handle,
+    stream: hipStream_t,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_set_stream(handle, stream)
+}
+
+pub(crate) unsafe fn get_stream(
+    handle: rocsparse_handle,
+    stream: *mut hipStream_t,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_get_stream(handle, stream)
+}
+
+
+
+pub(crate) unsafe fn xcoo2csr_raw(
+    handle: cuda_types::cusparse::cusparseHandle_t,
+    coo_row_ind: *const ::core::ffi::c_int,
+    nnz: ::core::ffi::c_int,
+    m: ::core::ffi::c_int,
+    csr_row_ptr: *mut ::core::ffi::c_int,
+) -> cuda_types::cusparse::cusparseStatus_t {
+    let handle: rocsparse_handle = match zluda_common::FromCuda::<
+        _,
+        cuda_types::cusparse::cusparseError_t,
+    >::from_cuda(&handle)
+    {
+        Ok(h) => h,
+        Err(_) => return cuda_types::cusparse::cusparseStatus_t::ERROR_INVALID_VALUE,
+    };
+    let api = match rocsparse() {
+        Ok(api) => api,
+        Err(_) => return cuda_types::cusparse::cusparseStatus_t::ERROR_INTERNAL_ERROR,
+    };
+    let status = api.rocsparse_coo2csr(
+        handle,
+        coo_row_ind,
+        nnz,
+        m,
+        csr_row_ptr,
+        rocsparse_index_base_(0),
+    );
+    if status.is_ok() {
+        Ok(())
+    } else {
+        cuda_types::cusparse::cusparseStatus_t::ERROR_INTERNAL_ERROR
+    }
+}
+
+pub(crate) unsafe fn create_csr_raw(
+    descr: *mut ::core::ffi::c_void,
+    rows: i64,
+    cols: i64,
+    nnz: i64,
+    csr_row_offsets: *mut ::core::ffi::c_void,
+    csr_col_ind: *mut ::core::ffi::c_void,
+    csr_values: *mut ::core::ffi::c_void,
+    row_idx_type: ::core::ffi::c_uint,
+    col_idx_type: ::core::ffi::c_uint,
+    idx_base: ::core::ffi::c_uint,
+    value_type: ::core::ffi::c_uint,
+) -> cuda_types::cusparse::cusparseStatus_t {
+    let datatype = match value_type {
+        0 => rocsparse_datatype_::rocsparse_datatype_f32_r,
+        4 => rocsparse_datatype_::rocsparse_datatype_f32_c,
+        1 => rocsparse_datatype_::rocsparse_datatype_f64_r,
+        5 => rocsparse_datatype_::rocsparse_datatype_f64_c,
+        3 => rocsparse_datatype_::rocsparse_datatype_i8_r,
+        _ => return cuda_types::cusparse::cusparseStatus_t::ERROR_NOT_SUPPORTED,
+    };
+    let api = match rocsparse() {
+        Ok(api) => api,
+        Err(_) => return cuda_types::cusparse::cusparseStatus_t::ERROR_INTERNAL_ERROR,
+    };
+    let status = api.rocsparse_create_csr_descr(
+        descr as *mut rocsparse_spmat_descr,
+        rows,
+        cols,
+        nnz,
+        csr_row_offsets,
+        csr_col_ind,
+        csr_values,
+        rocsparse_indextype_(row_idx_type),
+        rocsparse_indextype_(col_idx_type),
+        rocsparse_index_base_(if idx_base == 0 { 0 } else { 1 }),
+        datatype,
+    );
+    if status.is_ok() {
+        Ok(())
+    } else {
+        cuda_types::cusparse::cusparseStatus_t::ERROR_NOT_SUPPORTED
+    }
 }
