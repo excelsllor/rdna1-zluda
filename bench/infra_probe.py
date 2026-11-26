@@ -154,6 +154,13 @@ def main():
 
     probe("cublas_addmm_epilogue", cublas_addmm)
 
+    def cublas_sgemv_fp32():
+        x = torch.randn(1, 4096, device="cuda", dtype=torch.float32)
+        w = torch.randn(4096, 4096, device="cuda", dtype=torch.float32)
+        y = torch.mv(w, x[0])  # true 1-D GEMV path (cublasSgemv)
+        return {"shape": tuple(y.shape)}
+
+    probe("cublas_sgemv_fp32", cublas_sgemv_fp32)
     # ---------- cuRAND ----------
     def curand_ops():
         torch.manual_seed(1234)
