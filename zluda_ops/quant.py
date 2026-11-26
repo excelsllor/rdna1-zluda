@@ -377,7 +377,8 @@ def _int8_matmul_kernel(X, W, SC, Y, M, N, K,
              mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
-def int8_matmul(x, w, scales, group_size=128, block_m=64, block_n=64, block_k=128):
+def int8_matmul(x, w, scales, group_size=128, block_m=64, block_n=64, block_k=128,
+                num_warps=4, num_stages=2):
     """Prefill GEMM: y = (x @ w.T) with int8 weights dequantized on the fly."""
     if (not x.is_cuda or x.dtype != torch.float16 or x.dim() != 2
             or not x.is_contiguous() or w.dtype != torch.int8 or not w.is_contiguous()):
@@ -392,5 +393,5 @@ def int8_matmul(x, w, scales, group_size=128, block_m=64, block_n=64, block_k=12
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
     _int8_matmul_kernel[grid](
         x, w, scales, y, m, n, k, GROUP=group_size, BM=block_m, BN=block_n,
-        BK=block_k, num_warps=4, num_stages=2)
+        BK=block_k, num_warps=num_warps, num_stages=num_stages)
     return y

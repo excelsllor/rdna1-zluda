@@ -248,7 +248,14 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
-- **2026-11-26 - Phase 2 COMPLETE (kernels validated + e2e wired):**
+- **2026-11-26 - Phase 2 finished (tuning round):** sampling parallelised
+  (138.6 us standalone on 151936 vocab vs 658/3693 us before; greedy exact,
+  top-50 40/40), GEMV autotuner added (bench/autotune_gemv.py ->
+  zluda_ops/tuned_gemv_ext.py, merged as fallback in gemv._config), int8
+  prefill tuned (best 387/1624 us at M=64/512 vs fp16 dequant 207/726 us —
+  kept as VRAM option only). Final bench/phase2_kernels.py: 9/9 OK. Phase 2
+  complete for the planned kernel set; open follow-ups: wire fused QKV/GQA
+  kernels into the layer path, more e2e measurements.- **2026-11-26 - Phase 2 COMPLETE (kernels validated + e2e wired):**
   9/9 kernel checks pass (bench/phase2_kernels.py): GQA KV-reuse decode 1.34x,
   M=1 specialised decode 1.34x (M>1 exact after fixing the bench reference),
   fused residual+RMSNorm, fused QKV+RoPE+KV-append, embedding gather+scale,
