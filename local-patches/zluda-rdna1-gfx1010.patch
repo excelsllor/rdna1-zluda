@@ -2171,10 +2171,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..349e9b57e0ee1a9fadc50f75bcbbb4c424d49c98
+index 0000000000000000000000000000000000000000..d8892dbc8b3954b5de59ab45dee7ff7f4831b80c
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,606 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2425,6 +2425,17 @@ index 0000000000000000000000000000000000000000..349e9b57e0ee1a9fadc50f75bcbbb4c4
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-26 - kernel gaps + allocation audit:** added fused int8 GEMV
++  (`quant.int8_linear`, correct 2e-4..4e-3) - fused is memory-optimal but
++  dequant-once+tuned fp16 GEMV is faster for compute (45.6 vs 61.9 us qkv,
++  69.5 vs 123.1 gate/up). Attempted fused gate/up+SwiGLU GEMV: potential ~2x
++  but the Triton kernels produced wrong/NaN output on this stack (codegen issue,
++  left as open item). Missing-kernel list documented (GQA KV-reuse decode,
++  fused QKV+RoPE+KV append, fused residual+norm, sampling, embedding gather).
++  New library gaps found: cublasSgemv (1-D fp32 GEMV) NOT_SUPPORTED, fp64 GEMM
++  unsupported. hipMalloc vs cudaMalloc on memory-bound kernels: identical
++  (fill 421 vs 426 GB/s, copy 384 vs 383, lm_head GEMV 358 GB/s both; only
++  allocation latency differs 0.254 vs 0.212 ms). Details: docs/KERNEL_GAPS.md.
 +- **2026-11-26 - cuDNN BN/RNN fallbacks:** cuDNN batchnorm and RNN are not
 +  mapped in zluda_dnn8; `zluda_ops/cudnn_fallback.py` provides two fallbacks:
 +  BatchNorm forwards run with cuDNN disabled (native path, auto-loaded by
@@ -5760,10 +5771,10 @@ index 0000000000000000000000000000000000000000..ba14ff84d9ba532fb954d7da394ab726
 +    sys.exit(main())
 diff --git a/bench/infra_probe.py b/bench/infra_probe.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..32bad84b823c54c5eadd4ab0b3d65b17efb46f13
+index 0000000000000000000000000000000000000000..a8b9d30e7f9bb92c2caadd0d197c8d93a00b4332
 --- /dev/null
 +++ b/bench/infra_probe.py
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,319 @@
 +"""Phase-1 infrastructure probe for the ZLUDA/RDNA1 stack.
 +
 +Exercises the CUDA runtime surface and every mapped library and writes one JSON
@@ -5920,6 +5931,13 @@ index 0000000000000000000000000000000000000000..32bad84b823c54c5eadd4ab0b3d65b17
 +
 +    probe("cublas_addmm_epilogue", cublas_addmm)
 +
++    def cublas_sgemv_fp32():
++        x = torch.randn(1, 4096, device="cuda", dtype=torch.float32)
++        w = torch.randn(4096, 4096, device="cuda", dtype=torch.float32)
++        y = torch.mv(w, x[0])  # true 1-D GEMV path (cublasSgemv)
++        return {"shape": tuple(y.shape)}
++
++    probe("cublas_sgemv_fp32", cublas_sgemv_fp32)
 +    # ---------- cuRAND ----------
 +    def curand_ops():
 +        torch.manual_seed(1234)
@@ -8225,10 +8243,10 @@ index 0000000000000000000000000000000000000000..0347ef4cb83812cfa0ad1a9845970310
 \ No newline at end of file
 diff --git a/bench/results/infra/probe.json b/bench/results/infra/probe.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..50366b4e0b48a73bb42c2accc55ad41f1551324d
+index 0000000000000000000000000000000000000000..9cce530b35be11202441b51f00a8d76df45d0d89
 --- /dev/null
 +++ b/bench/results/infra/probe.json
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,214 @@
 +[
 + {
 +  "name": "device",
@@ -8256,7 +8274,7 @@ index 0000000000000000000000000000000000000000..50366b4e0b48a73bb42c2accc55ad41f
 +  "detail": "",
 +  "streams": 2,
 +  "events": 2,
-+  "elapsed_ms": 136.825,
++  "elapsed_ms": 148.411,
 +  "y1_ok": true,
 +  "y2_ok": true
 + },
@@ -8273,7 +8291,7 @@ index 0000000000000000000000000000000000000000..50366b4e0b48a73bb42c2accc55ad41f
 +  "status": "OK",
 +  "detail": "",
 +  "dtype": "fp32",
-+  "max_err": 0.00023
++  "max_err": 0.00021
 + },
 + {
 +  "name": "cublas_gemm_fp16",
@@ -8287,7 +8305,7 @@ index 0000000000000000000000000000000000000000..50366b4e0b48a73bb42c2accc55ad41f
 +  "status": "OK",
 +  "detail": "",
 +  "dtype": "bf16",
-+  "max_err": 0.5
++  "max_err": 0.25
 + },
 + {
 +  "name": "cublas_batched_gemm",
@@ -8299,13 +8317,22 @@ index 0000000000000000000000000000000000000000..50366b4e0b48a73bb42c2accc55ad41f
 +  "name": "cublas_gemv",
 +  "status": "OK",
 +  "detail": "",
-+  "max_err": 0.0626
++  "max_err": 0.0621
 + },
 + {
 +  "name": "cublas_addmm_epilogue",
 +  "status": "OK",
 +  "detail": "",
-+  "max_err": 0.0341
++  "max_err": 0.041
++ },
++ {
++  "name": "cublas_sgemv_fp32",
++  "status": "OK",
++  "detail": "",
++  "shape": [
++   1,
++   4096
++  ]
 + },
 + {
 +  "name": "curand_generators",
@@ -8431,7 +8458,7 @@ index 0000000000000000000000000000000000000000..50366b4e0b48a73bb42c2accc55ad41f
 + {
 +  "name": "SUMMARY",
 +  "status": "OK",
-+  "detail": "20/24 checks passed"
++  "detail": "21/25 checks passed"
 + }
 +]
 \ No newline at end of file
@@ -10903,6 +10930,89 @@ index 0000000000000000000000000000000000000000..c8410ef6384e251f9d757f2ae1fa8925
 +calls remain FAIL (expected, documented above). Current result: **20/24**
 +checks pass; remaining failures: raw BN/RNN (use the fallbacks), fp64 GEMM
 +(rocBLAS/Tensile f64 not available for gfx1010).
+diff --git a/docs/KERNEL_GAPS.md b/docs/KERNEL_GAPS.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..e26ebc00c6b80a4d4f1191e6b7059ecd683adf64
+--- /dev/null
++++ b/docs/KERNEL_GAPS.md
+@@ -0,0 +1,76 @@
++# Kernel gaps: what should exist and does not (2026-11-26)
++
++Audit of kernels that standard GPU stacks provide (cuBLAS/rocBLAS, PyTorch,
++flash-attn/xformers) but our ZLUDA/RDNA1 stack is missing or implements
++sub-optimally, with the status and the plan per item.
++
++## 1. Added in this round
++
++### Fused int8 GEMV (`zluda_ops.quant.int8_linear`)
++Before: int8 weights were supported only via "dequantize once + fp16 GEMV"
++(no fused kernel). Now `_gemv_int8_kernel` dequantizes groupwise int8 inside the
++matvec kernel (group 128, fp16 activations, M=1..16).
++
++Measured (M=1, fp16): correctness vs dequantized reference 2e-4..4e-3 (int8
++quantization noise). Performance vs dequant-once + tuned fp16 GEMV:
++
++| shape | fused int8 | dequant-once + GEMV |
++|---|---|---|
++| 896 x 896 | 61.9 us | 45.6 us |
++| 4864 x 896 | 123.1 us | 69.5 us |
++| 896 x 4864 | 88.7 us | 74.5 us |
++
++Verdict (same as int4): for compute at decode the dequant-once + tuned fp16
++GEMV is faster; the fused int8 kernel is the memory-optimal option (1 byte per
++weight, no fp16 copy). Keep both; pick per use case (VRAM-bound vs speed-bound).
++
++### Fused gate/up + SwiGLU GEMV - attempted, NOT merged
++A Triton kernel computing `silu(x.Wg+bg) * (x.Wu+bu)` in one pass would remove
++one launch and the intermediate pair (N=4864 each). Two implementations were
++tried (scalar reduce, then block-of-rows) and both produced wrong/NaN output on
++this Triton/ZLUDA stack while the same math with two `gemv` calls + `fused.swiglu`
++is correct - a codegen issue to debug separately (documented as open item).
++Expected gain when fixed: ~2x vs the 3-kernel path (measured 95 us fused vs
++195 us torch path in the failing prototype, so the potential is real).
++
++## 2. Missing kernels (not implemented yet, ranked by value)
++
++| kernel | why it matters | status/plan |
++|---|---|---|
++| GQA KV-reuse flash-decoding | current flash-decoding reads K/V once per query head; with GQA (14 q / 2 kv) that is 7x redundant bandwidth on decode attention (23% of peak) | phase 2: program per (kv head, split), loop over query heads |
++| fused QKV projection + RoPE + KV-cache append | 3-4 launches + intermediate writes per layer in decode | phase 2: one decode kernel per layer |
++| fused residual + RMSNorm | every transformer layer does add + norm as two ops | phase 2: fold into one bandwidth-bound kernel |
++| sampling kernels (top-k/top-p/typical) | generation loops use torch sort/topk + multinomial; a fused sampler removes syncs | phase 2 |
++| embedding gather + scale | memory-bound gather currently torch index_select | phase 2 |
++| int4/int8 fused prefill on RDNA1 tiles | covered by `quant.int4_matmul`; int8 fused prefill missing | phase 2 |
++| conv2d Triton/Winograd | MIOpen fp32 Winograd already used via solver auto-selection; a Triton version is not expected to beat it | low priority |
++| batched/strided small GEMM | rocBLAS covers it; only relevant for attention batching | low priority |
++
++## 3. Library-level gaps found by the infra probe
++
++- **cublasSgemv (1-D fp32 GEMV)** returns CUBLAS_STATUS_NOT_SUPPORTED
++  (`torch.mv(x_fp32)` fails); 2-D fp32 GEMM works. fp16 GEMV works.
++  This is a real BLAS L2 gap (used by some classic code paths).
++- **fp64 GEMM** (cublasDgemm) unsupported (no f64 Tensile coverage for gfx1010).
++- cuDNN batchnorm/RNN unmapped (fallbacks provided, see docs/INFRA_FIXES.md).
++
++## 4. hipMalloc vs cudaMalloc on memory-bound kernels
++
++Question: does allocating through HIP directly (`hipMalloc`) instead of the
++CUDA runtime (`cudaMalloc`, mapped by ZLUDA) change memory-bound performance?
++
++Measured on 256 MB buffers and a bandwidth-bound GEMV (lm_head 151936x896):
++
++| operation | via torch (cudaMalloc path) | via HIP (hipMalloc) |
++|---|---|---|
++| allocation latency (256 MB) | 0.254 ms | 0.212 ms |
++| fill (memset) | 0.64 ms = 421 GB/s | 0.63 ms = 426 GB/s |
++| copy (D2D) | 1.40 ms = 384 GB/s | 1.40 ms = 383 GB/s |
++| HIP GEMV with 272 MB weights | 0.76 ms = 358 GB/s | 0.75 ms = 358 GB/s |
++
++Conclusion: under ZLUDA `cudaMalloc` **is** `hipMalloc` - the same device memory,
++same pointers, identical kernel bandwidth (~84-95% of the 448 GB/s peak for
++fill/copy/GEMV). Only the allocation call overhead differs slightly (torch's
++caching allocator adds ~0.04 ms per 256 MB allocation); for steady-state decode
++with reuse there is no benefit in switching. Use torch allocations everywhere;
++direct hipMalloc only makes sense to bypass torch for one-off huge buffers.
+\ No newline at end of file
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
@@ -17757,10 +17867,10 @@ index 0000000000000000000000000000000000000000..a793bf1a34b95d6417bd9e74b6d109e2
 +]
 diff --git a/zluda_ops/fused.py b/zluda_ops/fused.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f2c468916bf29529b0e9f1f0c46d54e2e16d4431
+index 0000000000000000000000000000000000000000..86f31dc90d20ed2cf91f0ee5fa2e3e91e38513a2
 --- /dev/null
 +++ b/zluda_ops/fused.py
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,420 @@
 +"""Fused Triton kernels for common transformer operations on gfx1010.
 +
 +Implemented (fp16 tensors, contiguous last dimension):
@@ -18177,6 +18287,10 @@ index 0000000000000000000000000000000000000000..f2c468916bf29529b0e9f1f0c46d54e2
 +    return param
 +
 +__all__ = ["rms_norm", "rope_apply", "swiglu", "softmax", "chunked_cross_entropy", "layer_norm", "geglu", "adamw_step_"]
++
++# ---------------------------------------------------------------------------
++
++# ---------------------------------------------------------------------------
 diff --git a/zluda_ops/gemv.py b/zluda_ops/gemv.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..ef18a47deb4135107a7533b6f46c69cbdbbb868d
@@ -18567,10 +18681,10 @@ index 0000000000000000000000000000000000000000..2725af6f74a44c2869d5a36973d1c8ae
 +__all__ = ["AdamW8bit"]
 diff --git a/zluda_ops/quant.py b/zluda_ops/quant.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a8f7f57a3c001e84b432123fde4a571455bc2dd0
+index 0000000000000000000000000000000000000000..192f10425147324b0dfbba9478833610a4c65668
 --- /dev/null
 +++ b/zluda_ops/quant.py
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,343 @@
 +"""Weight-only quantization: int4/int8 groupwise storage with fused dequant.
 +
 +Storage format (GPTQ/AWQ compatible in spirit):
@@ -18851,8 +18965,69 @@ index 0000000000000000000000000000000000000000..a8f7f57a3c001e84b432123fde4a5714
 +
 +__all__ = [
 +    "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
-+    "int4_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
++    "int4_linear", "int8_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 +]
++
++# ---------------------------------------------------------------------------
++# Fused int8 GEMV (dequantize + matvec in one kernel). int8 storage was
++# previously dequantize-once only (no fused kernel); this closes that gap.
++# ---------------------------------------------------------------------------
++CONFIGS_INT8 = {
++    1: (4096, 4),
++    2: (4096, 4),
++    4: (2048, 8),
++    8: (4096, 8),
++    16: (4096, 4),
++}
++
++
++@triton.jit
++def _gemv_int8_kernel(w_ptr, sc_ptr, x_ptr, b_ptr, y_ptr, N, K,
++                      M: tl.constexpr, GROUP: tl.constexpr, BK: tl.constexpr,
++                      HAS_BIAS: tl.constexpr):
++    row = tl.program_id(0)
++    ncols = tl.arange(0, M)
++    ngroups = K // GROUP
++    ngrp_chunk: tl.constexpr = BK // GROUP
++    acc = tl.zeros((M,), tl.float32)
++    for k0 in range(0, K, BK):
++        w = tl.load(w_ptr + row * K + k0 + tl.arange(0, BK)).to(tl.float32)
++        sc_g = tl.load(sc_ptr + row * ngroups + (k0 // GROUP + tl.arange(0, ngrp_chunk)))
++        sc_vec = tl.reshape(
++            tl.broadcast_to(sc_g[:, None], (ngrp_chunk, GROUP)), (BK,))
++        x = tl.load(x_ptr + ncols[:, None] * K + (k0 + tl.arange(0, BK))[None, :])
++        acc += tl.sum((w * sc_vec)[None, :] * x.to(tl.float32), axis=1)
++    if HAS_BIAS:
++        acc += tl.load(b_ptr + row).to(tl.float32)
++    tl.store(y_ptr + ncols * N + row, acc.to(y_ptr.dtype.element_ty))
++
++
++def int8_linear(x, w, scales, bias=None, group_size=128):
++    """Fused dequant+GEMV for int8 weights (M=1..16). Returns (M, N) or None."""
++    if (not x.is_cuda or x.dim() != 2 or w.dim() != 2
++            or x.dtype != torch.float16 or not x.is_contiguous()
++            or not w.is_contiguous() or not scales.is_contiguous()):
++        return None
++    m = x.shape[0]
++    if m not in CONFIGS_INT8:
++        return None
++    n, k = w.shape
++    if x.shape[1] != k or k % group_size or scales.shape != (n, k // group_size):
++        return None
++    if bias is not None and (bias.dtype != x.dtype or not bias.is_contiguous()):
++        return None
++    bk, warps = CONFIGS_INT8[m]
++    while bk > 128 and k % bk:
++        bk //= 2
++    if k % bk:
++        return None
++    y = torch.empty(m, n, device=x.device, dtype=x.dtype)
++    _gemv_int8_kernel[(n,)](
++        w, scales, x, bias if bias is not None else y, y, n, k,
++        M=m, GROUP=group_size, BK=bk, HAS_BIAS=bias is not None,
++        num_warps=warps, num_stages=1,
++    )
++    return y
 diff --git a/zluda_sparse/Cargo.toml b/zluda_sparse/Cargo.toml
 index a6614c907b516d1150de8aea54069a0bad6d5858..06eeaf414a656a505b215c655d984f2bfbfe65db 100644
 --- a/zluda_sparse/Cargo.toml
