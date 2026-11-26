@@ -25,7 +25,7 @@
   "detail": "",
   "streams": 2,
   "events": 2,
-  "elapsed_ms": 206.604,
+  "elapsed_ms": 136.825,
   "y1_ok": true,
   "y2_ok": true
  },
@@ -42,7 +42,7 @@
   "status": "OK",
   "detail": "",
   "dtype": "fp32",
-  "max_err": 0.00022
+  "max_err": 0.00023
  },
  {
   "name": "cublas_gemm_fp16",
@@ -68,13 +68,13 @@
   "name": "cublas_gemv",
   "status": "OK",
   "detail": "",
-  "max_err": 0.0624
+  "max_err": 0.0626
  },
  {
   "name": "cublas_addmm_epilogue",
   "status": "OK",
   "detail": "",
-  "max_err": 0.0399
+  "max_err": 0.0341
  },
  {
   "name": "curand_generators",
@@ -175,8 +175,31 @@
   "max_err": 0.0
  },
  {
+  "name": "cudnn_batchnorm_fallback",
+  "status": "OK",
+  "detail": "",
+  "fallback": "cudnn_fallback.install",
+  "shape": [
+   2,
+   8,
+   16,
+   16
+  ]
+ },
+ {
+  "name": "cudnn_lstm_fallback",
+  "status": "OK",
+  "detail": "",
+  "fallback": "cudnn_fallback.rnn_context",
+  "shape": [
+   2,
+   8,
+   32
+  ]
+ },
+ {
   "name": "SUMMARY",
   "status": "OK",
-  "detail": "18/22 checks passed"
+  "detail": "20/24 checks passed"
  }
 ]

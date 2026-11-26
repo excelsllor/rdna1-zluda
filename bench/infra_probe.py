@@ -283,6 +283,26 @@ def main():
 
     probe("sdpa_math", sdpa_math)
 
+    # ---------- fallbacks for unmapped cuDNN ops ----------
+    def cudnn_batchnorm_fallback():
+        from zluda_ops import cudnn_fallback
+        cudnn_fallback.install()
+        m = torch.nn.BatchNorm2d(8).cuda()
+        x = torch.randn(2, 8, 16, 16, device="cuda")
+        y = m(x)
+        return {"fallback": "cudnn_fallback.install", "shape": tuple(y.shape)}
+
+    probe("cudnn_batchnorm_fallback", cudnn_batchnorm_fallback)
+
+    def cudnn_rnn_fallback():
+        from zluda_ops import cudnn_fallback
+        with cudnn_fallback.rnn_context():
+            lstm = torch.nn.LSTM(32, 32, batch_first=True).cuda()
+            x = torch.randn(2, 8, 32, device="cuda")
+            y = lstm(x)[0]
+        return {"fallback": "cudnn_fallback.rnn_context", "shape": tuple(y.shape)}
+
+    probe("cudnn_lstm_fallback", cudnn_rnn_fallback)
     n_ok = sum(1 for r in RESULTS if r["status"] == "OK")
     record("SUMMARY", "OK", f"{n_ok}/{len(RESULTS)} checks passed")
     return 0

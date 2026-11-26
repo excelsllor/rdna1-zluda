@@ -248,6 +248,15 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - cuDNN BN/RNN fallbacks:** cuDNN batchnorm and RNN are not
+  mapped in zluda_dnn8; `zluda_ops/cudnn_fallback.py` provides two fallbacks:
+  BatchNorm forwards run with cuDNN disabled (native path, auto-loaded by
+  zluda_ops.auto, `ZLUDA_CUDNN_FALLBACK=0` to disable) and
+  `rnn_context()` for LSTM/GRU (creation+forward inside the context, because the
+  backend is chosen before the call; retrying after a failed cuDNN call leaves
+  MIOpen state unusable). Infra probe: 20/24 OK (added fallback checks);
+  remaining: raw BN/RNN calls (use fallbacks), fp64 GEMM (no rocBLAS/Tensile
+  f64 for gfx1010).
 - **2026-11-26 - Phase-1 infra fixes: cuFFT + cuSPARSE now work.** cuFFT:
   PyTorch's FFT path uses `cufftXtMakePlanMany`/`cufftXtExec`, which were
   unimplemented (CUFFT_NOT_SUPPORTED); implemented them mapping cudaDataType

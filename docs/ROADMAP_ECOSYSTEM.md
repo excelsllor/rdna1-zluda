@@ -25,7 +25,7 @@ blockers fixed.
 | cuBLASLt (cublasLt64_11/12/13.dll) | MAPPED, UNVERIFIED | DLLs exist; PyTorch rarely exercises the epilogue paths | probe with a bias-epilogue GEMM / vendor code |
 | cuDNN -> MIOpen: conv2d | WORKS (with solver selection) | fp16 3x3 picks GEMM solver; per-shape auto-selection implemented (fp32 Winograd cached-weight path 1.4-2.7x) | keep; extend to conv1d/3d/transposed |
 | cuDNN: pool2d / avgpool / conv_transpose | WORKS | probe OK | regression tests |
-| cuDNN: batchnorm | **FAIL** | `CUDNN_STATUS_NOT_SUPPORTED` on BatchNorm2d (contiguous fp32 input) | fix or fallback: torch native batch_norm path |
+| cuDNN: batchnorm | **WORKS via fallback (2026-11-26)** | cuDNN BN unmapped; `zluda_ops.cudnn_fallback` runs BN with cuDNN disabled (native path), auto-loaded by zluda_ops.auto | implement MIOpen BN mapping later |
 | cuDNN: RNN (LSTM/GRU) | **FAIL/crash** | `CUDNN_STATUS_INTERNAL_ERROR` + MIOpen "Failed to launch kernel: invalid argument"; process died at exit | high priority: fix mapping or force native fallback |
 | cuDNN: attention/FMHA, conv3d, RNN variants | UNTESTED | not exercised yet | probe matrix |
 | cuFFT -> rocFFT (torch.fft) | **WORKS (fixed 2026-11-26)** | implemented `cufftXtMakePlanMany` + `cufftXtExec` (hipFFT type mapping); fft/ifft and rfft2/irfft2 round-trips exact | keep; add 3D/batched tests |
