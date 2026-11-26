@@ -2171,10 +2171,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7b2a108e74f14fcf873267ac25a96069272fb476
+index 0000000000000000000000000000000000000000..349e9b57e0ee1a9fadc50f75bcbbb4c424d49c98
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,586 @@
+@@ -0,0 +1,595 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2425,6 +2425,15 @@ index 0000000000000000000000000000000000000000..7b2a108e74f14fcf873267ac25a96069
 +  dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
 +  the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
 +  order/zero-point loading and the prefill dequant-GEMM remain open.
++- **2026-11-26 - cuDNN BN/RNN fallbacks:** cuDNN batchnorm and RNN are not
++  mapped in zluda_dnn8; `zluda_ops/cudnn_fallback.py` provides two fallbacks:
++  BatchNorm forwards run with cuDNN disabled (native path, auto-loaded by
++  zluda_ops.auto, `ZLUDA_CUDNN_FALLBACK=0` to disable) and
++  `rnn_context()` for LSTM/GRU (creation+forward inside the context, because the
++  backend is chosen before the call; retrying after a failed cuDNN call leaves
++  MIOpen state unusable). Infra probe: 20/24 OK (added fallback checks);
++  remaining: raw BN/RNN calls (use fallbacks), fp64 GEMM (no rocBLAS/Tensile
++  f64 for gfx1010).
 +- **2026-11-26 - Phase-1 infra fixes: cuFFT + cuSPARSE now work.** cuFFT:
 +  PyTorch's FFT path uses `cufftXtMakePlanMany`/`cufftXtExec`, which were
 +  unimplemented (CUFFT_NOT_SUPPORTED); implemented them mapping cudaDataType
@@ -5751,10 +5760,10 @@ index 0000000000000000000000000000000000000000..ba14ff84d9ba532fb954d7da394ab726
 +    sys.exit(main())
 diff --git a/bench/infra_probe.py b/bench/infra_probe.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..47d847d4d2486f5e99077af57ac4a4be1f3cce20
+index 0000000000000000000000000000000000000000..32bad84b823c54c5eadd4ab0b3d65b17efb46f13
 --- /dev/null
 +++ b/bench/infra_probe.py
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,312 @@
 +"""Phase-1 infrastructure probe for the ZLUDA/RDNA1 stack.
 +
 +Exercises the CUDA runtime surface and every mapped library and writes one JSON
@@ -6040,6 +6049,26 @@ index 0000000000000000000000000000000000000000..47d847d4d2486f5e99077af57ac4a4be
 +
 +    probe("sdpa_math", sdpa_math)
 +
++    # ---------- fallbacks for unmapped cuDNN ops ----------
++    def cudnn_batchnorm_fallback():
++        from zluda_ops import cudnn_fallback
++        cudnn_fallback.install()
++        m = torch.nn.BatchNorm2d(8).cuda()
++        x = torch.randn(2, 8, 16, 16, device="cuda")
++        y = m(x)
++        return {"fallback": "cudnn_fallback.install", "shape": tuple(y.shape)}
++
++    probe("cudnn_batchnorm_fallback", cudnn_batchnorm_fallback)
++
++    def cudnn_rnn_fallback():
++        from zluda_ops import cudnn_fallback
++        with cudnn_fallback.rnn_context():
++            lstm = torch.nn.LSTM(32, 32, batch_first=True).cuda()
++            x = torch.randn(2, 8, 32, device="cuda")
++            y = lstm(x)[0]
++        return {"fallback": "cudnn_fallback.rnn_context", "shape": tuple(y.shape)}
++
++    probe("cudnn_lstm_fallback", cudnn_rnn_fallback)
 +    n_ok = sum(1 for r in RESULTS if r["status"] == "OK")
 +    record("SUMMARY", "OK", f"{n_ok}/{len(RESULTS)} checks passed")
 +    return 0
@@ -8196,10 +8225,10 @@ index 0000000000000000000000000000000000000000..0347ef4cb83812cfa0ad1a9845970310
 \ No newline at end of file
 diff --git a/bench/results/infra/probe.json b/bench/results/infra/probe.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..4d344f4ba5bb78c36620ec2b73ddf6c66b5bbbce
+index 0000000000000000000000000000000000000000..50366b4e0b48a73bb42c2accc55ad41f1551324d
 --- /dev/null
 +++ b/bench/results/infra/probe.json
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,205 @@
 +[
 + {
 +  "name": "device",
@@ -8227,7 +8256,7 @@ index 0000000000000000000000000000000000000000..4d344f4ba5bb78c36620ec2b73ddf6c6
 +  "detail": "",
 +  "streams": 2,
 +  "events": 2,
-+  "elapsed_ms": 206.604,
++  "elapsed_ms": 136.825,
 +  "y1_ok": true,
 +  "y2_ok": true
 + },
@@ -8244,7 +8273,7 @@ index 0000000000000000000000000000000000000000..4d344f4ba5bb78c36620ec2b73ddf6c6
 +  "status": "OK",
 +  "detail": "",
 +  "dtype": "fp32",
-+  "max_err": 0.00022
++  "max_err": 0.00023
 + },
 + {
 +  "name": "cublas_gemm_fp16",
@@ -8270,13 +8299,13 @@ index 0000000000000000000000000000000000000000..4d344f4ba5bb78c36620ec2b73ddf6c6
 +  "name": "cublas_gemv",
 +  "status": "OK",
 +  "detail": "",
-+  "max_err": 0.0624
++  "max_err": 0.0626
 + },
 + {
 +  "name": "cublas_addmm_epilogue",
 +  "status": "OK",
 +  "detail": "",
-+  "max_err": 0.0399
++  "max_err": 0.0341
 + },
 + {
 +  "name": "curand_generators",
@@ -8377,9 +8406,32 @@ index 0000000000000000000000000000000000000000..4d344f4ba5bb78c36620ec2b73ddf6c6
 +  "max_err": 0.0
 + },
 + {
++  "name": "cudnn_batchnorm_fallback",
++  "status": "OK",
++  "detail": "",
++  "fallback": "cudnn_fallback.install",
++  "shape": [
++   2,
++   8,
++   16,
++   16
++  ]
++ },
++ {
++  "name": "cudnn_lstm_fallback",
++  "status": "OK",
++  "detail": "",
++  "fallback": "cudnn_fallback.rnn_context",
++  "shape": [
++   2,
++   8,
++   32
++  ]
++ },
++ {
 +  "name": "SUMMARY",
 +  "status": "OK",
-+  "detail": "18/22 checks passed"
++  "detail": "20/24 checks passed"
 + }
 +]
 \ No newline at end of file
@@ -10761,10 +10813,10 @@ index 0000000000000000000000000000000000000000..2a6adcece6ca143824ffe0c981961c93
 +decode on this card.
 diff --git a/docs/INFRA_FIXES.md b/docs/INFRA_FIXES.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b9d6f9707b5129deecb8a3b8f4231017fb965ddc
+index 0000000000000000000000000000000000000000..c8410ef6384e251f9d757f2ae1fa89250f16459e
 --- /dev/null
 +++ b/docs/INFRA_FIXES.md
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,86 @@
 +# Phase-1 infrastructure fixes log
 +
 +## 2026-11-26: cuFFT and cuSPARSE now work
@@ -10824,7 +10876,33 @@ index 0000000000000000000000000000000000000000..b9d6f9707b5129deecb8a3b8f4231017
 +Next: implement MIOpen batchnorm/rnn mappings (zluda_dnn8), investigate the f64
 +GEMM path (rocBLAS Tensile coverage for gfx1010), then re-run
 +`bench/infra_probe.py`.
-\ No newline at end of file
++## 2026-11-26: cuDNN batchnorm and RNN fallbacks
++
++cuDNN batchnorm and RNN/LSTM/GRU are not implemented in the `zluda_dnn8` mapping
++(MIOpen bindings exist but there is no descriptor/RNG mapping yet). Two
++different fallbacks are provided by `zluda_ops/cudnn_fallback.py`:
++
++- **BatchNorm**: the `_BatchNorm.forward` is wrapped and runs with
++  `torch.backends.cudnn.flags(enabled=False)` on ZLUDA (the native
++  batch-norm path is correct; retrying after a failed cuDNN call is too late
++  because the failed call can poison the MIOpen state). Installed by
++  `install()`; `zluda_ops.auto` autoloads it unless `ZLUDA_CUDNN_FALLBACK=0`.
++  Verified: `BatchNorm2d` forward OK.
++- **LSTM/GRU/RNN**: the backend is chosen before the call, so wrapping the
++  forward is not enough. Use `rnn_context()` around model creation AND forward:
++
++      with zluda_ops.cudnn_fallback.rnn_context():
++          model = torch.nn.LSTM(...).cuda()
++          y = model(x)
++
++  (equivalently `torch.backends.cudnn.enabled = False` for such models).
++  Verified: LSTM and GRU forward OK inside the context.
++
++Infra probe (`bench/infra_probe.py`) now covers both fallbacks:
++`cudnn_batchnorm_fallback` and `cudnn_lstm_fallback` are OK; the raw cuDNN
++calls remain FAIL (expected, documented above). Current result: **20/24**
++checks pass; remaining failures: raw BN/RNN (use the fallbacks), fp64 GEMM
++(rocBLAS/Tensile f64 not available for gfx1010).
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
@@ -11375,7 +11453,7 @@ index 0000000000000000000000000000000000000000..f5ff11e4e6a3f98a1229c8ba614f7fb9
 +ones and uninitialized buffers are not representative.
 diff --git a/docs/ROADMAP_ECOSYSTEM.md b/docs/ROADMAP_ECOSYSTEM.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..083fec0df89b4254b3412e480cbe9422dd9ea7da
+index 0000000000000000000000000000000000000000..94298a850e7576acef2736fbaf04020a3f7c45ae
 --- /dev/null
 +++ b/docs/ROADMAP_ECOSYSTEM.md
 @@ -0,0 +1,191 @@
@@ -11406,7 +11484,7 @@ index 0000000000000000000000000000000000000000..083fec0df89b4254b3412e480cbe9422
 +| cuBLASLt (cublasLt64_11/12/13.dll) | MAPPED, UNVERIFIED | DLLs exist; PyTorch rarely exercises the epilogue paths | probe with a bias-epilogue GEMM / vendor code |
 +| cuDNN -> MIOpen: conv2d | WORKS (with solver selection) | fp16 3x3 picks GEMM solver; per-shape auto-selection implemented (fp32 Winograd cached-weight path 1.4-2.7x) | keep; extend to conv1d/3d/transposed |
 +| cuDNN: pool2d / avgpool / conv_transpose | WORKS | probe OK | regression tests |
-+| cuDNN: batchnorm | **FAIL** | `CUDNN_STATUS_NOT_SUPPORTED` on BatchNorm2d (contiguous fp32 input) | fix or fallback: torch native batch_norm path |
++| cuDNN: batchnorm | **WORKS via fallback (2026-11-26)** | cuDNN BN unmapped; `zluda_ops.cudnn_fallback` runs BN with cuDNN disabled (native path), auto-loaded by zluda_ops.auto | implement MIOpen BN mapping later |
 +| cuDNN: RNN (LSTM/GRU) | **FAIL/crash** | `CUDNN_STATUS_INTERNAL_ERROR` + MIOpen "Failed to launch kernel: invalid argument"; process died at exit | high priority: fix mapping or force native fallback |
 +| cuDNN: attention/FMHA, conv3d, RNN variants | UNTESTED | not exercised yet | probe matrix |
 +| cuFFT -> rocFFT (torch.fft) | **WORKS (fixed 2026-11-26)** | implemented `cufftXtMakePlanMany` + `cufftXtExec` (hipFFT type mapping); fft/ifft and rfft2/irfft2 round-trips exact | keep; add 3D/batched tests |
@@ -16674,6 +16752,104 @@ index 0000000000000000000000000000000000000000..25f0a8805d570d8b7b198b814db9b174
 +
 +__all__ = ["conv2d", "install", "uninstall", "installed", "is_eligible",
 +           "stats", "clear_caches"]
+diff --git a/zluda_ops/cudnn_fallback.py b/zluda_ops/cudnn_fallback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f2bc002bac36146e8ddef25b1512d521e6b3222
+--- /dev/null
++++ b/zluda_ops/cudnn_fallback.py
+@@ -0,0 +1,91 @@
++"""Automatic fallbacks for cuDNN operations ZLUDA does not map.
++
++Status on this stack (2026-11-26):
++- cuDNN batchnorm is unimplemented in zluda_dnn8 -> NOT_SUPPORTED. The native
++  PyTorch path works, so BatchNorm forwards are wrapped and always run with
++  cuDNN disabled on ZLUDA (installed by `install()`, autoloaded by
++  `zluda_ops.auto`).
++- cuDNN RNN (LSTM/GRU) is unimplemented and a failed cuDNN RNN call can leave
++  MIOpen state unusable, so wrapping the call is not enough: the backend choice
++  must happen with cuDNN disabled from the start. Use `rnn_context()` around
++  model creation AND forward, or set `torch.backends.cudnn.enabled = False`
++  globally for RNN models.
++
++    from zluda_ops.cudnn_fallback import install, rnn_context
++    install()
++    with rnn_context():
++        model = torch.nn.LSTM(...).cuda()
++        y = model(x)
++"""
++
++import contextlib
++import os
++
++import torch
++
++_installed = False
++_orig_bn_forward = None
++
++
++def _is_zluda():
++    try:
++        return torch.cuda.is_available() and "ZLUDA" in torch.cuda.get_device_name(0)
++    except Exception:  # noqa: BLE001
++        return False
++
++
++_ZLUDA = _is_zluda()
++
++
++def _bn_forward(self, input):
++    if _ZLUDA:
++        with torch.backends.cudnn.flags(enabled=False):
++            return _orig_bn_forward(self, input)
++    return _orig_bn_forward(self, input)
++
++
++def install():
++    """Patch BatchNorm forwards to run without cuDNN on ZLUDA."""
++    global _installed, _orig_bn_forward
++    if _installed:
++        return False
++    from torch.nn.modules.batchnorm import _BatchNorm
++
++    _orig_bn_forward = _BatchNorm.forward
++    _BatchNorm.forward = _bn_forward
++    _installed = True
++    return True
++
++
++def uninstall():
++    global _installed
++    if not _installed:
++        return False
++    from torch.nn.modules.batchnorm import _BatchNorm
++
++    _BatchNorm.forward = _orig_bn_forward
++    _installed = False
++    return True
++
++
++def installed():
++    return _installed
++
++
++@contextlib.contextmanager
++def rnn_context():
++    """Context where cuDNN is disabled (create and run RNN models inside it)."""
++    prev = torch.backends.cudnn.enabled
++    torch.backends.cudnn.enabled = False
++    try:
++        yield
++    finally:
++        torch.backends.cudnn.enabled = prev
++
++
++def autoload():
++    if os.environ.get("ZLUDA_CUDNN_FALLBACK", "1") != "0":
++        install()
++
++
++__all__ = ["install", "uninstall", "installed", "autoload", "rnn_context"]
+\ No newline at end of file
 diff --git a/zluda_ops/flash_attention.py b/zluda_ops/flash_attention.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..2057cfabac282ea9a70fd6f56e1369495109d0e6
