@@ -57,3 +57,30 @@ reference exactly (max err 0.0), probe check `cusparse_spmm` OK.
 Next: implement MIOpen batchnorm/rnn mappings (zluda_dnn8), investigate the f64
 GEMM path (rocBLAS Tensile coverage for gfx1010), then re-run
 `bench/infra_probe.py`.
+## 2026-11-26: cuDNN batchnorm and RNN fallbacks
+
+cuDNN batchnorm and RNN/LSTM/GRU are not implemented in the `zluda_dnn8` mapping
+(MIOpen bindings exist but there is no descriptor/RNG mapping yet). Two
+different fallbacks are provided by `zluda_ops/cudnn_fallback.py`:
+
+- **BatchNorm**: the `_BatchNorm.forward` is wrapped and runs with
+  `torch.backends.cudnn.flags(enabled=False)` on ZLUDA (the native
+  batch-norm path is correct; retrying after a failed cuDNN call is too late
+  because the failed call can poison the MIOpen state). Installed by
+  `install()`; `zluda_ops.auto` autoloads it unless `ZLUDA_CUDNN_FALLBACK=0`.
+  Verified: `BatchNorm2d` forward OK.
+- **LSTM/GRU/RNN**: the backend is chosen before the call, so wrapping the
+  forward is not enough. Use `rnn_context()` around model creation AND forward:
+
+      with zluda_ops.cudnn_fallback.rnn_context():
+          model = torch.nn.LSTM(...).cuda()
+          y = model(x)
+
+  (equivalently `torch.backends.cudnn.enabled = False` for such models).
+  Verified: LSTM and GRU forward OK inside the context.
+
+Infra probe (`bench/infra_probe.py`) now covers both fallbacks:
+`cudnn_batchnorm_fallback` and `cudnn_lstm_fallback` are OK; the raw cuDNN
+calls remain FAIL (expected, documented above). Current result: **20/24**
+checks pass; remaining failures: raw BN/RNN (use the fallbacks), fp64 GEMM
+(rocBLAS/Tensile f64 not available for gfx1010).
