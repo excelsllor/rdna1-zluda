@@ -278,7 +278,7 @@ def int4_prefill_linear(x, packed, scales, bias=None, group_size=64):
 
 __all__ = [
     "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
-    "int4_linear", "int8_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
+    "int4_linear", "int8_linear", "int8_matmul", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 ]
 
 # ---------------------------------------------------------------------------
@@ -340,4 +340,57 @@ def int8_linear(x, w, scales, bias=None, group_size=128):
         M=m, GROUP=group_size, BK=bk, HAS_BIAS=bias is not None,
         num_warps=warps, num_stages=1,
     )
+    return y
+
+# ---------------------------------------------------------------------------
+# int8 prefill GEMM with on-the-fly groupwise dequant (Phase 2).
+# Weights stay int8 (1 byte) in VRAM; dequantization and matmul are fused in the
+# Triton tile kernel. For long prefill this halves weight traffic vs fp16 for
+# the same math (compute is FMA-bound on RDNA1, so the win is mainly memory).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _int8_matmul_kernel(X, W, SC, Y, M, N, K,
+                        GROUP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                        BK: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    ngrp: tl.constexpr = BK // GROUP
+    ngroups = K // GROUP
+    acc = tl.zeros((BM, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        x = tl.load(X + offs_m[:, None] * K + (k0 + offs_k)[None, :],
+                    mask=(offs_m[:, None] < M) & ((k0 + offs_k)[None, :] < K),
+                    other=0.0)
+        w = tl.load(W + offs_n[None, :] * K + (k0 + offs_k)[:, None],
+                    mask=(offs_n[None, :] < N) & ((k0 + offs_k)[:, None] < K),
+                    other=0).to(tl.float32)
+        sc_vec = tl.load(
+            SC + offs_n[None, :] * ngroups + ((k0 + offs_k) // GROUP)[:, None],
+            mask=offs_n[None, :] < N, other=0.0)
+        wdeq = (w * sc_vec).to(tl.float16)  # (BK, BN)
+        acc += tl.dot(x, wdeq)
+    tl.store(Y + offs_m[:, None] * N + offs_n[None, :],
+             acc.to(Y.dtype.element_ty),
+             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def int8_matmul(x, w, scales, group_size=128, block_m=64, block_n=64, block_k=128):
+    """Prefill GEMM: y = (x @ w.T) with int8 weights dequantized on the fly."""
+    if (not x.is_cuda or x.dtype != torch.float16 or x.dim() != 2
+            or not x.is_contiguous() or w.dtype != torch.int8 or not w.is_contiguous()):
+        return None
+    m, k = x.shape
+    n = w.shape[0]
+    if w.shape[1] != k or k % block_k or k % group_size or block_k % group_size:
+        return None
+    if scales.shape != (n, k // group_size):
+        return None
+    y = torch.empty(m, n, device=x.device, dtype=x.dtype)
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+    _int8_matmul_kernel[grid](
+        x, w, scales, y, m, n, k, GROUP=group_size, BM=block_m, BN=block_n,
+        BK=block_k, num_warps=4, num_stages=2)
     return y

@@ -1,181 +1,126 @@
-﻿import argparse
+"""Roofline harness for the Phase-2 decode kernels (ZLUDA/RDNA1).
+
+Measures each bandwidth-bound kernel and reports the achieved GB/s as a share of
+the RDNA1 peak (448 GB/s) so it is obvious which kernels still have headroom.
+Run under run-zluda.cmd:
+
+    venv\\Scripts\\python.exe bench\\roofline.py
+"""
+
+import json
 import sys
+import time
+from pathlib import Path
 
 import torch
-import triton
-import triton.language as tl
 
-from common import bench, nvml_sample, save_report
-
-PEAK_FP32_TF = 9.754
-PEAK_FP16_TF = 19.51
-PEAK_BW_GBS = 448.0
-
-DEV = "cuda"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+PEAK_GBS = 448.0
+ROWS = []
 
 
-@triton.jit
-def _alu_f32(out_ptr, a, b, ITER: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    acc0 = tl.load(out_ptr + offs)
-    acc1 = acc0 * 0.5
-    acc2 = acc0 * 0.25
-    acc3 = acc0 * 0.125
-    for _ in range(ITER):
-        acc0 = acc0 * a + b
-        acc1 = acc1 * a + b
-        acc2 = acc2 * a + b
-        acc3 = acc3 * a + b
-    tl.store(out_ptr + offs, acc0 + acc1 + acc2 + acc3)
+def bench(fn, n=20):
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / n
 
 
-@triton.jit
-def _alu_f16(out_ptr, a_ptr, b_ptr, ITER: tl.constexpr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    acc0 = tl.load(out_ptr + offs)
-    acc1 = acc0 * 0.5
-    acc2 = acc0 * 0.25
-    acc3 = acc0 * 0.125
-    a = tl.load(a_ptr)
-    b = tl.load(b_ptr)
-    for _ in range(ITER):
-        acc0 = acc0 * a + b
-        acc1 = acc1 * a + b
-        acc2 = acc2 * a + b
-        acc3 = acc3 * a + b
-    tl.store(out_ptr + offs, acc0 + acc1 + acc2 + acc3)
-
-
-@triton.jit
-def _chase(next_ptr, out_ptr, N: tl.constexpr):
-    idx = tl.zeros((1,), tl.int32)
-    for _ in range(N):
-        idx = tl.load(next_ptr + idx)
-    tl.store(out_ptr + tl.arange(0, 1), idx)
-
-
-@triton.jit
-def _cache_load(data_ptr, out_ptr, ITER: tl.constexpr, BLOCK: tl.constexpr, SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    lanes = tl.arange(0, BLOCK)
-    acc = tl.zeros((BLOCK,), tl.float32)
-    for i in range(ITER):
-        offs = (lanes + i * BLOCK) % SIZE
-        acc += tl.load(data_ptr + offs)
-    tl.store(out_ptr + pid * BLOCK + lanes, acc)
-
-
-def alu_test(dtype, iters=20):
-    block = 256
-    grid = 2048
-    n = block * grid
-    out = torch.randn(n, device=DEV, dtype=dtype) * 1e-3
-    if dtype == torch.float16:
-        a = torch.tensor(1.0001, device=DEV, dtype=dtype)
-        b = torch.tensor(1e-5, device=DEV, dtype=dtype)
-        fn = lambda: _alu_f16[(grid,)](out, a, b, ITER=2048, BLOCK=block, num_warps=4)
-    else:
-        fn = lambda: _alu_f32[(grid,)](out, 1.0001, 1e-5, ITER=2048, BLOCK=block, num_warps=4)
-    ms = bench(fn, warmup=2, iters=iters)
-    flops = 2.0 * 4 * grid * block * 2048
-    tflops = flops / (ms / 1000.0) / 1e12
-    return {"ms": ms, "tflops": tflops}
-
-
-def memory_test(dtype, elems=32 * 1024 * 1024, iters=15):
-    itemsize = torch.tensor([], dtype=dtype).element_size()
-    src = torch.randn(elems, device=DEV, dtype=dtype)
-    dst = torch.empty_like(src)
-    other = torch.randn_like(src)
-    third = torch.randn_like(src)
-    out = torch.empty_like(src)
-    cases = []
-
-    def add_case(name, fn, traffic):
-        ms = bench(fn, warmup=2, iters=iters)
-        gbs = traffic / (ms / 1000.0) / 1e9
-        cases.append({"name": name, "ms": ms, "gbs": gbs, "pct_peak": gbs / PEAK_BW_GBS * 100.0})
-
-    add_case("copy", lambda: dst.copy_(src), elems * itemsize * 2)
-    add_case("add", lambda: torch.add(src, other, out=out), elems * itemsize * 3)
-    add_case("addcmul", lambda: torch.addcmul(src, other, third, out=out), elems * itemsize * 4)
-    add_case("sum", lambda: torch.sum(src), elems * itemsize)
-    return cases
-
-
-def latency_test(size=1 << 23, chain=512, iters=20):
-    nxt = torch.randperm(size, dtype=torch.int32, device="cpu").to(DEV)
-    out = torch.zeros(1, dtype=torch.int32, device=DEV)
-    fn = lambda: _chase[(1,)](nxt, out, N=chain, num_warps=1)
-    ms = bench(fn, warmup=3, iters=iters)
-    return {"ms": ms, "ns_per_load": ms * 1e6 / chain, "chain": chain, "buffer_mb": size * 4 / 1024**2}
-
-
-def cache_test(iters=256, block=256, grid=1024, size=8192):
-    data = torch.randn(size, device=DEV, dtype=torch.float32)
-    out = torch.empty(grid * block, device=DEV, dtype=torch.float32)
-    fn = lambda: _cache_load[(grid,)](data, out, ITER=iters, BLOCK=block, SIZE=size, num_warps=4)
-    ms = bench(fn, warmup=2, iters=15)
-    traffic = grid * block * iters * 4
-    gbs = traffic / (ms / 1000.0) / 1e9
-    return {"ms": ms, "gbs": gbs, "working_set_kb": size * 4 / 1024, "iters": iters}
+def row(name, fn, nbytes, flops=0, iters=20):
+    us = bench(fn, iters) * 1e6
+    gbs = nbytes / (us * 1e-6) / 1e9
+    tflops = flops / (us * 1e-6) / 1e12
+    ROWS.append({"name": name, "us": round(us, 1), "gbs": round(gbs, 1),
+                 "pct_peak": round(gbs / PEAK_GBS * 100, 1),
+                 "tflops": round(tflops, 3)})
+    print(f"{name:32s} {us:9.1f} us  {gbs:6.1f} GB/s ({gbs / PEAK_GBS * 100:5.1f}% peak)"
+          + (f"  {tflops:6.2f} TF" if flops else ""), flush=True)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args()
-
+    if not torch.cuda.is_available():
+        print("CUDA/ZLUDA device is not available")
+        return 1
+    torch.cuda.set_per_process_memory_fraction(0.7)
     torch.manual_seed(0)
-    report: dict = {"peak": {"fp32_tf": PEAK_FP32_TF, "fp16_tf": PEAK_FP16_TF, "bw_gbs": PEAK_BW_GBS}}
+    import zluda_ops.auto
+    from zluda_ops import gemv as G, fused as F
+    from zluda_ops.gqa_decode import gqa_decode_attn
+    from zluda_ops.qkv_fused import qkv_rope_append
+    from zluda_ops.embedding import embedding_lookup
+    from zluda_ops.quant import int8_matmul, quantize_int8
+    from zluda_ops import flash_attention as FA
 
-    print("== ALU ==")
-    report["alu"] = {}
-    for name, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
-        try:
-            r = alu_test(dtype)
-            report["alu"][name] = r
-            print(f"{name}: {r['ms']:.3f} ms  {r['tflops']:.2f} TFLOPS")
-        except Exception as exc:
-            report["alu"][name] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
-            print(f"{name}: FAIL {type(exc).__name__}: {str(exc)[:160]}")
+    # copy / fill
+    n = 128 * 1024 * 1024 // 2
+    a = torch.empty(n, device="cuda", dtype=torch.float16)
+    b = torch.empty_like(a)
+    row("copy 128MB (D2D)", lambda: b.copy_(a), 2 * a.numel() * 2)
+    row("fill 128MB", lambda: a.fill_(1.0), a.numel() * 2)
 
-    print("== memory ==")
-    report["memory"] = {}
-    for name, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
-        try:
-            cases = memory_test(dtype)
-            report["memory"][name] = cases
-            for c in cases:
-                print(f"{name} {c['name']:8s}: {c['ms']:8.3f} ms  {c['gbs']:7.1f} GB/s  {c['pct_peak']:5.1f}%")
-        except Exception as exc:
-            report["memory"][name] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
-            print(f"{name}: FAIL {type(exc).__name__}: {str(exc)[:160]}")
+    # decode GEMVs (memory-bound: weights + output)
+    for N_, K_ in ((896, 896), (4864, 896), (896, 4864), (151936, 896)):
+        w = torch.randn(N_, K_, device="cuda", dtype=torch.float16)
+        x = torch.randn(1, K_, device="cuda", dtype=torch.float16)
+        nb = N_ * K_ * 2 + N_ * 2
+        row(f"gemv {N_}x{K_}", lambda: G.linear(x, w, None, accurate=True), nb,
+            flops=2 * N_ * K_)
 
-    print("== latency / cache ==")
-    try:
-        lat = latency_test()
-        report["latency"] = lat
-        print(f"chase: {lat['ns_per_load']:.1f} ns/load ({lat['ms']:.2f} ms, {lat['buffer_mb']:.0f} MB)")
-    except Exception as exc:
-        report["latency"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
-        print(f"chase: FAIL {type(exc).__name__}: {str(exc)[:160]}")
-    try:
-        cache = cache_test()
-        report["cache"] = cache
-        print(f"cache load: {cache['gbs']:.1f} GB/s ({cache['working_set_kb']:.0f} KB working set)")
-    except Exception as exc:
-        report["cache"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
-        print(f"cache: FAIL {type(exc).__name__}: {str(exc)[:160]}")
+    # GQA decode (KV + q + out traffic)
+    q = torch.randn(1, 14, 1, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 2048, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 2, 2048, 64, device="cuda", dtype=torch.float16)
+    nb = 2 * 2 * 2048 * 64 * 2 + q.numel() * 2 + q.numel() * 2
+    row("gqa_decode n=2048", lambda: gqa_decode_attn(q, k, v), nb,
+        flops=4 * 2048 * 64 * 14)
 
-    report["monitor"] = nvml_sample()
-    path = save_report("roofline", report)
-    if args.json:
-        print(path)
+    # fused residual+rmsnorm (1 token)
+    x = torch.randn(1, 896, device="cuda", dtype=torch.float16)
+    d = torch.randn(1, 896, device="cuda", dtype=torch.float16)
+    w = torch.randn(896, device="cuda", dtype=torch.float16)
+    row("add_rms_norm 896", lambda: F.add_rms_norm(x, d, w), 3 * 896 * 2, 4 * 896)
+
+    # fused qkv+rope+append
+    wqkv = torch.randn(1152, 896, device="cuda", dtype=torch.float16)
+    x1 = torch.randn(896, device="cuda", dtype=torch.float16)
+    cos = torch.randn(32, device="cuda", dtype=torch.float16)
+    sin = torch.randn(32, device="cuda", dtype=torch.float16)
+    kc = torch.zeros(2, 64, 64, device="cuda", dtype=torch.float16)
+    vc = torch.zeros(2, 64, 64, device="cuda", dtype=torch.float16)
+    qo = torch.empty(14, 1, 64, device="cuda", dtype=torch.float16)
+    row("qkv_rope_append", lambda: qkv_rope_append(x1, wqkv, cos, sin, kc, vc, qo, 37),
+        1152 * 896 * 2 + 64 * 2, flops=2 * 1152 * 896)
+
+    # embedding gather
+    we = torch.randn(50000, 896, device="cuda", dtype=torch.float16)
+    idx = torch.randint(0, 50000, (8,), device="cuda")
+    row("embedding 8x896", lambda: embedding_lookup(idx, we), 8 * 896 * 2)
+
+    # int8 prefill matmul (compute-bound): 64x2048x2048
+    w = torch.randn(2048, 2048, device="cuda", dtype=torch.float16) * 0.05
+    x = torch.randn(64, 2048, device="cuda", dtype=torch.float16)
+    wi8, sc = quantize_int8(w, 128)
+    row("int8 matmul 64x2048x2048", lambda: int8_matmul(x, wi8, sc),
+        2048 * 2048 + 64 * 2048 * 2, flops=2 * 64 * 2048 * 2048)
+
+    # Triton FA prefill (compute-bound)
+    q = torch.randn(1, 8, 256, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 8, 256, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 8, 256, 64, device="cuda", dtype=torch.float16)
+    row("fa prefill S=256", lambda: FA.flash_attn_func(q, k, v, causal=True),
+        3 * 8 * 256 * 64 * 2, flops=4 * 256 * 256 * 64 * 8)
+
+    print(f"\npeak used: {PEAK_GBS} GB/s (RDNA1 8GB)", flush=True)
+    out = Path(__file__).resolve().parents[1] / "bench" / "results" / "roofline.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"rows": ROWS}, indent=1), encoding="utf-8")
+    print(f"report: {out}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
+    sys.exit(main())

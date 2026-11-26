@@ -479,8 +479,7 @@ def swiglu_gemv(x, w_gate, w_up, bias_gate=None, bias_up=None,
 # Replaces two bandwidth-bound kernels (add, rms_norm) per transformer layer.
 # ---------------------------------------------------------------------------
 @triton.jit
-def _add_rms_norm_kernel(X, D, W, Y, R, N: tl.constexpr, BLOCK: tl.constexpr,
-                         eps):
+def _add_rms_norm_kernel(X, D, W, Y, R, N, BLOCK: tl.constexpr, eps):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     mask = offs < N
@@ -500,7 +499,7 @@ def add_rms_norm(x, delta, weight, eps=1e-6):
     if (not x.is_cuda or x.dtype != torch.float16 or x.shape != delta.shape
             or weight.shape != (n,) or weight.dtype != torch.float16):
         return None
-    if n > 8192 or (n & (n - 1)):
+    if n > 8192:
         return None
     xf = x.reshape(-1, n)
     df = delta.reshape(-1, n)
