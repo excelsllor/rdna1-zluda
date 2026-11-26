@@ -248,6 +248,17 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - kernel gaps + allocation audit:** added fused int8 GEMV
+  (`quant.int8_linear`, correct 2e-4..4e-3) - fused is memory-optimal but
+  dequant-once+tuned fp16 GEMV is faster for compute (45.6 vs 61.9 us qkv,
+  69.5 vs 123.1 gate/up). Attempted fused gate/up+SwiGLU GEMV: potential ~2x
+  but the Triton kernels produced wrong/NaN output on this stack (codegen issue,
+  left as open item). Missing-kernel list documented (GQA KV-reuse decode,
+  fused QKV+RoPE+KV append, fused residual+norm, sampling, embedding gather).
+  New library gaps found: cublasSgemv (1-D fp32 GEMV) NOT_SUPPORTED, fp64 GEMM
+  unsupported. hipMalloc vs cudaMalloc on memory-bound kernels: identical
+  (fill 421 vs 426 GB/s, copy 384 vs 383, lm_head GEMV 358 GB/s both; only
+  allocation latency differs 0.254 vs 0.212 ms). Details: docs/KERNEL_GAPS.md.
 - **2026-11-26 - cuDNN BN/RNN fallbacks:** cuDNN batchnorm and RNN are not
   mapped in zluda_dnn8; `zluda_ops/cudnn_fallback.py` provides two fallbacks:
   BatchNorm forwards run with cuDNN disabled (native path, auto-loaded by

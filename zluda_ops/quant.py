@@ -278,5 +278,66 @@ def int4_prefill_linear(x, packed, scales, bias=None, group_size=64):
 
 __all__ = [
     "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
-    "int4_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
+    "int4_linear", "int8_linear", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 ]
+
+# ---------------------------------------------------------------------------
+# Fused int8 GEMV (dequantize + matvec in one kernel). int8 storage was
+# previously dequantize-once only (no fused kernel); this closes that gap.
+# ---------------------------------------------------------------------------
+CONFIGS_INT8 = {
+    1: (4096, 4),
+    2: (4096, 4),
+    4: (2048, 8),
+    8: (4096, 8),
+    16: (4096, 4),
+}
+
+
+@triton.jit
+def _gemv_int8_kernel(w_ptr, sc_ptr, x_ptr, b_ptr, y_ptr, N, K,
+                      M: tl.constexpr, GROUP: tl.constexpr, BK: tl.constexpr,
+                      HAS_BIAS: tl.constexpr):
+    row = tl.program_id(0)
+    ncols = tl.arange(0, M)
+    ngroups = K // GROUP
+    ngrp_chunk: tl.constexpr = BK // GROUP
+    acc = tl.zeros((M,), tl.float32)
+    for k0 in range(0, K, BK):
+        w = tl.load(w_ptr + row * K + k0 + tl.arange(0, BK)).to(tl.float32)
+        sc_g = tl.load(sc_ptr + row * ngroups + (k0 // GROUP + tl.arange(0, ngrp_chunk)))
+        sc_vec = tl.reshape(
+            tl.broadcast_to(sc_g[:, None], (ngrp_chunk, GROUP)), (BK,))
+        x = tl.load(x_ptr + ncols[:, None] * K + (k0 + tl.arange(0, BK))[None, :])
+        acc += tl.sum((w * sc_vec)[None, :] * x.to(tl.float32), axis=1)
+    if HAS_BIAS:
+        acc += tl.load(b_ptr + row).to(tl.float32)
+    tl.store(y_ptr + ncols * N + row, acc.to(y_ptr.dtype.element_ty))
+
+
+def int8_linear(x, w, scales, bias=None, group_size=128):
+    """Fused dequant+GEMV for int8 weights (M=1..16). Returns (M, N) or None."""
+    if (not x.is_cuda or x.dim() != 2 or w.dim() != 2
+            or x.dtype != torch.float16 or not x.is_contiguous()
+            or not w.is_contiguous() or not scales.is_contiguous()):
+        return None
+    m = x.shape[0]
+    if m not in CONFIGS_INT8:
+        return None
+    n, k = w.shape
+    if x.shape[1] != k or k % group_size or scales.shape != (n, k // group_size):
+        return None
+    if bias is not None and (bias.dtype != x.dtype or not bias.is_contiguous()):
+        return None
+    bk, warps = CONFIGS_INT8[m]
+    while bk > 128 and k % bk:
+        bk //= 2
+    if k % bk:
+        return None
+    y = torch.empty(m, n, device=x.device, dtype=x.dtype)
+    _gemv_int8_kernel[(n,)](
+        w, scales, x, bias if bias is not None else y, y, n, k,
+        M=m, GROUP=group_size, BK=bk, HAS_BIAS=bias is not None,
+        num_warps=warps, num_stages=1,
+    )
+    return y
