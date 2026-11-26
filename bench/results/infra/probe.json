@@ -1,0 +1,182 @@
+[
+ {
+  "name": "device",
+  "status": "OK",
+  "detail": "AMD Radeon RX 5700 XT [ZLUDA]",
+  "torch": "2.7.1+cu118"
+ },
+ {
+  "name": "runtime_alloc_copy_free",
+  "status": "OK",
+  "detail": "",
+  "dtype": "fp32",
+  "elems": 1048576
+ },
+ {
+  "name": "runtime_pinned_memory",
+  "status": "OK",
+  "detail": "",
+  "pinned": false,
+  "ok": true
+ },
+ {
+  "name": "runtime_streams_events",
+  "status": "OK",
+  "detail": "",
+  "streams": 2,
+  "events": 2,
+  "elapsed_ms": 206.604,
+  "y1_ok": true,
+  "y2_ok": true
+ },
+ {
+  "name": "runtime_memory_stats",
+  "status": "OK",
+  "detail": "",
+  "free_mb": 6467.4,
+  "total_mb": 8176.0,
+  "allocated_mb": 16.2
+ },
+ {
+  "name": "cublas_gemm_fp32",
+  "status": "OK",
+  "detail": "",
+  "dtype": "fp32",
+  "max_err": 0.00022
+ },
+ {
+  "name": "cublas_gemm_fp16",
+  "status": "OK",
+  "detail": "",
+  "dtype": "fp16",
+  "max_err": 0.0625
+ },
+ {
+  "name": "cublas_gemm_bf16",
+  "status": "OK",
+  "detail": "",
+  "dtype": "bf16",
+  "max_err": 0.5
+ },
+ {
+  "name": "cublas_batched_gemm",
+  "status": "OK",
+  "detail": "",
+  "max_err": 0.0156
+ },
+ {
+  "name": "cublas_gemv",
+  "status": "OK",
+  "detail": "",
+  "max_err": 0.0624
+ },
+ {
+  "name": "cublas_addmm_epilogue",
+  "status": "OK",
+  "detail": "",
+  "max_err": 0.0399
+ },
+ {
+  "name": "curand_generators",
+  "status": "OK",
+  "detail": "",
+  "randn_reproducible": true,
+  "rand_range_ok": true,
+  "randint_reproducible": true,
+  "randn_mean": 0.0034,
+  "randn_std": 1.0314
+ },
+ {
+  "name": "curand_dropout",
+  "status": "OK",
+  "detail": "",
+  "keep_fraction": 0.499
+ },
+ {
+  "name": "cufft_transforms",
+  "status": "OK",
+  "detail": "",
+  "fft1d": [
+   256
+  ],
+  "rfft1d": [
+   129
+  ],
+  "fft2d": [
+   256,
+   256
+  ],
+  "rfft2d": [
+   256,
+   129
+  ],
+  "ifft_roundtrip_err": 0.0
+ },
+ {
+  "name": "cusparse_spmm",
+  "status": "OK",
+  "detail": "",
+  "coo_err": 0.0,
+  "csr_err": 0.0
+ },
+ {
+  "name": "cudnn_conv2d",
+  "status": "OK",
+  "detail": "",
+  "shape": [
+   2,
+   16,
+   32,
+   32
+  ],
+  "finite": true
+ },
+ {
+  "name": "cudnn_pool2d",
+  "status": "OK",
+  "detail": "",
+  "maxpool": [
+   2,
+   8,
+   16,
+   16
+  ],
+  "avgpool": [
+   2,
+   8,
+   16,
+   16
+  ]
+ },
+ {
+  "name": "cudnn_batchnorm",
+  "status": "FAIL",
+  "detail": "RuntimeError: cuDNN error: CUDNN_STATUS_NOT_SUPPORTED. This error may appear if you passed in a non-contiguous input."
+ },
+ {
+  "name": "cudnn_lstm",
+  "status": "FAIL",
+  "detail": "RuntimeError: cuDNN error: CUDNN_STATUS_INTERNAL_ERROR"
+ },
+ {
+  "name": "cudnn_gru",
+  "status": "FAIL",
+  "detail": "RuntimeError: cuDNN error: CUDNN_STATUS_INTERNAL_ERROR"
+ },
+ {
+  "name": "cusolver_linalg",
+  "status": "FAIL",
+  "detail": "RuntimeError: CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasDgemm( handle, opa, opb, m, n, k, &alpha, a, lda, b, ldb, &beta, c, ldc)`"
+ },
+ {
+  "name": "sdpa_math",
+  "status": "OK",
+  "detail": "",
+  "max_err": 0.0
+ },
+ {
+  "name": "SUMMARY",
+  "status": "OK",
+  "detail": "18/22 checks passed"
+ }
+]

@@ -5377,6 +5377,7 @@ dependencies = [
  "cuda_macros",
  "cuda_types",
  "embed-resource",
+ "hip_runtime-sys",
  "libloading",
  "rocsparse-sys",
  "unwrap_or",

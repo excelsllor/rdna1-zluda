@@ -62,9 +62,15 @@ macro_rules! implemented_no_error {
     };
 }
 
+macro_rules! noop_extra {
+    ($($t:tt)*) => {};
+}
+
 cuda_macros::cusparse_function_declarations!(
     unimplemented,
     implemented_unmapped <= [cusparseGetErrorName, cusparseGetErrorString,],
+    noop_extra <= [cusparseXcoo2csr],
+    noop_extra <= [cusparseCreateCsr],
     implemented_no_error
         <= [
             cusparseGetMatDiagType,
@@ -84,6 +90,8 @@ cuda_macros::cusparse_function_declarations!(
             cusparseSpMM_bufferSize,
             cusparseSpMM_preprocess,
             cusparseSpMM,
+            cusparseSetStream,
+            cusparseGetStream,
         ]
 );
 
@@ -169,5 +177,50 @@ cuda_macros::rocsparse_function_declarations!(
             rocsparse_spmm_buffer_size,
             rocsparse_spmm_preprocess,
             rocsparse_spmm,
+            rocsparse_coo2csr,
+            rocsparse_create_csr_descr,
+            rocsparse_set_stream,
+            rocsparse_get_stream,
         ]
 );
+
+#[no_mangle]
+pub unsafe extern "C" fn cusparseXcoo2csr(
+    handle: cuda_types::cusparse::cusparseHandle_t,
+    cooRowInd: *const ::core::ffi::c_int,
+    nnz: ::core::ffi::c_int,
+    m: ::core::ffi::c_int,
+    csrSortedRowPtr: *mut ::core::ffi::c_int,
+    _idxBase: cuda_types::cusparse::cusparseIndexBase_t,
+) -> cuda_types::cusparse::cusparseStatus_t {
+    crate::r#impl::xcoo2csr_raw(handle, cooRowInd, nnz, m, csrSortedRowPtr)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn cusparseCreateCsr(
+    spMatDescr: *mut cuda_types::cusparse::cusparseSpMatDescr_t,
+    rows: i64,
+    cols: i64,
+    nnz: i64,
+    csrRowOffsets: *mut ::core::ffi::c_void,
+    csrColInd: *mut ::core::ffi::c_void,
+    csrValues: *mut ::core::ffi::c_void,
+    csrRowOffsetsType: cuda_types::cusparse::cusparseIndexType_t,
+    csrColIndType: cuda_types::cusparse::cusparseIndexType_t,
+    idxBase: cuda_types::cusparse::cusparseIndexBase_t,
+    valueType: cuda_types::cusparse::cudaDataType,
+) -> cuda_types::cusparse::cusparseStatus_t {
+    crate::r#impl::create_csr_raw(
+        spMatDescr as *mut ::core::ffi::c_void,
+        rows,
+        cols,
+        nnz,
+        csrRowOffsets,
+        csrColInd,
+        csrValues,
+        csrRowOffsetsType.0,
+        csrColIndType.0,
+        idxBase.0,
+        valueType.0,
+    )
+}

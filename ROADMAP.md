@@ -248,6 +248,18 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   dequantisation is compute/launch bound, and a tiled/split-K int4 kernel is
   the next step. GPTQ/AWQ-compatible layout is documented; their exact nibble
   order/zero-point loading and the prefill dequant-GEMM remain open.
+- **2026-11-26 - Phase-1 infra fixes: cuFFT + cuSPARSE now work.** cuFFT:
+  PyTorch's FFT path uses `cufftXtMakePlanMany`/`cufftXtExec`, which were
+  unimplemented (CUFFT_NOT_SUPPORTED); implemented them mapping cudaDataType
+  pairs to hipFFT transform types and dispatching hipfftExec* through a
+  per-plan kind registry. torch.fft/ifft and rfft2/irfft2 round-trips are exact.
+  cuSPARSE: implemented SetStream/GetStream (rocsparse_set_stream, plus the
+  missing hip_runtime-sys dep), Xcoo2csr (rocsparse_coo2csr) and CreateCsr
+  (rocsparse_create_csr_descr with datatype mapping); torch.sparse COO mm is
+  exact (err 0.0). Full infra probe: 18/22 OK (was 16/22). Remaining:
+  cuDNN batchnorm/RNN (work with cudnn.enabled=False native fallback) and fp64
+  GEMM (cublasDgemm NOT_SUPPORTED). Details: docs/INFRA_FIXES.md,
+  docs/ROADMAP_ECOSYSTEM.md; probe: bench/infra_probe.py.
 - **2026-11-25 - ecosystem roadmap (3 phases) + Phase-1 analysis:**
   docs/ROADMAP_ECOSYSTEM.md created: Phase 1 close the infrastructure (status
   matrix of every library/engine/application with evidence, verification
