@@ -238,9 +238,25 @@ Automation (one command):
 -> `docs/ENGINE_COMPARISON_REMATRIX.md` (tables below in this file are updated
 from that report).
 
-Status: **blocked in the 2026-11-27 session - the GPU driver wedged after a
-cancelled torch.compile experiment**: `torch.cuda.is_available()` hangs during
-ZLUDA init while the PnP device reports "OK", so all HIP/ZLUDA workloads need a
-reboot. The runner and the Vulkan/Ollama imports (Q8_0 GGUF conversion +
-`ollama create qwen05-q8`) are prepared; rerun the command above after the
-reboot to fill `docs/ENGINE_COMPARISON_REMATRIX.md` and refresh the tables here.
+Status (2026-11-27 evening): the runner is hardened and the models are ready,
+but the measurement is still blocked by the GPU driver state.
+
+- The first run converted and imported **Q8_0 GGUF** `qwen2.5-0.5b-instruct-q8_0.gguf`
+  and the Ollama model `qwen05-q8` successfully; `qwen05-q4` (Q4_K_M) is
+  imported by the runner from the local GGUF.
+- Preliminary ZLUDA numbers from the aborted run (fp16, math SDPA, 85% VRAM):
+  4096-token prefill **2577 tok/s**, decode **23.8 tok/s**, peak 3.2 GB, and an
+  **OOM at 8192** (needs 3.5 GiB more) - so the fitting context for PyTorch
+  math-SDPA fp16 is ~4096 on this 8 GB card. These will be re-measured with the
+  final warmed-up runner.
+- Raw PyTorch SDPA default backend selection (`--attn sdpa_fast`) is **not
+  usable under ZLUDA**: it tries cuDNN cutlass `fmha_cutlassF_f16...` kernels
+  built for sm80+, logs `FATAL: kernel ... is for sm80-sm100`, and hangs/wedges
+  the AMD driver. `bench/maxctx_matrix.py` now force-disables the
+  flash/efficient/cudnn SDPA backends before any CUDA work, so the "sdpa"
+  column means the default selector with the usable math backend (the same thing
+  ZLUDA users get through `zluda_ops.auto`).
+- The driver wedged again during the sdpa experiment, so the full matrix needs
+  another reboot; after the reboot run
+  `tools\run_cross_backend_rematrix.ps1` and the tables will be filled from
+  `docs/ENGINE_COMPARISON_REMATRIX.md`.
