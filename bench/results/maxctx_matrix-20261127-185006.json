@@ -1,0 +1,69 @@
+{
+  "dtype": "fp16",
+  "acc": 0,
+  "bf16_emul": false,
+  "quant": "none",
+  "attn": "math",
+  "tag": "fp16_math",
+  "contexts": [
+    {
+      "prefill_tok_s": 2746.2,
+      "decode_tok_s": 26.1,
+      "decode_ms_per_tok": 38.35,
+      "ctx": 2048,
+      "peak_mb": 1546.9
+    },
+    {
+      "prefill_tok_s": 457.0,
+      "decode_tok_s": 23.3,
+      "decode_ms_per_tok": 42.96,
+      "ctx": 4096,
+      "peak_mb": 3175.4
+    }
+  ],
+  "max_ok_ctx": 4096,
+  "compute_dtype": "torch.float16",
+  "first_fail": {
+    "ctx": 8192,
+    "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 3.50 GiB. GPU 0 has a total capacity of 7.98 GiB of which 2.67 GiB is free. 6.79 GiB allowed; Of the allocated memory 4.85"
+  },
+  "attn_calls": null,
+  "attn_errors": null,
+  "attn_last_error": null,
+  "timestamp": "2026-11-27T18:50:06",
+  "gpu": {
+    "torch": "2.7.1+cu118",
+    "cuda": "11.8",
+    "hip": null,
+    "hip_path": "G:\\zluda\\hip",
+    "zluda_cc": "8.6",
+    "device": "AMD Radeon RX 5700 XT [ZLUDA]",
+    "multi_processor_count": 20,
+    "total_memory_gb": 7.98,
+    "l2_cache_mb": 4.0,
+    "allow_tf32": false,
+    "float32_matmul_precision": "highest",
+    "triton": "3.3.1"
+  },
+  "protocol": {
+    "data": "random data (torch.randn) unless stated otherwise",
+    "timing": "mean per round, median across rounds, warmup per round",
+    "order": "variant order shuffled between rounds when comparing",
+    "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
+  },
+  "clocks": {
+    "adapter": "AMD Radeon RX 5700 XT",
+    "engine_clock_mhz": null,
+    "memory_clock_mhz": null,
+    "vddc_mv": null,
+    "temperature_c": null,
+    "activity_pct": null,
+    "power_pct": null,
+    "errors": {
+      "overdriveN_status": -8,
+      "overdrive6_status": -8,
+      "overdrive6_temperature": -8,
+      "overdrive6_power": -1
+    }
+  }
+}
