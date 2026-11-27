@@ -24,14 +24,16 @@ $repo = Split-Path -Parent $PSScriptRoot
 $py = Join-Path $repo "venv\Scripts\python.exe"
 $ggufDir = Join-Path $repo "models\qwen05-gguf"
 $hfDir = Join-Path $repo "models\Qwen2.5-0.5B-Instruct"
-$vulkanCtx = "2048,4096,8192,16384,32768"
+$vulkanCtx = "2048,8192,32768"
 $zludaCtx = "2048,4096,8192,12288,16384,24576,32768"
 
-function Run-Python([string]$name, [string]$scriptArgs, [int]$timeoutSec = 2400) {
+function Invoke-Run([string]$name, [string]$innerCmd, [int]$timeoutSec = 2700) {
     Write-Host "=== $name ==="
+    $bat = Join-Path $env:TEMP "rematrix_$name.cmd"
     $log = Join-Path $env:TEMP "rematrix_$name.log"
-    $cmd = "`"$py`" $scriptArgs > `"$log`" 2>&1"
-    $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', $cmd -PassThru -WindowStyle Hidden
+    $lines = @('@echo off', "($innerCmd) > `"$log`" 2>&1", 'exit /b %ERRORLEVEL%')
+    Set-Content -Path $bat -Value $lines -Encoding ascii
+    $p = Start-Process -FilePath $bat -PassThru -WindowStyle Hidden
     $p | Wait-Process -Timeout $timeoutSec -ErrorAction SilentlyContinue | Out-Null
     if (-not $p.HasExited) {
         Get-Process python,zluda -ErrorAction SilentlyContinue |
@@ -40,27 +42,23 @@ function Run-Python([string]$name, [string]$scriptArgs, [int]$timeoutSec = 2400)
         Write-Host "TIMEOUT: $name (log $log)"
         return $false
     }
-    Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 6 | ForEach-Object { Write-Host "  $_" }
+    Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 6 |
+        ForEach-Object { Write-Host "  $_" }
+    if ($p.ExitCode -ne 0) { Write-Host "exit=$($p.ExitCode) (log $log)" }
     return ($p.ExitCode -eq 0)
+}
+
+function Run-Python([string]$name, [string]$scriptArgs, [int]$timeoutSec = 2400) {
+    $parts = $scriptArgs.Split(' ', 2)
+    $inner = "`"$py`" `"$repo\bench\$($parts[0])`" " + $parts[1]
+    return Invoke-Run $name $inner $timeoutSec
 }
 
 function Run-Zluda([string]$name, [string]$scriptArgs, [int]$timeoutSec = 2400) {
-    Write-Host "=== $name (ZLUDA) ==="
-    $log = Join-Path $env:TEMP "rematrix_$name.log"
-    $cmd = "`"$repo\run-zluda.cmd`" venv\Scripts\python.exe $scriptArgs > `"$log`" 2>&1"
-    $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', $cmd -PassThru -WindowStyle Hidden
-    $p | Wait-Process -Timeout $timeoutSec -ErrorAction SilentlyContinue | Out-Null
-    if (-not $p.HasExited) {
-        Get-Process python,zluda -ErrorAction SilentlyContinue |
-            Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-$([int]($timeoutSec / 60) + 2)) } |
-            Stop-Process -Force
-        Write-Host "TIMEOUT: $name (log $log)"
-        return $false
-    }
-    Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 6 | ForEach-Object { Write-Host "  $_" }
-    return ($p.ExitCode -eq 0)
+    $parts = $scriptArgs.Split(' ', 2)
+    $inner = "call `"$repo\run-zluda.cmd`" venv\Scripts\python.exe `"$repo\bench\$($parts[0])`" " + $parts[1]
+    return Invoke-Run $name $inner $timeoutSec
 }
-
 # ---------- 1. model preparation ----------
 if (-not $SkipModelPrep) {
     $q8Gguf = Join-Path $ggufDir "qwen2.5-0.5b-instruct-q8_0.gguf"
@@ -86,7 +84,7 @@ if (-not $SkipModelPrep) {
 
 # ---------- 2. Vulkan matrix ----------
 if (-not $SkipVulkan) {
-    Run-Python "vulkan_matrix" "bench\run_vulkan_matrix.py --models qwen05-f32,qwen05-bf16,qwen05-f16,qwen05-q8,qwen05-q4 --fa 0 --kv f16 --ctx $vulkanCtx --num-predict 32"
+    Run-Python "vulkan_matrix" "run_vulkan_matrix.py --models qwen05-f32,qwen05-bf16,qwen05-f16,qwen05-q8,qwen05-q4 --fa 0 --kv f16 --ctx $vulkanCtx --num-predict 32"
 }
 
 # ---------- 3. ZLUDA matrix ----------
@@ -108,7 +106,7 @@ if (-not $SkipZluda) {
         @{tag = 'q4_fp32_sdpa';     args = '--dtype fp32 --quant int4 --group 64 --attn sdpa_fast' }
     )
     foreach ($cfg in $configs) {
-        Run-Zluda $cfg.tag ("bench\maxctx_matrix.py {0} --contexts $zludaCtx --decode 8 --tag {1}" -f $cfg.args, $cfg.tag)
+        Run-Zluda $cfg.tag ("maxctx_matrix.py {0} --contexts $zludaCtx --decode 8 --tag {1}" -f $cfg.args, $cfg.tag)
     }
 }
 
