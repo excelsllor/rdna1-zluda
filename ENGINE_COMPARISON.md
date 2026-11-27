@@ -216,3 +216,31 @@ execute PTX. llama.cpp therefore reports
 offloaded layers the driver can even hard-crash. The fix is a local llama.cpp
 build with `-DCMAKE_CUDA_ARCHITECTURES=86-virtual` (PTX-only compute_86); recipe
 and verified toolchain: docs/LLAMACPP_ZLUDA_BUILD.md.
+
+---
+
+## 2026-11-27 re-measurement at max fitting context (in progress)
+
+A fresh cross-backend matrix is being measured at the **maximum context that
+fits** for each configuration, without FA and without torch.compile:
+
+- **Vulkan** (Ollama/llama.cpp, FA=0, KV f16): GGUF F32, F16, BF16, Q8_0, Q4_K_M
+  at requested contexts 2048..32768 (the actual allocated context is recorded
+  for each run).
+- **ZLUDA** (PyTorch): fp32, fp16, fp16+accum, bf16, bf16-emul and q8/q4
+  quantized weights dequantized into fp32, each with `math` and `sdpa` attention
+  backends; contexts are probed upward (2048..32768) and the largest fitting
+  context per configuration is recorded with prefill/decode throughput.
+
+Automation (one command):
+`tools\run_cross_backend_rematrix.ps1` ->
+`bench/maxctx_matrix.py`, `bench/run_vulkan_matrix.py`, `bench/summarize_rematrix.py`
+-> `docs/ENGINE_COMPARISON_REMATRIX.md` (tables below in this file are updated
+from that report).
+
+Status: **blocked in the 2026-11-27 session - the GPU driver wedged after a
+cancelled torch.compile experiment**: `torch.cuda.is_available()` hangs during
+ZLUDA init while the PnP device reports "OK", so all HIP/ZLUDA workloads need a
+reboot. The runner and the Vulkan/Ollama imports (Q8_0 GGUF conversion +
+`ollama create qwen05-q8`) are prepared; rerun the command above after the
+reboot to fill `docs/ENGINE_COMPARISON_REMATRIX.md` and refresh the tables here.

@@ -789,10 +789,10 @@ index cc344b8fb95670ba7d2d1df7c82144f3d9fdcbc0..e5a75ce13db6e7558a067b8a2c621cbf
   "unwrap_or",
 diff --git a/ENGINE_COMPARISON.md b/ENGINE_COMPARISON.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..665c91d8930e892ed621c8398ccf33523f15e730
+index 0000000000000000000000000000000000000000..07898ec7c4fba9576ba7198390e1863b6ebb5850
 --- /dev/null
 +++ b/ENGINE_COMPARISON.md
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,246 @@
 +# Engine comparison: Vulkan (Ollama) vs ZLUDA (PyTorch/Triton) on gfx1010
 +
 +Final report: 2026-11-25. GPU: RX 5700 XT (gfx1010, 8 GB). Model: Qwen2.5-0.5B
@@ -1011,6 +1011,34 @@ index 0000000000000000000000000000000000000000..665c91d8930e892ed621c8398ccf3352
 +offloaded layers the driver can even hard-crash. The fix is a local llama.cpp
 +build with `-DCMAKE_CUDA_ARCHITECTURES=86-virtual` (PTX-only compute_86); recipe
 +and verified toolchain: docs/LLAMACPP_ZLUDA_BUILD.md.
++
++---
++
++## 2026-11-27 re-measurement at max fitting context (in progress)
++
++A fresh cross-backend matrix is being measured at the **maximum context that
++fits** for each configuration, without FA and without torch.compile:
++
++- **Vulkan** (Ollama/llama.cpp, FA=0, KV f16): GGUF F32, F16, BF16, Q8_0, Q4_K_M
++  at requested contexts 2048..32768 (the actual allocated context is recorded
++  for each run).
++- **ZLUDA** (PyTorch): fp32, fp16, fp16+accum, bf16, bf16-emul and q8/q4
++  quantized weights dequantized into fp32, each with `math` and `sdpa` attention
++  backends; contexts are probed upward (2048..32768) and the largest fitting
++  context per configuration is recorded with prefill/decode throughput.
++
++Automation (one command):
++`tools\run_cross_backend_rematrix.ps1` ->
++`bench/maxctx_matrix.py`, `bench/run_vulkan_matrix.py`, `bench/summarize_rematrix.py`
++-> `docs/ENGINE_COMPARISON_REMATRIX.md` (tables below in this file are updated
++from that report).
++
++Status: **blocked in the 2026-11-27 session - the GPU driver wedged after a
++cancelled torch.compile experiment**: `torch.cuda.is_available()` hangs during
++ZLUDA init while the PnP device reports "OK", so all HIP/ZLUDA workloads need a
++reboot. The runner and the Vulkan/Ollama imports (Q8_0 GGUF conversion +
++`ollama create qwen05-q8`) are prepared; rerun the command above after the
++reboot to fill `docs/ENGINE_COMPARISON_REMATRIX.md` and refresh the tables here.
 diff --git a/INTEGRATION.md b/INTEGRATION.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..f133f4cd7db83d31fa4f99060a2b17b01547278a
@@ -6682,6 +6710,193 @@ index 0000000000000000000000000000000000000000..bc697e5782dc3ace9f538ed9409de6c4
 +        b = torch.randn(n, n, device=dev, dtype=dtype)
 +        ms = bench(lambda: a @ b)
 +        print(f"matmul {str(dtype).split('.')[-1]:9s} n={n:5d}: {ms:9.2f} ms  {2*n**3/(ms/1000)/1e12:7.2f} TFLOPS")
+diff --git a/bench/maxctx_matrix.py b/bench/maxctx_matrix.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e46308689397c6416d7d7ec45e6ddca319ae91b
+--- /dev/null
++++ b/bench/maxctx_matrix.py
+@@ -0,0 +1,181 @@
++"""Max-fitting-context matrix: ZLUDA PyTorch dtype/quant/attention variants.
++
++For one configuration (dtype x fp16-accum x bf16-emul x quant x attention
++backend) it probes increasing context lengths and records the largest context
++that fits in VRAM together with prefill/decode throughput there.
++
++- bf16-emul: bf16 weights after round-trip, all maths in fp32.
++- quant q8/q4: weights are quantized (groupwise symmetric int8/int4) and then
++  dequantized into fp32; the model runs fp32 (i.e. "dequantize to fp32").
++- attention: math (forced MATH SDPA) or sdpa_fast (PyTorch default; on ZLUDA the
++  fast backends are unavailable and it falls back to math).
++
++Run under run-zluda.cmd:
++  venv\\Scripts\\python.exe bench/maxctx_matrix.py --dtype fp16 --attn math
++"""
++
++import argparse
++import json
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from bench.common import save_report  # noqa: E402
++
++DEFAULT_MODEL = str(Path(__file__).resolve().parents[1] / "models" / "Qwen2.5-0.5B-Instruct")
++DTYPES = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
++
++
++def _math_attn(q, k, v, *a, **kw):
++    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++    with sdpa_kernel(SDPBackend.MATH):
++        return _orig_sdpa(q, k, v, *a, **kw)
++
++
++def _fast_attn(q, k, v, *a, **kw):
++    return _orig_sdpa(q, k, v, *a, **kw)
++
++
++_orig_sdpa = torch.nn.functional.scaled_dot_product_attention
++
++
++def quantize_weights_fp32(model, bits, group):
++    """Quantize Linear weights (int8/int4 groupwise) then dequantize into fp32."""
++    import torch.nn as nn
++
++    from zluda_ops import quant as Q
++
++    for module in model.modules():
++        if not isinstance(module, nn.Linear):
++            continue
++        w = module.weight.detach().to(torch.float16)
++        if bits == 8:
++            packed, scales = Q.quantize_int8(w, 128)
++            wdq = Q.dequantize_int8(packed, scales, w.shape, 128)
++        elif bits == 4:
++            packed, scales = Q.quantize_int4(w, group)
++            wdq = Q.dequantize_int4(packed, scales, w.shape, group)
++        else:
++            raise ValueError(bits)
++        module.weight = nn.Parameter(wdq.float(), requires_grad=False)
++    return model
++
++
++def load_model(path, dtype):
++    from transformers import AutoModelForCausalLM
++
++    kwargs = dict(local_files_only=True, low_cpu_mem_usage=True,
++                  attn_implementation="sdpa")
++    try:
++        model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, **kwargs)
++    except TypeError:
++        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype, **kwargs)
++    return model.eval()
++
++
++def measure(model, ctx, decode):
++    ids = torch.randint(0, model.config.vocab_size, (1, ctx), device="cuda")
++    with torch.no_grad():
++        t0 = time.perf_counter()
++        out = model(input_ids=ids, use_cache=True, logits_to_keep=1)
++        torch.cuda.synchronize()
++        prefill_ms = (time.perf_counter() - t0) * 1000
++        prefill_tok_s = ctx / prefill_ms * 1000
++        cache = out.past_key_values
++        tok = out.logits[:, -1:].argmax(-1)
++        pos = torch.tensor([ctx], device="cuda")
++        t0 = time.perf_counter()
++        for _ in range(decode):
++            o = model(input_ids=tok, past_key_values=cache, use_cache=True,
++                      cache_position=pos, logits_to_keep=1)
++            tok = o.logits[:, -1:].argmax(-1)
++            pos = pos + 1
++        torch.cuda.synchronize()
++        decode_ms = (time.perf_counter() - t0) * 1000 / decode
++    return {"prefill_tok_s": round(prefill_tok_s, 1),
++            "decode_tok_s": round(1000 / decode_ms, 1),
++            "decode_ms_per_tok": round(decode_ms, 2)}
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--dtype", default="fp16", choices=list(DTYPES))
++    parser.add_argument("--acc", type=int, default=0, choices=[0, 1])
++    parser.add_argument("--bf16-emul", action="store_true")
++    parser.add_argument("--quant", default="none", choices=["none", "int8", "int4"])
++    parser.add_argument("--group", type=int, default=64)
++    parser.add_argument("--attn", default="math", choices=["math", "sdpa_fast"])
++    parser.add_argument("--contexts", default="2048,4096,8192,12288,16384,24576,32768")
++    parser.add_argument("--decode", type=int, default=8)
++    parser.add_argument("--vram-fraction", type=float, default=0.85)
++    parser.add_argument("--tag", default="")
++    args = parser.parse_args()
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
++    torch.cuda.reset_peak_memory_stats()
++    torch.manual_seed(0)
++
++    result = {"dtype": args.dtype, "acc": args.acc, "bf16_emul": args.bf16_emul,
++              "quant": args.quant, "attn": args.attn, "tag": args.tag,
++              "contexts": [], "max_ok_ctx": None}
++    import torch.nn.functional as F
++
++    global _orig_sdpa
++    _orig_sdpa = F.scaled_dot_product_attention
++    F.scaled_dot_product_attention = _math_attn if args.attn == "math" else _fast_attn
++    if args.acc:
++        if args.dtype != "fp16":
++            result["error"] = "fp16-accum applies to fp16 only"
++            print(json.dumps(result))
++            return 0
++        torch._C._set_cublas_allow_fp16_accumulation(True)
++
++    print("[maxctx] loading model", flush=True)
++    model = load_model(DEFAULT_MODEL, DTYPES[args.dtype])
++    print("[maxctx] model loaded", flush=True)
++    compute_dtype = DTYPES[args.dtype]
++    if args.bf16_emul:
++        for prm in model.parameters():
++            prm.data = prm.data.float()
++        compute_dtype = torch.float32
++    if args.quant != "none":
++        bits = 8 if args.quant == "int8" else 4
++        model = quantize_weights_fp32(model, bits, args.group)
++        model = model.float()
++        compute_dtype = torch.float32
++    print("[maxctx] moving to GPU", flush=True)
++    model = model.cuda()
++    print("[maxctx] on GPU", flush=True)
++    result["compute_dtype"] = str(compute_dtype)
++
++    for ctx in [int(c) for c in args.contexts.split(",") if c]:
++        try:
++            torch.cuda.empty_cache()
++            torch.cuda.reset_peak_memory_stats()
++            m = measure(model, ctx, args.decode)
++            m["ctx"] = ctx
++            m["peak_mb"] = round(torch.cuda.max_memory_allocated() / 1024 ** 2, 1)
++            result["contexts"].append(m)
++            result["max_ok_ctx"] = ctx
++            print(f"OK   ctx={ctx:6d} prefill {m['prefill_tok_s']:8.1f} tok/s "
++                  f"decode {m['decode_tok_s']:7.1f} tok/s peak {m['peak_mb']:.0f} MB",
++                  flush=True)
++        except Exception as exc:  # noqa: BLE001
++            msg = f"{type(exc).__name__}: {str(exc)[:160]}"
++            result["first_fail"] = {"ctx": ctx, "error": msg}
++            print(f"FAIL ctx={ctx:6d} {msg}", flush=True)
++            torch.cuda.empty_cache()
++            break
++    save_report("maxctx_matrix", result)
++    print(json.dumps(result, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/miopen_db.py b/bench/miopen_db.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..a05eacddf9b6a886f544ebf224221770e5518405
@@ -10235,6 +10450,147 @@ index 0000000000000000000000000000000000000000..d781c16b57057b9e29057a4310f7949b
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/bench/summarize_rematrix.py b/bench/summarize_rematrix.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a37f234f5781a8c10c1f79ae7a5db84be0ddebbc
+--- /dev/null
++++ b/bench/summarize_rematrix.py
+@@ -0,0 +1,135 @@
++"""Summarise the cross-backend re-measurement into a markdown report.
++
++Reads the newest bench/results/vulkan_matrix-*.json (Ollama/Vulkan, FA=0) and all
++bench/results/maxctx_matrix-*.json files produced by today's run, then writes
++docs/ENGINE_COMPARISON_REMATRIX.md and prints the tables.
++
++Usage:
++  venv\\Scripts\\python.exe bench\\summarize_rematrix.py [--date YYYY-MM-DD]
++"""
++
++import argparse
++import json
++from datetime import date
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++RESULTS = REPO / "bench" / "results"
++OUT = REPO / "docs" / "ENGINE_COMPARISON_REMATRIX.md"
++
++
++def newest(pattern):
++    files = sorted(RESULTS.glob(pattern), key=lambda p: p.stat().st_mtime,
++                   reverse=True)
++    return files
++
++
++def load(path):
++    try:
++        return json.loads(path.read_text(encoding="utf-8"))
++    except Exception:  # noqa: BLE001
++        return None
++
++
++VULKAN_DTYPE = {
++    "qwen05-f32": "fp32",
++    "qwen05-bf16": "bf16",
++    "qwen05-f16": "fp16",
++    "qwen05-q8": "q8_0",
++    "qwen05-q4": "q4_k_m",
++}
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--date", default=str(date.today()))
++    args = parser.parse_args()
++    lines = [f"# Cross-backend re-measurement at max fitting context ({args.date})", "",
++             "Generated by bench/summarize_rematrix.py from bench/results/*.json.",
++             "Vulkan = Ollama/llama.cpp Vulkan backend, FA=0, KV f16.",
++             "ZLUDA = PyTorch 2.7.1+cu118 under this fork; no FA, no compile.",
++             "GPU clocks are not fixed (run-to-run spread 15-30%).", ""]
++
++    # ---------- Vulkan ----------
++    vrows = []
++    for rep in newest("vulkan_matrix-*.json")[:1]:
++        data = load(rep)
++        if not data:
++            continue
++        for row in data.get("rows", []):
++            if "error" in row:
++                vrows.append({"model": row.get("model"), "ctx": row.get(
++                    "requested_ctx"), "prefill": None, "decode": None,
++                    "note": row["error"][:80]})
++                continue
++            vrows.append({"model": row.get("model"),
++                          "ctx": row.get("requested_ctx"),
++                          "vram_ctx": row.get("context_length"),
++                          "prefill": row.get("prefill_tok_s"),
++                          "decode": row.get("decode_tok_s")})
++        lines += [f"Vulkan source: `{rep.name}`", ""]
++        break
++    if vrows:
++        lines += ["## Vulkan (llama.cpp via Ollama, FA=0)", "",
++                  "| model | requested ctx | actual ctx | prefill tok/s | decode tok/s |",
++                  "|---|---|---|---|---|"]
++        for r in vrows:
++            lines.append(f"| {r['model']} | {r['ctx']} | {r.get('vram_ctx')} | "
++                         f"{r.get('prefill')} | {r.get('decode')} |")
++        lines.append("")
++
++    # ---------- ZLUDA ----------
++    zrows = []
++    seen = set()
++    for rep in newest("maxctx_matrix-*.json"):
++        data = load(rep)
++        if not data or not isinstance(data, dict):
++            continue
++        key = (data.get("dtype"), data.get("acc"), data.get("bf16_emul"),
++               data.get("quant"), data.get("attn"))
++        if key in seen:
++            continue
++        seen.add(key)
++        best = data.get("max_ok_ctx")
++        ctx_rows = data.get("contexts") or []
++        last = ctx_rows[-1] if ctx_rows else {}
++        zrows.append({"dtype": data.get("dtype"), "acc": data.get("acc"),
++                      "emul": data.get("bf16_emul"),
++                      "quant": data.get("quant"), "attn": data.get("attn"),
++                      "max_ctx": best,
++                      "prefill": last.get("prefill_tok_s"),
++                      "decode": last.get("decode_tok_s"),
++                      "peak_mb": last.get("peak_mb"),
++                      "fail": (data.get("first_fail") or {}).get("ctx")})
++    if zrows:
++        zrows.sort(key=lambda r: (r["dtype"], r["attn"], r["quant"],
++                                  r["acc"], r["emul"]))
++        lines += ["## ZLUDA (PyTorch, max fitting context)", "",
++                  "| dtype | acc | bf16-emul | quant | attn | max ctx | prefill tok/s | decode tok/s | peak MB | next ctx fails |",
++                  "|---|---|---|---|---|---|---|---|---|---|"]
++        for r in zrows:
++            lines.append(
++                f"| {r['dtype']} | {r['acc']} | {r['emul']} | {r['quant']} | "
++                f"{r['attn']} | {r['max_ctx']} | {r['prefill']} | "
++                f"{r['decode']} | {r['peak_mb']} | {r['fail']} |")
++        lines.append("")
++
++    # ---------- mapping ----------
++    lines += ["## Cross-backend mapping", "",
++              "| dtype config | Vulkan equivalent | note |", "|---|---|---|",
++              "| fp32 | F32 GGUF | |",
++              "| fp16 | F16 GGUF | |",
++              "| fp16 + accum | n/a | cuBLAS HPA only, llama.cpp computes in tensor type |",
++              "| bf16 | BF16 GGUF | |",
++              "| bf16-emul (fp32 compute) | n/a | llama.cpp equivalent absent |",
++              "| q8 (int8 -> dequant fp32) | Q8_0 GGUF | both dequantize to compute precision |",
++              "| q4 (int4 -> dequant fp32) | Q4_K_M GGUF | |",
++              "| attention math/sdpa | FA=0 kernels | Vulkan FA=1 excluded from this run |", ""]
++    OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    print("\n".join(lines))
++    print(f"\nreport: {OUT}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
 diff --git a/bench/train_amp.py b/bench/train_amp.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..c60b05760c8fe42d14f5b43249a06bd74e5f32bb
@@ -16765,6 +17121,130 @@ index 0000000000000000000000000000000000000000..9fb3fe5ba2807c4dc92eb9038f1f8ed9
 +}
 +[System.IO.File]::WriteAllText($hookPath, $content.Replace("`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
 +"installed patch check in $hookPath"
+diff --git a/tools/run_cross_backend_rematrix.ps1 b/tools/run_cross_backend_rematrix.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b35d08c4b9e45a0c5705028f5444f53180ccf80
+--- /dev/null
++++ b/tools/run_cross_backend_rematrix.ps1
+@@ -0,0 +1,118 @@
++# Cross-backend re-measurement runner: Vulkan vs ZLUDA at max fitting context.
++#
++# What it does:
++#   1. prepares Q8_0 GGUF and the Ollama models (qwen05-q8, qwen05-q4 if missing);
++#   2. runs the Vulkan matrix (Ollama/llama.cpp, FA=0, KV f16) over the contexts
++#      that fit (up to 32768) for F32/BF16/F16/Q8_0/Q4_K_M;
++#   3. runs the ZLUDA PyTorch matrix (no FA, no compile): dtype fp32/fp16/
++#      fp16+accum/bf16/bf16-emul and q8/q4 dequantized to fp32, for math and
++#      sdpa attention backends, probing contexts up to 32768 and recording the
++#      largest that fits;
++#   4. summarises everything into docs/ENGINE_COMPARISON_REMATRIX.md.
++#
++# Usage (after a reboot, the GPU driver must be healthy):
++#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_cross_backend_rematrix.ps1
++#   ... -SkipVulkan   # ZLUDA only
++#   ... -SkipZluda    # Vulkan only
++param(
++    [switch]$SkipVulkan,
++    [switch]$SkipZluda,
++    [switch]$SkipModelPrep
++)
++$ErrorActionPreference = "Continue"
++$repo = Split-Path -Parent $PSScriptRoot
++$py = Join-Path $repo "venv\Scripts\python.exe"
++$ggufDir = Join-Path $repo "models\qwen05-gguf"
++$hfDir = Join-Path $repo "models\Qwen2.5-0.5B-Instruct"
++$vulkanCtx = "2048,4096,8192,16384,32768"
++$zludaCtx = "2048,4096,8192,12288,16384,24576,32768"
++
++function Run-Python([string]$name, [string]$scriptArgs, [int]$timeoutSec = 2400) {
++    Write-Host "=== $name ==="
++    $log = Join-Path $env:TEMP "rematrix_$name.log"
++    $cmd = "`"$py`" $scriptArgs > `"$log`" 2>&1"
++    $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', $cmd -PassThru -WindowStyle Hidden
++    $p | Wait-Process -Timeout $timeoutSec -ErrorAction SilentlyContinue | Out-Null
++    if (-not $p.HasExited) {
++        Get-Process python,zluda -ErrorAction SilentlyContinue |
++            Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-$([int]($timeoutSec / 60) + 2)) } |
++            Stop-Process -Force
++        Write-Host "TIMEOUT: $name (log $log)"
++        return $false
++    }
++    Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 6 | ForEach-Object { Write-Host "  $_" }
++    return ($p.ExitCode -eq 0)
++}
++
++function Run-Zluda([string]$name, [string]$scriptArgs, [int]$timeoutSec = 2400) {
++    Write-Host "=== $name (ZLUDA) ==="
++    $log = Join-Path $env:TEMP "rematrix_$name.log"
++    $cmd = "`"$repo\run-zluda.cmd`" venv\Scripts\python.exe $scriptArgs > `"$log`" 2>&1"
++    $p = Start-Process -FilePath cmd.exe -ArgumentList '/c', $cmd -PassThru -WindowStyle Hidden
++    $p | Wait-Process -Timeout $timeoutSec -ErrorAction SilentlyContinue | Out-Null
++    if (-not $p.HasExited) {
++        Get-Process python,zluda -ErrorAction SilentlyContinue |
++            Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-$([int]($timeoutSec / 60) + 2)) } |
++            Stop-Process -Force
++        Write-Host "TIMEOUT: $name (log $log)"
++        return $false
++    }
++    Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 6 | ForEach-Object { Write-Host "  $_" }
++    return ($p.ExitCode -eq 0)
++}
++
++# ---------- 1. model preparation ----------
++if (-not $SkipModelPrep) {
++    $q8Gguf = Join-Path $ggufDir "qwen2.5-0.5b-instruct-q8_0.gguf"
++    if (-not (Test-Path $q8Gguf)) {
++        Write-Host "=== converting Q8_0 GGUF ==="
++        & $py "C:\build\llama.cpp\convert_hf_to_gguf.py" $hfDir --outtype q8_0 --outfile $q8Gguf
++        if ($LASTEXITCODE -ne 0) { Write-Host "Q8_0 conversion FAILED (continuing without q8)" }
++    }
++    $models = (& ollama list 2>$null | Out-String)
++    foreach ($spec in @(
++        @{name = "qwen05-q8"; gguf = $q8Gguf },
++        @{name = "qwen05-q4"; gguf = (Join-Path $ggufDir "qwen2.5-0.5b-instruct-q4_k_m.gguf") }
++    )) {
++        if (($models -notmatch [regex]::Escape($spec.name)) -and (Test-Path $spec.gguf)) {
++            $mf = Join-Path $env:TEMP "Modelfile_$($spec.name)"
++            "FROM `"$($spec.gguf)`"`r`nPARAMETER num_ctx 32768" |
++                Set-Content -Path $mf -Encoding ascii
++            Write-Host "=== importing Ollama model $($spec.name) ==="
++            & ollama create $spec.name -f $mf
++        }
++    }
++}
++
++# ---------- 2. Vulkan matrix ----------
++if (-not $SkipVulkan) {
++    Run-Python "vulkan_matrix" "bench\run_vulkan_matrix.py --models qwen05-f32,qwen05-bf16,qwen05-f16,qwen05-q8,qwen05-q4 --fa 0 --kv f16 --ctx $vulkanCtx --num-predict 32"
++}
++
++# ---------- 3. ZLUDA matrix ----------
++if (-not $SkipZluda) {
++    $configs = @(
++        @{tag = 'fp16_math';        args = '--dtype fp16 --attn math' },
++        @{tag = 'fp16_sdpa';        args = '--dtype fp16 --attn sdpa_fast' },
++        @{tag = 'fp16acc_math';     args = '--dtype fp16 --acc 1 --attn math' },
++        @{tag = 'fp16acc_sdpa';     args = '--dtype fp16 --acc 1 --attn sdpa_fast' },
++        @{tag = 'fp32_math';        args = '--dtype fp32 --attn math' },
++        @{tag = 'fp32_sdpa';        args = '--dtype fp32 --attn sdpa_fast' },
++        @{tag = 'bf16_math';        args = '--dtype bf16 --attn math' },
++        @{tag = 'bf16_sdpa';        args = '--dtype bf16 --attn sdpa_fast' },
++        @{tag = 'bf16emul_math';    args = '--dtype bf16 --bf16-emul --attn math' },
++        @{tag = 'bf16emul_sdpa';    args = '--dtype bf16 --bf16-emul --attn sdpa_fast' },
++        @{tag = 'q8_fp32_math';     args = '--dtype fp32 --quant int8 --attn math' },
++        @{tag = 'q8_fp32_sdpa';     args = '--dtype fp32 --quant int8 --attn sdpa_fast' },
++        @{tag = 'q4_fp32_math';     args = '--dtype fp32 --quant int4 --group 64 --attn math' },
++        @{tag = 'q4_fp32_sdpa';     args = '--dtype fp32 --quant int4 --group 64 --attn sdpa_fast' }
++    )
++    foreach ($cfg in $configs) {
++        Run-Zluda $cfg.tag ("bench\maxctx_matrix.py {0} --contexts $zludaCtx --decode 8 --tag {1}" -f $cfg.args, $cfg.tag)
++    }
++}
++
++# ---------- 4. summary ----------
++Write-Host "=== summary ==="
++& $py (Join-Path $repo "bench\summarize_rematrix.py")
++Write-Host "Done: docs/ENGINE_COMPARISON_REMATRIX.md"
 diff --git a/tools/run_infra_suite.ps1 b/tools/run_infra_suite.ps1
 new file mode 100644
 index 0000000000000000000000000000000000000000..b6133360d5f093fd431df2fd85dbc5f18457fb0e
