@@ -36,12 +36,7 @@ def _math_attn(q, k, v, *a, **kw):
         return _orig_sdpa(q, k, v, *a, **kw)
 
 
-def _fast_attn(q, k, v, *a, **kw):
-    return _orig_sdpa(q, k, v, *a, **kw)
-
-
 _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
-
 
 def quantize_weights_fp32(model, bits, group):
     """Quantize Linear weights (int8/int4 groupwise) then dequantize into fp32."""
@@ -117,6 +112,15 @@ def main():
     if not torch.cuda.is_available():
         print("CUDA/ZLUDA device is not available")
         return 1
+    # Raw SDPA fast-backend selection tries cuDNN cutlass fmha kernels built
+    # for sm80+ and hangs/wedges the driver under ZLUDA; keep math only.
+    try:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[maxctx] SDPA backend guard failed: {exc}", flush=True)
     torch.cuda.set_per_process_memory_fraction(args.vram_fraction)
     torch.cuda.reset_peak_memory_stats()
     torch.manual_seed(0)
@@ -126,9 +130,21 @@ def main():
               "contexts": [], "max_ok_ctx": None}
     import torch.nn.functional as F
 
-    global _orig_sdpa
-    _orig_sdpa = F.scaled_dot_product_attention
-    F.scaled_dot_product_attention = _math_attn if args.attn == "math" else _fast_attn
+    if args.attn == "math":
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        def _math_guard(q, k, v, *a, **kw):
+            with sdpa_kernel(SDPBackend.MATH):
+                return _orig_sdpa(q, k, v, *a, **kw)
+
+        F.scaled_dot_product_attention = _math_guard
+        _attn_unpatch = lambda: setattr(F, "scaled_dot_product_attention", _orig_sdpa)
+        _attn_state = {"mode": "math"}
+    else:
+        # default selection with the unusable backends disabled -> math
+        _attn_state = {"mode": "sdpa_safe_math"}
+    _attn_unpatch = None
+    _attn_state = {}
     if args.acc:
         if args.dtype != "fp16":
             result["error"] = "fp16-accum applies to fp16 only"
@@ -154,6 +170,14 @@ def main():
     print("[maxctx] on GPU", flush=True)
     result["compute_dtype"] = str(compute_dtype)
 
+    # one-time warmup (kernel compilation / allocator warm-up) so the first
+    # measured context is not cold
+    with torch.no_grad():
+        warm = torch.randint(0, model.config.vocab_size, (1, 256), device="cuda")
+        model(input_ids=warm, use_cache=False, logits_to_keep=1)
+        torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
     for ctx in [int(c) for c in args.contexts.split(",") if c]:
         try:
             torch.cuda.empty_cache()
@@ -172,6 +196,14 @@ def main():
             print(f"FAIL ctx={ctx:6d} {msg}", flush=True)
             torch.cuda.empty_cache()
             break
+    result["attn_calls"] = _attn_state.get("calls")
+    result["attn_errors"] = _attn_state.get("errors")
+    result["attn_last_error"] = _attn_state.get("last_error")
+    if _attn_unpatch:
+        try:
+            _attn_unpatch()
+        except Exception:
+            pass
     save_report("maxctx_matrix", result)
     print(json.dumps(result, indent=2))
     return 0
