@@ -169,11 +169,38 @@ def install():
     F.linear = _linear
     F.scaled_dot_product_attention = _sdpa
     _disable_fast_sdpa()
+    try:
+        from . import cudnn_fallback
+        cudnn_fallback.autoload()  # BN/RNN fallbacks for unmapped cuDNN ops
+    except Exception:  # noqa: BLE001 - fallbacks are optional
+        pass
     if (os.environ.get("ZLUDA_CONV_FP32") == "1"
             or os.environ.get("ZLUDA_CONV_AUTO") == "1"):
         _conv.install()
     return True
 
+
+def uninstall():
+    """Restore the original torch functions and undo the fallback patches."""
+    global _orig_linear, _orig_sdpa
+    if _orig_linear is None:
+        return False
+    F.linear = _orig_linear
+    F.scaled_dot_product_attention = _orig_sdpa
+    _restore_sdpa()
+    try:
+        from . import cudnn_fallback
+
+        cudnn_fallback.uninstall()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _conv.uninstall()
+    except Exception:  # noqa: BLE001
+        pass
+    _orig_linear = None
+    _orig_sdpa = None
+    return True
 
 if os.environ.get("ZLUDA_MHA_SLOW") == "1":
     _mha.install()

@@ -59,9 +59,7 @@ layers).
 
 ## 3. Library-level gaps found by the infra probe
 
-- **cublasSgemv (1-D fp32 GEMV)** returns CUBLAS_STATUS_NOT_SUPPORTED
-  (`torch.mv(x_fp32)` fails); 2-D fp32 GEMM works. fp16 GEMV works.
-  This is a real BLAS L2 gap (used by some classic code paths).
+- **cublasSgemv (1-D fp32 GEMV)** - **fixed 2026-11-26** (mapped to rocBLAS sgemv/sgemv_v2/sgemv_v2_64; `torch.mv` fp32/fp16 work, probe OK). Only `cublasDgemv` (fp64) remains unsupported (no `FromCuda` for `*const f64`, no fp64 BLAS on this gfx1010 build).
 - **fp64 GEMM** (cublasDgemm) unsupported (no f64 Tensile coverage for gfx1010).
 - cuDNN batchnorm/RNN unmapped (fallbacks provided, see docs/INFRA_FIXES.md).
 

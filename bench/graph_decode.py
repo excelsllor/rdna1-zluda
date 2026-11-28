@@ -100,6 +100,8 @@ def main():
                 with torch.cuda.graph(g):
                     gout = step()
             torch.cuda.synchronize()
+            g.replay()  # capture only records; replay to fill buffers
+            torch.cuda.synchronize()
             err = float((gout.logits - ref).abs().max())
             result["graph_logits_max_abs_diff"] = err
             result["graph_ms_per_tok"] = timed(g.replay, args.steps)
