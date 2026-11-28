@@ -30,6 +30,11 @@ in PyTorch runs. GPU clocks cannot be fixed (+-15-30% run-to-run spread).
   ZLUDA's `ptx`/`llvm_zluda` support; no llama.cpp binary patch can avoid those
   kernels. Same-engine Vulkan-vs-ZLUDA comparison therefore remains blocked and
   the cross-engine table below is labelled accordingly.
+
+> **Correction (2026-11-28 agent audit):** the "still blocked" part above is
+> superseded by the custom compute_86-PTX build (docs/LLAMACPP_ZLUDA_BUILD.md):
+> llama.cpp runs with `-ngl 99`, F16 GGUF, `-fa 0` (6144/3294 prefill and
+> 184 tok/s decode at 2k/8k). Only `-fa 1` and Q4/Q8 MMQ remain broken.
 - **bitsandbytes: excluded.** 0.50.2 imports and ships ROCm libraries, but its
   kernels fail under ZLUDA (`named symbol not found`, default and
   `BNB_BACKEND=rocm`). Substitute in this repo: `zluda_ops/optim8bit.py`.
@@ -105,12 +110,13 @@ is not available (ComfyUI, dynamic shapes) and for isolated ops.
 - **Decode is the main gap**: 22-28 tok/s at 1k context and 6.2 tok/s at 32k vs
   105-212 tok/s on Vulkan, i.e. 4-8x at short context and ~17x at 32k. Causes:
   one Python/kernel-launch-heavy forward per token, math SDPA for the query in
-  the default path (our flash-decoding helps ~+22%), no CUDA/HIP graphs,
+  the default path (our flash-decoding helps ~+22%), no CUDA/HIP graphs in the compiled path,
   no persistent/fused decode kernels, no batched decode.
 - **Torch.compile**: excellent for prefill on this stack (Inductor fuses the
   whole graph, peak memory drops to 1031 MB) but unusable for decode with
-  `dynamic=False` (recompilation per token) and CUDA graphs are not supported
-  by ZLUDA; `dynamic=True` also recompiles per token here. Decode-specific
+  `dynamic=False` (recompilation per token) and Inductor's reduce-overhead
+  CUDA-graph trees fail (raw CUDA-graph capture/replay does work under ZLUDA:
+  see zluda_ops/graph_decode.py and docs/CUDA_GRAPHS_ZLUDA.md); `dynamic=True`
   compilation/graph support is an open ZLUDA issue.
 - **Quantization**: steady memory is a real win (fp16 950 MB -> int4 519 MB,
   1.85x), but prefill gets slower (2031 tok/s) because dequant ALU is no

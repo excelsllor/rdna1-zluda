@@ -28,6 +28,14 @@ def _config(m, n, k):
         cfg = TUNED_M1.get((n, k))
         if cfg is not None:
             return cfg
+        try:
+            from .tuned_gemv_ext import TUNED_M1_EXT
+
+            cfg = TUNED_M1_EXT.get((n, k))
+        except Exception:  # noqa: BLE001 - generated table is optional
+            cfg = None
+        if cfg is not None:
+            return cfg
     return CONFIGS[m]
 
 

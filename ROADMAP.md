@@ -4,6 +4,25 @@ Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
 runtime + tuned rocBLAS 7.1.1. See `RESULTS_RDNA1.md` for measurements and
 `docs/RDNA1_BUILD_AND_USAGE.md` for build/usage instructions.
 
+## Агентный аудит (2026-11-28)
+
+6 агентов-исследователей + верификатор перепроверили стек по репо,
+JSON-результатам, логам и первоисточникам: **77/90 пунктов верифицировано**,
+найдено **12 расхождений** доков с фактами и 2 бага обвязки.
+Полный отчёт: `docs/AGENT_AUDIT_REPORT.md`.
+
+Исправлено сразу: автозагрузка `cudnn_fallback` (BN/RNN), merge
+`TUNED_M1_EXT` в `gemv._config`, replay перед проверкой logits в
+`bench/graph_decode.py`, реализован `zluda_ops.auto.uninstall()`;
+обновлены устаревшие места в `INFRA_FIXES` (21/25), `KERNEL_GAPS`
+(sgemv), `COMPAT_MATRIX` (-fa 1 + software-fallback MMA PR #551),
+`ENGINE_COMPARISON` (графы, llama.cpp), `INTEGRATION`, `ROADMAP`
+(bf16-emul), `ROADMAP_ECOSYSTEM` (RNN fallback).
+Топ-приоритеты из аудита: P0 стабилизация драйвера/safe-run;
+P1 llama.cpp FA/MMQ, torch.compile decode, проводка fused QKV/GQA,
+ComfyUI e2e, MIOpen RNN, GPTQ/AWQ, профайлер+GPU-CI.
+
+
 ## Facts and constraints
 
 - gfx1010: 40 CU / 20 WGP, wave32, **no matrix units (no tensor cores/MFMA)**,
@@ -450,7 +469,8 @@ guarantee selection; transforms add memory traffic and may lose accuracy.
   reaches graph instantiation and fails on (a) DynamicCache torch.cat inside
   the captured region (use StaticCache) and (b) cuBLAS not being graph-capture
   safe (zluda_blas audit is the next item). bf16-emul works on ROCm (3812/26.0)
-  but still crashes on ZLUDA (VRAM). Details: docs/CUDA_GRAPHS_ZLUDA.md.
+  and on ZLUDA too (5488/29.6 tok/s); the earlier "crash" was a harness
+  invocation without the ZLUDA launcher, not a VRAM limit.
 - **2026-11-25 - CUDA graphs work under ZLUDA:** torch.cuda.CUDAGraph capture
   and replay now work. PyTorch's runtime path called three unimplemented legacy
   driver entry points - `cuStreamBeginCapture` (no mode arg),

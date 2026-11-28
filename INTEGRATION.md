@@ -186,6 +186,9 @@ and will exercise the Triton path for supported shapes.
 
 ### llama.cpp on ZLUDA (blocked - do not run with GPU offload)
 
+**SUPERSEDED (2026-11-26): a custom compute_86-PTX build runs llama.cpp with
+-ngl 99` (F16, `-fa 0`); see the next section.**
+
 With the launch-attribute patch (`zluda/src/impl/driver.rs`) llama.cpp's CUDA
 backend loads under ZLUDA and runs at `-ngl 0` (CPU: pp16 124 tok/s, tg2 17.4)
 and `-ngl 1 -fa 0` with the F16 GGUF (pp8 415.6, tg1 61.5). Increasing the

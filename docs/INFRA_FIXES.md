@@ -81,7 +81,7 @@ different fallbacks are provided by `zluda_ops/cudnn_fallback.py`:
 
 Infra probe (`bench/infra_probe.py`) now covers both fallbacks:
 `cudnn_batchnorm_fallback` and `cudnn_lstm_fallback` are OK; the raw cuDNN
-calls remain FAIL (expected, documented above). Current result: **20/24**
+calls remain FAIL (expected, documented above). Current result: **21/25**
 checks pass; remaining failures: raw BN/RNN (use the fallbacks), fp64 GEMM
 (rocBLAS/Tensile f64 not available for gfx1010).
 

@@ -42,7 +42,7 @@ attention works but is ~17x slower than Triton FA for prefill.
 |---|---|---|
 | F16, `-fa 0` | **OK** | pp64 1762 tok/s, tg4 172 tok/s |
 | F32 GGUF, `-fa 0` | **OK** | pp64 2841 tok/s, tg4 139 tok/s (F32 prefill is faster than F16 because fp32 GEMM is faster on gfx1010) |
-| F16, `-fa 1` | **FAIL** | `CUDA error: named symbol not found` (fatnn/mma kernels) |
+| F16, `-fa 1` | **FAIL** | `named symbol not found`: a specific fatnn kernel variant is not translated yet; not the absence of tensor cores (upstream PR #551 ships a software-fallback MMA for RDNA1/RDNA2 in this fork) - re-check on the current fork |
 | Q4_K_M / Q8_0 (MMQ quant kernels) | **not testable safely** | Q4_K_M hangs the driver on this stack (requires reboot); Q8_0 uses the same MMQ kernel family - do not run without reboot readiness |
 
 Official SASS-only llama.cpp builds remain unusable (no PTX for sm_86); the
@@ -90,7 +90,7 @@ on CUDA-graph replay (`zluda_ops.graph_decode.GraphDecoder`).
 ## 5. Summary of what does NOT work (documented)
 
 1. PyTorch fast SDPA backends (flash/efficient/cudnn) -> crash / wrong-arch kernels.
-2. llama.cpp `-fa 1` (mma/fatnn kernels) and quantized MMQ models (Q4/Q8 hang).
+2. llama.cpp `-fa 1` (a specific fatnn kernel variant is still not translated, even though software-fallback MMA exists) and quantized MMQ models (Q4/Q8 hang).
 3. torch.compile for decode (StaticCache) and reduce-overhead (CUDA graphs).
 4. ComfyUI startup / Flux GGUF e2e under ZLUDA (not yet achieved).
 5. fp64 BLAS (cublasDgemm), cublasDgemv (fp64 only; fp32/fp16 GEMV work).
