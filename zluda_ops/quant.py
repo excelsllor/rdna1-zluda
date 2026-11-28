@@ -278,7 +278,7 @@ def int4_prefill_linear(x, packed, scales, bias=None, group_size=64):
 
 __all__ = [
     "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
-    "int4_linear", "int8_linear", "int8_matmul", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
+    "int4_linear", "int8_linear", "int8_matmul", "unpack_gptq_int4", "unpack_awq_int4", "gptq_selftest", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 ]
 
 # ---------------------------------------------------------------------------
@@ -395,3 +395,149 @@ def int8_matmul(x, w, scales, group_size=128, block_m=64, block_n=64, block_k=12
         x, w, scales, y, m, n, k, GROUP=group_size, BM=block_m, BN=block_n,
         BK=block_k, num_warps=num_warps, num_stages=num_stages)
     return y
+
+# ---------------------------------------------------------------------------
+# GPTQ / AWQ weight unpacking (Phase-2 functional gap: import real quantized
+# checkpoints -- 7B int4 fits in ~3.5 GB on this 8 GB card).
+#
+# Layouts follow the reference packing helpers in vLLM
+# (quant_utils.py: pack_rows/pack_cols/gptq_pack/awq_pack) and AutoGPTQ/ AutoAWQ:
+#   GPTQ: qweight int32 (in/8, out), 8 consecutive *input* features per int32,
+#         little-endian nibble order; dequant = (q - qzeros) * scales.
+#         Symmetric checkpoints store the uint4b8 bias (zero = 8).
+#   AWQ:  qweight int32 (in, out/8), 8 consecutive *output* features per int32
+#         with the interleave order [0,2,4,6,1,3,5,7]; dequant = (q - qzeros) * scales.
+# Scales are groupwise along the input dimension: (in/group, out).
+# ---------------------------------------------------------------------------
+def _pack_rows_ref(q_uint, bits=4):
+    """Reference GPTQ packing: q_uint (k, n) -> int32 (k/(32/bits), n)."""
+    k, n = q_uint.shape
+    pf = 32 // bits
+    if k % pf:
+        raise ValueError("k must be divisible by the pack factor")
+    res = torch.zeros((k // pf, n), dtype=torch.int32, device=q_uint.device)
+    for i in range(pf):
+        res |= (q_uint[i::pf, :].to(torch.int32) & ((1 << bits) - 1)) << (bits * i)
+    return res
+
+
+def _pack_cols_ref(q_uint, bits=4):
+    """Reference column packing: q_uint (k, n) -> int32 (k, n/(32/bits))."""
+    k, n = q_uint.shape
+    pf = 32 // bits
+    if n % pf:
+        raise ValueError("n must be divisible by the pack factor")
+    res = torch.zeros((k, n // pf), dtype=torch.int32, device=q_uint.device)
+    for i in range(pf):
+        res |= (q_uint[:, i::pf].to(torch.int32) & ((1 << bits) - 1)) << (bits * i)
+    return res
+
+
+def _unpack_rows(packed, bits, k):
+    pf = 32 // bits
+    mask = (1 << bits) - 1
+    out = torch.empty((k, packed.shape[1]), dtype=torch.int32, device=packed.device)
+    for i in range(pf):
+        out[i::pf, :] = (packed >> (bits * i)) & mask
+    return out
+
+
+def _unpack_cols(packed, bits, n):
+    pf = 32 // bits
+    mask = (1 << bits) - 1
+    out = torch.empty((packed.shape[0], n), dtype=torch.int32, device=packed.device)
+    for i in range(pf):
+        out[:, i::pf] = (packed >> (bits * i)) & mask
+    return out
+
+
+_AWQ_INTERLEAVE = [0, 2, 4, 6, 1, 3, 5, 7]
+_AWQ_DEINTERLEAVE = [0, 4, 1, 5, 2, 6, 3, 7]
+
+
+def unpack_gptq_int4(qweight, scales, qzeros=None, in_features=None,
+                     out_features=None, group_size=128, zero_offset=1):
+    """Unpack GPTQ int4 weights to a dequantized fp16 weight (in, out)."""
+    if qweight.dim() != 2 or qweight.dtype != torch.int32:
+        raise ValueError("qweight must be an int32 2-D tensor")
+    k, n = in_features, out_features
+    if k is None:
+        k = qweight.shape[0] * 8
+    if n is None:
+        n = qweight.shape[1]
+    if qweight.shape != (k // 8, n):
+        raise ValueError(f"qweight shape {tuple(qweight.shape)} != ({k // 8}, {n})")
+    q = _unpack_rows(qweight, 4, k).to(torch.float32)  # (k, n), unsigned 0..15
+    if qzeros is None:
+        zeros = torch.full((k // group_size, n), 8.0, device=qweight.device)
+    else:
+        if qzeros.shape != (k // group_size, n // 8):
+            raise ValueError(f"qzeros shape {tuple(qzeros.shape)} != "
+                             f"({k // group_size}, {n // 8})")
+        zeros = _unpack_cols(qzeros, 4, n).to(torch.float32) + zero_offset
+    zeros = zeros.repeat_interleave(group_size, dim=0)
+    w = (q - zeros) * scales.float().repeat_interleave(group_size, dim=0)
+    return w.to(torch.float16)
+
+
+def unpack_awq_int4(qweight, scales, qzeros=None, in_features=None,
+                    out_features=None, group_size=128, zero_offset=1):
+    """Unpack AWQ int4 weights to a dequantized fp16 weight (in, out)."""
+    if qweight.dim() != 2 or qweight.dtype != torch.int32:
+        raise ValueError("qweight must be an int32 2-D tensor")
+    k, n = in_features, out_features
+    if k is None:
+        k = qweight.shape[0]
+    if n is None:
+        n = qweight.shape[1] * 8
+    if qweight.shape != (k, n // 8):
+        raise ValueError(f"qweight shape {tuple(qweight.shape)} != ({k}, {n // 8})")
+    q = _unpack_cols(qweight, 4, n).to(torch.float32)
+    # undo the AWQ interleave of the output dimension inside each 8-column group
+    q = q.reshape(k, n // 8, 8)[:, :, _AWQ_DEINTERLEAVE].reshape(k, n)
+    if qzeros is None:
+        zeros = torch.full((k // group_size, n), 8.0, device=qweight.device)
+    else:
+        if qzeros.shape != (k // group_size, n // 8):
+            raise ValueError(f"qzeros shape {tuple(qzeros.shape)} != "
+                             f"({k // group_size}, {n // 8})")
+        zeros = _unpack_cols(qzeros, 4, n).to(torch.float32)
+        zeros = zeros.reshape(k // group_size, n // 8, 8)[:, :, _AWQ_DEINTERLEAVE]
+        zeros = zeros.reshape(k // group_size, n) + zero_offset
+    zeros = zeros.repeat_interleave(group_size, dim=0)
+    w = (q - zeros) * scales.float().repeat_interleave(group_size, dim=0)
+    return w.to(torch.float16)
+
+
+def gptq_selftest():
+    """Round-trip test for the GPTQ/AWQ unpack helpers (CPU, no GPU needed)."""
+    torch.manual_seed(0)
+    in_f, out_f, group = 256, 128, 128
+    w = torch.randn(out_f, in_f) * 0.05  # (out, in) as used by nn.Linear
+    # --- GPTQ (symmetric uint4b8: stored = q + 8) ---
+    g = w.reshape(out_f, in_f // group, group)
+    amax = g.abs().amax(-1, keepdim=True).clamp(min=1e-8)
+    scale = amax / 7.0
+    q_signed = torch.round(g / scale).clamp(-8, 7).to(torch.int32).reshape(out_f, in_f)
+    stored = (q_signed + 8).to(torch.int32).t().contiguous()  # (in, out) uint4b8
+    qw = _pack_rows_ref(stored)
+    sc_g = scale.reshape(out_f, in_f // group).t().contiguous()
+    w_gptq = unpack_gptq_int4(qw, sc_g, qzeros=None, group_size=group)
+    ref = ((q_signed.reshape(out_f, in_f // group, group).float() * scale)
+           .reshape(out_f, in_f))
+    err = float((w_gptq.float().t() - ref).abs().max())
+    # --- AWQ (asymmetric, interleaved columns, zero stored as zp-1) ---
+    zp = 8
+    q_awq = torch.round(w.reshape(out_f, in_f // group, group) / scale) + zp
+    q_awq = q_awq.clamp(0, 15).to(torch.int32).reshape(out_f, in_f)
+    inter = q_awq.t().reshape(in_f, out_f // 8, 8)[:, :, _AWQ_INTERLEAVE]
+    inter = inter.reshape(in_f, out_f)
+    qw_awq = _pack_cols_ref(inter)
+    zeros = torch.full((in_f // group, out_f // 8, 8), zp - 1, dtype=torch.int32)
+    qz = _pack_cols_ref(zeros.reshape(in_f // group, out_f))
+    w_awq = unpack_awq_int4(qw_awq, sc_g, qz, group_size=group, zero_offset=1)
+    ref_awq = ((q_awq.reshape(out_f, in_f // group, group) - zp).float() * scale)
+    ref_awq = ref_awq.reshape(out_f, in_f)
+    err_awq = float((w_awq.float().t() - ref_awq).abs().max())
+    return {"gptq_err": round(err, 5), "awq_err": round(err_awq, 5),
+            "gptq_shape": tuple(w_gptq.shape), "awq_shape": tuple(w_awq.shape)}

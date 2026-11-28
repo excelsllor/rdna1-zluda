@@ -1,0 +1,37 @@
+{
+ "tag": "ci-20261128-224629",
+ "checks": {
+  "gqa_decode_correctness": "OK",
+  "gqa_decode_speed": "OK",
+  "add_rms_norm_correctness": "OK",
+  "add_rms_norm_speed": "OK",
+  "gqa_decode_m1_speed": "OK",
+  "embedding_gather_scale": "OK",
+  "sampling_kernel": "OK",
+  "int8_prefill_matmul": "OK",
+  "qkv_rope_append_correctness": "OK",
+  "train:linear_fwd_bwd": "OK",
+  "train:conv2d_fwd_bwd": "OK",
+  "train:sdpa_math_bwd": "OK",
+  "train:triton_fa_bwd": "OK",
+  "train:autocast_fp16_bf16": "OK",
+  "train:bn_rnn_fallback_bwd": "OK",
+  "train:optim8bit_step": "OK"
+ },
+ "metrics": {
+  "gqa_decode_speed:gqa_us": 146.1,
+  "gqa_decode_speed:old_us": 175.1,
+  "add_rms_norm_speed:fused_us": 70.8,
+  "add_rms_norm_speed:two_kernel_us": 101.7,
+  "gqa_decode_m1_speed:m1_us": 138.5,
+  "gqa_decode_m1_speed:old_us": 171.7,
+  "embedding_gather_scale:us": 46.0,
+  "sampling_kernel:us": 437.7,
+  "int8_prefill_matmul:int8_us": 484.3,
+  "int8_prefill_matmul:dequant_fp16_us": 239.3
+ },
+ "regressions": [],
+ "failures": [],
+ "ok": true,
+ "timestamp": "2026-11-28T22:49:27"
+}

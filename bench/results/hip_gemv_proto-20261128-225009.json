@@ -1,0 +1,47 @@
+{
+  "n": 4864,
+  "k": 896,
+  "dll": "C:\\Users\\artyom\\AppData\\Local\\Temp\\hip_gemv4.dll",
+  "hip_us": 45992.3,
+  "hip_status": "OK",
+  "triton_us": 84.7,
+  "speedup_vs_triton": 0.0,
+  "hip_GBs": 0.2,
+  "triton_GBs": 103.0,
+  "timestamp": "2026-11-28T22:50:09",
+  "gpu": {
+    "torch": "2.7.1+cu118",
+    "cuda": "11.8",
+    "hip": null,
+    "hip_path": "G:\\zluda\\hip",
+    "zluda_cc": "8.6",
+    "device": "AMD Radeon RX 5700 XT [ZLUDA]",
+    "multi_processor_count": 20,
+    "total_memory_gb": 7.98,
+    "l2_cache_mb": 4.0,
+    "allow_tf32": false,
+    "float32_matmul_precision": "highest",
+    "triton": "3.3.1"
+  },
+  "protocol": {
+    "data": "random data (torch.randn) unless stated otherwise",
+    "timing": "mean per round, median across rounds, warmup per round",
+    "order": "variant order shuffled between rounds when comparing",
+    "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
+  },
+  "clocks": {
+    "adapter": "AMD Radeon RX 5700 XT",
+    "engine_clock_mhz": null,
+    "memory_clock_mhz": null,
+    "vddc_mv": null,
+    "temperature_c": null,
+    "activity_pct": null,
+    "power_pct": null,
+    "errors": {
+      "overdriveN_status": -8,
+      "overdrive6_status": -8,
+      "overdrive6_temperature": -8,
+      "overdrive6_power": -1
+    }
+  }
+}

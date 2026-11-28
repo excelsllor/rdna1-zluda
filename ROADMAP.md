@@ -18,6 +18,7 @@ JSON-результатам, логам и первоисточникам: **77/
 (sgemv), `COMPAT_MATRIX` (-fa 1 + software-fallback MMA PR #551),
 `ENGINE_COMPARISON` (графы, llama.cpp), `INTEGRATION`, `ROADMAP`
 (bf16-emul), `ROADMAP_ECOSYSTEM` (RNN fallback).
+Дополнительно сделано: GPTQ/AWQ-распаковка (`unpack_gptq_int4`/`unpack_awq_int4`, selftest 6e-5), GPU-CI (`bench/regression_gate.py` + `tools/run_gpu_ci.ps1`, PASS, baseline 10 метрик), HIP-GEMV harness (`bench/hip_gemv_proto.py`), метка «sdpa (fast off)» в rematrix.
 Топ-приоритеты из аудита: P0 стабилизация драйвера/safe-run;
 P1 llama.cpp FA/MMQ, torch.compile decode, проводка fused QKV/GQA,
 ComfyUI e2e, MIOpen RNN, GPTQ/AWQ, профайлер+GPU-CI.
