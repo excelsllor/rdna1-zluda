@@ -31,6 +31,11 @@ def load(path):
         return None
 
 
+def _attn_label(attn):
+    # sdpa_fast = default selector with the crashy fast backends disabled
+    return {"sdpa_fast": "sdpa (fast off)"}.get(attn, attn)
+
+
 VULKAN_DTYPE = {
     "qwen05-f32": "fp32",
     "qwen05-bf16": "bf16",
@@ -110,7 +115,7 @@ def main():
         for r in zrows:
             lines.append(
                 f"| {r['dtype']} | {r['acc']} | {r['emul']} | {r['quant']} | "
-                f"{r['attn']} | {r['max_ctx']} | {r['prefill']} | "
+                f"{{_attn_label(r['attn'])}} | {{r['max_ctx']}} | {{r['prefill']}} | "
                 f"{r['decode']} | {r['peak_mb']} | {r['fail']} |")
         lines.append("")
 

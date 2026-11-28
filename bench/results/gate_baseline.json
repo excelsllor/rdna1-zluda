@@ -1,0 +1,15 @@
+{
+ "metrics": {
+  "gqa_decode_speed:gqa_us": 146.1,
+  "gqa_decode_speed:old_us": 175.1,
+  "add_rms_norm_speed:fused_us": 70.8,
+  "add_rms_norm_speed:two_kernel_us": 101.7,
+  "gqa_decode_m1_speed:m1_us": 138.5,
+  "gqa_decode_m1_speed:old_us": 171.7,
+  "embedding_gather_scale:us": 46.0,
+  "sampling_kernel:us": 437.7,
+  "int8_prefill_matmul:int8_us": 484.3,
+  "int8_prefill_matmul:dequant_fp16_us": 239.3
+ },
+ "timestamp": "2026-11-28T22:49:27"
+}

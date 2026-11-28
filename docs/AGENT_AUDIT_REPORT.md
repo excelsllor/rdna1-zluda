@@ -201,3 +201,27 @@ cores. `mma.sync` при этом транслируется software-fallback'�
 
 Примечание: в среде верификатора `web_search` вернул HTTP 401, поэтому
 веб-проверка сделана через `web_fetch` первоисточников.
+
+## 12. Дополнительно сделано после аудита (2026-11-28)
+
+- **GPTQ/AWQ import (P1):** `zluda_ops/quant.py` — `unpack_gptq_int4` /
+  `unpack_awq_int4` (форматы сверены с эталонными `pack_rows`/`pack_cols`/
+  `awq_pack` из vLLM), групповые scales, поддержка qzeros; CPU-roundtrip
+  `gptq_selftest()` → err 6e-5. Осталось: загрузчик чекпойнта (маппинг
+  qweight/qzeros/scales в эти хелперы) — импорт сам по себе ускоряет только
+  через VRAM (7B int4 ≈ 3.5 ГБ).
+- **GPU-CI / regression gate (P1):** `bench/regression_gate.py` +
+  `tools/run_gpu_ci.ps1`. Первый прогон: **PASS** (phase2 9/9, shim 4/4,
+  train 7/7; 16 проверок, baseline из 10 метрик записан). Гейт падает при
+  статусах != OK и при деградации таймингов >40%.
+- **HIP GEMV prototype harness:** `bench/hip_gemv_proto.py` (закрывает
+  корректировку #9). Оговорка: вызов прототипной DLL из ZLUDA-процесса дал
+  неправдоподобные 511 мс/вызов — для честных чисел прототип надо собирать
+  ROCm-clang'ом (скрипт `tools/hip_proto/build_gemv.cmd`) и мерить в отдельном
+  HIP-процессе; текущая DLL в %TEMP% нерелевантна.
+- **rematrix (корректировка #11):** метка «sdpa_fast» в сводке теперь
+  отображается как «sdpa (fast off)» — это math-селектор с выключенными
+  падающими бэкендами.
+- **Safe-run:** GPU-CI использует только безопасные наборы и не трогает
+  raw-SDPA/llama.cpp MMQ/FA; `zluda_ops.auto` по-прежнему отключает падающие
+  SDPA-бэкенды при импорте.

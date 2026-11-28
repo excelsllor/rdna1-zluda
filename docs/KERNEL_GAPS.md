@@ -83,3 +83,14 @@ fill/copy/GEMV). Only the allocation call overhead differs slightly (torch's
 caching allocator adds ~0.04 ms per 256 MB allocation); for steady-state decode
 with reuse there is no benefit in switching. Use torch allocations everywhere;
 direct hipMalloc only makes sense to bypass torch for one-off huge buffers.
+
+## 1b. Added later (2026-11-28): GPTQ/AWQ import scaffolding
+
+`zluda_ops/quant.py` now provides `unpack_gptq_int4` and `unpack_awq_int4`
+(layouts follow vLLM's reference `pack_rows`/`pack_cols`/`awq_pack` helpers and
+AutoGPTQ/AutoAWQ conventions: GPTQ uint4b8 rows, AWQ interleaved columns,
+groupwise scales (in/group, out)). Round-trip self-test:
+`quant.gptq_selftest()` -> err 6e-5 (fp16 rounding). A full checkpoint loader
+(mapping qweight/qzeros/scales tensors into these helpers) is still to be
+written; import support alone does not accelerate anything on RDNA1, it only
+reduces VRAM (7B int4 ~3.5 GB) and enables real quantized models to run.
