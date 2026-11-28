@@ -2224,10 +2224,10 @@ index 0000000000000000000000000000000000000000..20a7a85a9757d88a127f816ccc5fc9bb
 +`bench/quant_prefill.py` reproduces the table.
 diff --git a/ROADMAP.md b/ROADMAP.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7f038ecc2a21c20cf9338c7fce420ccc61fd404e
+index 0000000000000000000000000000000000000000..7cee53b61fd3905dfd1e646a6dcd1dce82fa6a13
 --- /dev/null
 +++ b/ROADMAP.md
-@@ -0,0 +1,708 @@
+@@ -0,0 +1,709 @@
 +# Roadmap — ZLUDA on gfx1010 (Radeon RX 5700 XT)
 +
 +Status: ZLUDA v7-preview.21 builds and runs on gfx1010 with a unified ROCm 10.1
@@ -2248,6 +2248,7 @@ index 0000000000000000000000000000000000000000..7f038ecc2a21c20cf9338c7fce420ccc
 +(sgemv), `COMPAT_MATRIX` (-fa 1 + software-fallback MMA PR #551),
 +`ENGINE_COMPARISON` (графы, llama.cpp), `INTEGRATION`, `ROADMAP`
 +(bf16-emul), `ROADMAP_ECOSYSTEM` (RNN fallback).
++Дополнительно сделано: GPTQ/AWQ-распаковка (`unpack_gptq_int4`/`unpack_awq_int4`, selftest 6e-5), GPU-CI (`bench/regression_gate.py` + `tools/run_gpu_ci.ps1`, PASS, baseline 10 метрик), HIP-GEMV harness (`bench/hip_gemv_proto.py`), метка «sdpa (fast off)» в rematrix.
 +Топ-приоритеты из аудита: P0 стабилизация драйвера/safe-run;
 +P1 llama.cpp FA/MMQ, torch.compile decode, проводка fused QKV/GQA,
 +ComfyUI e2e, MIOpen RNN, GPTQ/AWQ, профайлер+GPU-CI.
@@ -6372,6 +6373,128 @@ index 0000000000000000000000000000000000000000..fcbefeabd1e0e8465822f498ccefa82b
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/bench/hip_gemv_proto.py b/bench/hip_gemv_proto.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..88664ca2a73075d875ee74ea4d22705c5909b07d
+--- /dev/null
++++ b/bench/hip_gemv_proto.py
+@@ -0,0 +1,116 @@
++"""HIP GEMV prototype harness (audit correction #9: the docs referenced a
++harness that did not exist).
++
++The prototype DLL is built from tools/hip_proto/gemv_fp16.cpp with
++tools/hip_proto/build_gemv.cmd and exports
++    int hip_gemv_bench(void* x, void* w, void* y, int N, int K, int iters)
++It is called through ctypes and compared against the Triton GEMV
++(zluda_ops.gemv.linear) on the same buffers (under ZLUDA cudaMalloc is hipMalloc,
++so a torch tensor pointer is a valid HIP device pointer for the prototype).
++
++Run under run-zluda.cmd:
++  venv\\Scripts\\python.exe bench\\hip_gemv_proto.py [--dll PATH] [--n 151936] [--k 896]
++"""
++
++import argparse
++import ctypes
++import sys
++import time
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from bench.common import save_report  # noqa: E402
++
++CANDIDATES = [
++    Path(__import__("os").environ.get("TEMP", ".")) / "hip_gemv4.dll",
++    Path(__import__("os").environ.get("TEMP", ".")) / "hip_gemv.dll",
++    Path(__file__).resolve().parents[1] / "tools" / "hip_proto" / "build" / "hip_gemv.dll",
++]
++
++
++def find_dll(explicit):
++    if explicit:
++        p = Path(explicit)
++        return p if p.exists() else None
++    for p in CANDIDATES:
++        if p.exists():
++            return p
++    return None
++
++
++def bench(fn, n=20):
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(n):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t0) / n * 1e6
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--dll", default=None)
++    parser.add_argument("--n", type=int, default=151936)
++    parser.add_argument("--k", type=int, default=896)
++    parser.add_argument("--iters", type=int, default=20)
++    args = parser.parse_args()
++    if not torch.cuda.is_available():
++        print("CUDA/ZLUDA device is not available")
++        return 1
++    torch.cuda.set_per_process_memory_fraction(0.7)
++    from zluda_ops import gemv as G
++
++    dll = find_dll(args.dll)
++    result = {"n": args.n, "k": args.k, "dll": str(dll) if dll else None}
++    if dll is None:
++        result["status"] = "skipped"
++        result["hint"] = ("build it with tools\\hip_proto\\build_gemv.cmd "
++                          "(needs ROCm clang++) and pass --dll")
++        save_report("hip_gemv_proto", result)
++        print(f"SKIP: prototype DLL not found; {result['hint']}")
++        return 0
++    fn = ctypes.CDLL(str(dll)).hip_gemv_bench
++    fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int, ctypes.c_int, ctypes.c_int]
++    fn.restype = ctypes.c_int
++    x = torch.randn(args.k, device="cuda", dtype=torch.float16)
++    w = torch.randn(args.n, args.k, device="cuda", dtype=torch.float16)
++    y = torch.empty(args.n, device="cuda", dtype=torch.float16)
++
++    def hip_run():
++        rc = fn(x.data_ptr(), w.data_ptr(), y.data_ptr(), args.n, args.k,
++                args.iters)
++        if rc:
++            raise RuntimeError(f"hip_gemv_bench rc={rc}")
++        torch.cuda.synchronize()
++
++    def triton_run():
++        G.linear(x.unsqueeze(0), w, None, accurate=True)
++
++    hip_us = None
++    try:
++        # the prototype loops --iters internally per call
++        t0 = time.perf_counter()
++        hip_run()
++        hip_us = (time.perf_counter() - t0) * 1e6 / args.iters
++        result["hip_us"] = round(hip_us, 1)
++        result["hip_status"] = "OK"
++    except Exception as exc:  # noqa: BLE001
++        result["hip_status"] = f"FAIL {type(exc).__name__}: {exc}"
++    triton_us = bench(triton_run, n=max(20, args.iters)) if torch.cuda.is_available() else None
++    result["triton_us"] = round(triton_us, 1) if triton_us else None
++    if hip_us and triton_us:
++        result["speedup_vs_triton"] = round(triton_us / hip_us, 2)
++    bytes_read = args.n * args.k * 2
++    result["hip_GBs"] = round(bytes_read / hip_us / 1e3, 1) if hip_us else None
++    result["triton_GBs"] = round(bytes_read / triton_us / 1e3, 1) if triton_us else None
++    save_report("hip_gemv_proto", result)
++    print(result)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/infra_probe.py b/bench/infra_probe.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..a8b9d30e7f9bb92c2caadd0d197c8d93a00b4332
@@ -8506,6 +8629,139 @@ index 0000000000000000000000000000000000000000..23d7a589bcba6d7f28e1fb3a64a98624
 +if __name__ == "__main__":
 +    main()
 +
+diff --git a/bench/regression_gate.py b/bench/regression_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..02407f40febc8aa8481f880dfee0307807696d27
+--- /dev/null
++++ b/bench/regression_gate.py
+@@ -0,0 +1,127 @@
++"""GPU regression gate for the ZLUDA/RDNA1 stack (audit item P1).
++
++Runs the existing GPU suites, checks every check is OK and that the measured
++kernel timings did not regress beyond a tolerance, and stores a baseline JSON so
++future runs can gate on it.
++
++Usage (under run-zluda.cmd):
++  venv\\Scripts\\python.exe bench/regression_gate.py            # check vs baseline
++  venv\\Scripts\\python.exe bench/regression_gate.py --update   # refresh baseline
++"""
++
++import argparse
++import json
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++RESULTS = REPO / "bench" / "results"
++BASELINE = RESULTS / "gate_baseline.json"
++GATE_REPORT = RESULTS / "regression_gate.json"
++
++
++def run_py(script, timeout=900):
++    t0 = time.time()
++    proc = subprocess.run([sys.executable, str(REPO / "bench" / script)],
++                          cwd=str(REPO), capture_output=True, text=True,
++                          timeout=timeout)
++    out = (proc.stdout or "") + (proc.stderr or "")
++    return {"script": script, "rc": proc.returncode,
++            "wall_s": round(time.time() - t0, 1),
++            "summary": [ln.strip() for ln in out.splitlines()
++                        if "SUMMARY" in ln], "tail": out[-800:]}
++
++
++def newest(pattern):
++    files = sorted(RESULTS.glob(pattern), key=lambda p: p.stat().st_mtime,
++                   reverse=True)
++    return files
++
++
++def collect_metrics():
++    """Collect (check_statuses, timing metrics) from the saved JSON reports."""
++    checks = {}
++    metrics = {}
++    phase2 = RESULTS / "phase2_kernels.json"
++    if phase2.exists():
++        data = json.loads(phase2.read_text(encoding="utf-8"))
++        for r in data.get("results", []):
++            checks[r["name"]] = r["status"]
++            d = r.get("detail") or {}
++            if isinstance(d, dict):
++                for k, v in d.items():
++                    if isinstance(v, (int, float)) and ("us" in k or "ms" in k):
++                        metrics[f"{r['name']}:{k}"] = float(v)
++    for f in newest("train_suite-*.json")[:1]:
++        data = json.loads(f.read_text(encoding="utf-8"))
++        for r in data.get("results", []):
++            checks[f"train:{r['name']}"] = r["status"]
++    return checks, metrics
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--update", action="store_true",
++                        help="write the current results as the new baseline")
++    parser.add_argument("--tolerance", type=float, default=0.60,
++                        help="minimum ratio vs baseline (lower is better, 0.6=40%% slower allowed)")
++    parser.add_argument("--tag", default="")
++    args = parser.parse_args()
++
++    runs = [run_py("phase2_kernels.py")]
++    runs.append(run_py("shim_smoke.py"))
++    try:
++        runs.append(run_py("train_suite.py", timeout=1200))
++    except Exception as exc:  # noqa: BLE001
++        runs.append({"script": "train_suite.py", "rc": 1,
++                     "summary": [], "tail": f"{type(exc).__name__}: {exc}"})
++
++    failures = []
++    for r in runs:
++        print(f"[gate] {r['script']}: rc={r['rc']} {r.get('summary')}", flush=True)
++        if r["rc"] != 0:
++            failures.append(f"{r['script']} exited {r['rc']}")
++    checks, metrics = collect_metrics()
++    bad = [k for k, v in checks.items() if v != "OK"]
++    if bad:
++        failures.append(f"checks not OK: {bad}")
++
++    baseline = {}
++    if BASELINE.exists():
++        baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
++    regressions = []
++    if not args.update and baseline:
++        bmetrics = baseline.get("metrics", {})
++        for key, val in metrics.items():
++            if key in bmetrics and bmetrics[key] > 0:
++                ratio = val / bmetrics[key]
++                if ratio > 1.0 / args.tolerance:
++                    regressions.append({"metric": key, "base": bmetrics[key],
++                                        "now": val, "ratio": round(ratio, 2)})
++        if regressions:
++            failures.append(f"timing regressions: {regressions}")
++
++    report = {"tag": args.tag, "checks": checks, "metrics": metrics,
++              "regressions": regressions, "failures": failures,
++              "ok": not failures, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}
++    GATE_REPORT.write_text(json.dumps(report, indent=1), encoding="utf-8")
++    if args.update:
++        BASELINE.write_text(json.dumps({"metrics": metrics,
++                                        "timestamp": report["timestamp"]},
++                                       indent=1), encoding="utf-8")
++        print(f"[gate] baseline updated ({len(metrics)} metrics)", flush=True)
++    print(f"[gate] checks={len(checks)} bad={len(bad)} regressions={len(regressions)}",
++          flush=True)
++    if failures:
++        print("REGRESSION GATE: FAIL")
++        for f in failures:
++            print("  -", f)
++        return 1
++    print("REGRESSION GATE: PASS")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
 diff --git a/bench/results/cross_backend_summary.json b/bench/results/cross_backend_summary.json
 new file mode 100644
 index 0000000000000000000000000000000000000000..0347ef4cb83812cfa0ad1a9845970310ca966929
@@ -9305,6 +9561,136 @@ index 0000000000000000000000000000000000000000..0347ef4cb83812cfa0ad1a9845970310
 +        "overdrive6_temperature": -8,
 +        "overdrive6_power": -1
 +      }
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/bench/results/gate_baseline.json b/bench/results/gate_baseline.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..e77f1e56c01fd7b7b1adb73986c5002bd3156560
+--- /dev/null
++++ b/bench/results/gate_baseline.json
+@@ -0,0 +1,15 @@
++{
++ "metrics": {
++  "gqa_decode_speed:gqa_us": 146.1,
++  "gqa_decode_speed:old_us": 175.1,
++  "add_rms_norm_speed:fused_us": 70.8,
++  "add_rms_norm_speed:two_kernel_us": 101.7,
++  "gqa_decode_m1_speed:m1_us": 138.5,
++  "gqa_decode_m1_speed:old_us": 171.7,
++  "embedding_gather_scale:us": 46.0,
++  "sampling_kernel:us": 437.7,
++  "int8_prefill_matmul:int8_us": 484.3,
++  "int8_prefill_matmul:dequant_fp16_us": 239.3
++ },
++ "timestamp": "2026-11-28T22:49:27"
++}
+\ No newline at end of file
+diff --git a/bench/results/hip_gemv_proto-20261128-225009.json b/bench/results/hip_gemv_proto-20261128-225009.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c59bfb2aa4ac9c83fbe52e0698c6bce68c20ee8
+--- /dev/null
++++ b/bench/results/hip_gemv_proto-20261128-225009.json
+@@ -0,0 +1,47 @@
++{
++  "n": 4864,
++  "k": 896,
++  "dll": "C:\\Users\\artyom\\AppData\\Local\\Temp\\hip_gemv4.dll",
++  "hip_us": 45992.3,
++  "hip_status": "OK",
++  "triton_us": 84.7,
++  "speedup_vs_triton": 0.0,
++  "hip_GBs": 0.2,
++  "triton_GBs": 103.0,
++  "timestamp": "2026-11-28T22:50:09",
++  "gpu": {
++    "torch": "2.7.1+cu118",
++    "cuda": "11.8",
++    "hip": null,
++    "hip_path": "G:\\zluda\\hip",
++    "zluda_cc": "8.6",
++    "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++    "multi_processor_count": 20,
++    "total_memory_gb": 7.98,
++    "l2_cache_mb": 4.0,
++    "allow_tf32": false,
++    "float32_matmul_precision": "highest",
++    "triton": "3.3.1"
++  },
++  "protocol": {
++    "data": "random data (torch.randn) unless stated otherwise",
++    "timing": "mean per round, median across rounds, warmup per round",
++    "order": "variant order shuffled between rounds when comparing",
++    "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++  },
++  "clocks": {
++    "adapter": "AMD Radeon RX 5700 XT",
++    "engine_clock_mhz": null,
++    "memory_clock_mhz": null,
++    "vddc_mv": null,
++    "temperature_c": null,
++    "activity_pct": null,
++    "power_pct": null,
++    "errors": {
++      "overdriveN_status": -8,
++      "overdrive6_status": -8,
++      "overdrive6_temperature": -8,
++      "overdrive6_power": -1
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/bench/results/hip_gemv_proto-20261128-225033.json b/bench/results/hip_gemv_proto-20261128-225033.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..86d921abd24fc0900497764991994fc331866cc3
+--- /dev/null
++++ b/bench/results/hip_gemv_proto-20261128-225033.json
+@@ -0,0 +1,47 @@
++{
++  "n": 4864,
++  "k": 896,
++  "dll": "C:\\Users\\artyom\\AppData\\Local\\Temp\\hip_gemv4.dll",
++  "hip_us": 511028.4,
++  "hip_status": "OK",
++  "triton_us": 70.0,
++  "speedup_vs_triton": 0.0,
++  "hip_GBs": 0.0,
++  "triton_GBs": 124.5,
++  "timestamp": "2026-11-28T22:50:33",
++  "gpu": {
++    "torch": "2.7.1+cu118",
++    "cuda": "11.8",
++    "hip": null,
++    "hip_path": "G:\\zluda\\hip",
++    "zluda_cc": "8.6",
++    "device": "AMD Radeon RX 5700 XT [ZLUDA]",
++    "multi_processor_count": 20,
++    "total_memory_gb": 7.98,
++    "l2_cache_mb": 4.0,
++    "allow_tf32": false,
++    "float32_matmul_precision": "highest",
++    "triton": "3.3.1"
++  },
++  "protocol": {
++    "data": "random data (torch.randn) unless stated otherwise",
++    "timing": "mean per round, median across rounds, warmup per round",
++    "order": "variant order shuffled between rounds when comparing",
++    "clocks": "unfixed; sclk/mclk unavailable (ADL NOT_SUPPORTED, see bench/gpu_clocks.py)"
++  },
++  "clocks": {
++    "adapter": "AMD Radeon RX 5700 XT",
++    "engine_clock_mhz": null,
++    "memory_clock_mhz": null,
++    "vddc_mv": null,
++    "temperature_c": null,
++    "activity_pct": null,
++    "power_pct": null,
++    "errors": {
++      "overdriveN_status": -8,
++      "overdrive6_status": -8,
++      "overdrive6_temperature": -8,
++      "overdrive6_power": -1
 +    }
 +  }
 +}
@@ -11982,6 +12368,50 @@ index 0000000000000000000000000000000000000000..662e2e9287fe60db88a5823dd657df85
 + ]
 +}
 \ No newline at end of file
+diff --git a/bench/results/regression_gate.json b/bench/results/regression_gate.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..dca070ae3a1029db06230e9cb2e0b5fefaac79ef
+--- /dev/null
++++ b/bench/results/regression_gate.json
+@@ -0,0 +1,37 @@
++{
++ "tag": "ci-20261128-224629",
++ "checks": {
++  "gqa_decode_correctness": "OK",
++  "gqa_decode_speed": "OK",
++  "add_rms_norm_correctness": "OK",
++  "add_rms_norm_speed": "OK",
++  "gqa_decode_m1_speed": "OK",
++  "embedding_gather_scale": "OK",
++  "sampling_kernel": "OK",
++  "int8_prefill_matmul": "OK",
++  "qkv_rope_append_correctness": "OK",
++  "train:linear_fwd_bwd": "OK",
++  "train:conv2d_fwd_bwd": "OK",
++  "train:sdpa_math_bwd": "OK",
++  "train:triton_fa_bwd": "OK",
++  "train:autocast_fp16_bf16": "OK",
++  "train:bn_rnn_fallback_bwd": "OK",
++  "train:optim8bit_step": "OK"
++ },
++ "metrics": {
++  "gqa_decode_speed:gqa_us": 146.1,
++  "gqa_decode_speed:old_us": 175.1,
++  "add_rms_norm_speed:fused_us": 70.8,
++  "add_rms_norm_speed:two_kernel_us": 101.7,
++  "gqa_decode_m1_speed:m1_us": 138.5,
++  "gqa_decode_m1_speed:old_us": 171.7,
++  "embedding_gather_scale:us": 46.0,
++  "sampling_kernel:us": 437.7,
++  "int8_prefill_matmul:int8_us": 484.3,
++  "int8_prefill_matmul:dequant_fp16_us": 239.3
++ },
++ "regressions": [],
++ "failures": [],
++ "ok": true,
++ "timestamp": "2026-11-28T22:49:27"
++}
+\ No newline at end of file
 diff --git a/bench/results/roofline.json b/bench/results/roofline.json
 new file mode 100644
 index 0000000000000000000000000000000000000000..3e6a1fcde42f40e6ae384bc1309ad47f6f734e6b
@@ -13221,10 +13651,10 @@ index 0000000000000000000000000000000000000000..d781c16b57057b9e29057a4310f7949b
 +    main()
 diff --git a/bench/summarize_rematrix.py b/bench/summarize_rematrix.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a37f234f5781a8c10c1f79ae7a5db84be0ddebbc
+index 0000000000000000000000000000000000000000..f7d3cb7f539a2c379b991bec76dc83bd1e1d897b
 --- /dev/null
 +++ b/bench/summarize_rematrix.py
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,140 @@
 +"""Summarise the cross-backend re-measurement into a markdown report.
 +
 +Reads the newest bench/results/vulkan_matrix-*.json (Ollama/Vulkan, FA=0) and all
@@ -13256,6 +13686,11 @@ index 0000000000000000000000000000000000000000..a37f234f5781a8c10c1f79ae7a5db84b
 +        return json.loads(path.read_text(encoding="utf-8"))
 +    except Exception:  # noqa: BLE001
 +        return None
++
++
++def _attn_label(attn):
++    # sdpa_fast = default selector with the crashy fast backends disabled
++    return {"sdpa_fast": "sdpa (fast off)"}.get(attn, attn)
 +
 +
 +VULKAN_DTYPE = {
@@ -13337,7 +13772,7 @@ index 0000000000000000000000000000000000000000..a37f234f5781a8c10c1f79ae7a5db84b
 +        for r in zrows:
 +            lines.append(
 +                f"| {r['dtype']} | {r['acc']} | {r['emul']} | {r['quant']} | "
-+                f"{r['attn']} | {r['max_ctx']} | {r['prefill']} | "
++                f"{{_attn_label(r['attn'])}} | {{r['max_ctx']}} | {{r['prefill']}} | "
 +                f"{r['decode']} | {r['peak_mb']} | {r['fail']} |")
 +        lines.append("")
 +
@@ -14798,10 +15233,10 @@ index 0000000000000000000000000000000000000000..aa9230e5ac3bad29b1dabd9f18bfc8e2
 +call "%~dp0run-zluda.cmd" "%COMFY_PYTHON%" main.py --listen 127.0.0.1 --port 8188 --use-pytorch-cross-attention --force-fp16 --preview-method auto --disable-smart-memory --gpu-only --disable-pinned-memory --disable-all-custom-nodes
 diff --git a/docs/AGENT_AUDIT_REPORT.md b/docs/AGENT_AUDIT_REPORT.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..63787b555c4b3adb9b96e6cd08012b5c2b068ffc
+index 0000000000000000000000000000000000000000..6095e5692d477ae01e8c69cf7a3f0c0b78acdc03
 --- /dev/null
 +++ b/docs/AGENT_AUDIT_REPORT.md
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,227 @@
 +# Агентный анализ ZLUDA/RDNA1 — 2026-11-28
 +
 +Метод: 6 агентов-исследователей (функционально: работает / сломано / можно
@@ -15005,6 +15440,30 @@ index 0000000000000000000000000000000000000000..63787b555c4b3adb9b96e6cd08012b5c
 +
 +Примечание: в среде верификатора `web_search` вернул HTTP 401, поэтому
 +веб-проверка сделана через `web_fetch` первоисточников.
++
++## 12. Дополнительно сделано после аудита (2026-11-28)
++
++- **GPTQ/AWQ import (P1):** `zluda_ops/quant.py` — `unpack_gptq_int4` /
++  `unpack_awq_int4` (форматы сверены с эталонными `pack_rows`/`pack_cols`/
++  `awq_pack` из vLLM), групповые scales, поддержка qzeros; CPU-roundtrip
++  `gptq_selftest()` → err 6e-5. Осталось: загрузчик чекпойнта (маппинг
++  qweight/qzeros/scales в эти хелперы) — импорт сам по себе ускоряет только
++  через VRAM (7B int4 ≈ 3.5 ГБ).
++- **GPU-CI / regression gate (P1):** `bench/regression_gate.py` +
++  `tools/run_gpu_ci.ps1`. Первый прогон: **PASS** (phase2 9/9, shim 4/4,
++  train 7/7; 16 проверок, baseline из 10 метрик записан). Гейт падает при
++  статусах != OK и при деградации таймингов >40%.
++- **HIP GEMV prototype harness:** `bench/hip_gemv_proto.py` (закрывает
++  корректировку #9). Оговорка: вызов прототипной DLL из ZLUDA-процесса дал
++  неправдоподобные 511 мс/вызов — для честных чисел прототип надо собирать
++  ROCm-clang'ом (скрипт `tools/hip_proto/build_gemv.cmd`) и мерить в отдельном
++  HIP-процессе; текущая DLL в %TEMP% нерелевантна.
++- **rematrix (корректировка #11):** метка «sdpa_fast» в сводке теперь
++  отображается как «sdpa (fast off)» — это math-селектор с выключенными
++  падающими бэкендами.
++- **Safe-run:** GPU-CI использует только безопасные наборы и не трогает
++  raw-SDPA/llama.cpp MMQ/FA; `zluda_ops.auto` по-прежнему отключает падающие
++  SDPA-бэкенды при импорте.
 diff --git a/docs/COMPAT_MATRIX.md b/docs/COMPAT_MATRIX.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..8cfc80d44e853c645973fbb647f78da184b92fc3
@@ -15429,11 +15888,11 @@ index 0000000000000000000000000000000000000000..2a6adcece6ca143824ffe0c981961c93
 +decode on this card.
 diff --git a/docs/ENGINE_COMPARISON_REMATRIX.md b/docs/ENGINE_COMPARISON_REMATRIX.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..3660f7d42aa8344093adfa712a458bac84eae022
+index 0000000000000000000000000000000000000000..6db66b2b1b921863ef8022f0848b63f046f1a811
 --- /dev/null
 +++ b/docs/ENGINE_COMPARISON_REMATRIX.md
 @@ -0,0 +1,61 @@
-+# Cross-backend re-measurement at max fitting context (2026-11-27)
++# Cross-backend re-measurement at max fitting context (2026-11-28)
 +
 +Generated by bench/summarize_rematrix.py from bench/results/*.json.
 +Vulkan = Ollama/llama.cpp Vulkan backend, FA=0, KV f16.
@@ -15466,20 +15925,20 @@ index 0000000000000000000000000000000000000000..3660f7d42aa8344093adfa712a458bac
 +
 +| dtype | acc | bf16-emul | quant | attn | max ctx | prefill tok/s | decode tok/s | peak MB | next ctx fails |
 +|---|---|---|---|---|---|---|---|---|---|
-+| bf16 | 0 | False | none | math | 4096 | 2076.4 | 10.3 | 3175.4 | 8192 |
-+| bf16 | 0 | True | none | math | 4096 | 2842.5 | 28.7 | 4169.5 | 8192 |
-+| bf16 | 0 | False | none | sdpa_fast | 4096 | 2082.5 | 10.3 | 3175.4 | 8192 |
-+| bf16 | 0 | True | none | sdpa_fast | 4096 | 2815.9 | 28.7 | 4169.5 | 8192 |
-+| fp16 | 0 | False | none | math | 4096 | 2546.1 | 23.3 | 3175.4 | 8192 |
-+| fp16 | 1 | False | none | math | 4096 | 3017.5 | 37.7 | 3175.4 | 8192 |
-+| fp16 | 0 | False | none | sdpa_fast | 4096 | 2577.4 | 23.5 | 3175.4 | 8192 |
-+| fp16 | 1 | False | none | sdpa_fast | 4096 | 3019.4 | 38.1 | 3175.4 | 8192 |
-+| fp32 | 0 | False | int4 | math | 4096 | 2828.1 | 29.4 | 4689.5 | 8192 |
-+| fp32 | 0 | False | int8 | math | 4096 | 2799.6 | 28.7 | 4689.5 | 8192 |
-+| fp32 | 0 | False | none | math | 4096 | 2808.3 | 29.1 | 4169.5 | 8192 |
-+| fp32 | 0 | False | int4 | sdpa_fast | 4096 | 2847.3 | 29.1 | 4689.5 | 8192 |
-+| fp32 | 0 | False | int8 | sdpa_fast | 4096 | 2801.0 | 27.9 | 4689.5 | 8192 |
-+| fp32 | 0 | False | none | sdpa_fast | 4096 | 2793.6 | 28.6 | 4169.5 | 8192 |
++| bf16 | 0 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 10.3 | 3175.4 | 8192 |
++| bf16 | 0 | True | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 28.7 | 4169.5 | 8192 |
++| bf16 | 0 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 10.3 | 3175.4 | 8192 |
++| bf16 | 0 | True | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 28.7 | 4169.5 | 8192 |
++| fp16 | 0 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 23.3 | 3175.4 | 8192 |
++| fp16 | 1 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 37.7 | 3175.4 | 8192 |
++| fp16 | 0 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 23.5 | 3175.4 | 8192 |
++| fp16 | 1 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 38.1 | 3175.4 | 8192 |
++| fp32 | 0 | False | int4 | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 29.4 | 4689.5 | 8192 |
++| fp32 | 0 | False | int8 | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 28.7 | 4689.5 | 8192 |
++| fp32 | 0 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 29.1 | 4169.5 | 8192 |
++| fp32 | 0 | False | int4 | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 29.1 | 4689.5 | 8192 |
++| fp32 | 0 | False | int8 | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 27.9 | 4689.5 | 8192 |
++| fp32 | 0 | False | none | {_attn_label(r['attn'])} | {r['max_ctx']} | {r['prefill']} | 28.6 | 4169.5 | 8192 |
 +
 +## Cross-backend mapping
 +
@@ -15606,10 +16065,10 @@ index 0000000000000000000000000000000000000000..bdfa64afc8b5ae7a329441d9ac6be805
 +documented limitations.
 diff --git a/docs/KERNEL_GAPS.md b/docs/KERNEL_GAPS.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..3ed5504191c28ebebc924d54586bd2380d7aef0c
+index 0000000000000000000000000000000000000000..330b43e1263fa9966a2ef163cf602da85401ec15
 --- /dev/null
 +++ b/docs/KERNEL_GAPS.md
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,96 @@
 +# Kernel gaps: what should exist and does not (2026-11-26)
 +
 +Audit of kernels that standard GPU stacks provide (cuBLAS/rocBLAS, PyTorch,
@@ -15695,6 +16154,17 @@ index 0000000000000000000000000000000000000000..3ed5504191c28ebebc924d54586bd238
 +caching allocator adds ~0.04 ms per 256 MB allocation); for steady-state decode
 +with reuse there is no benefit in switching. Use torch allocations everywhere;
 +direct hipMalloc only makes sense to bypass torch for one-off huge buffers.
++
++## 1b. Added later (2026-11-28): GPTQ/AWQ import scaffolding
++
++`zluda_ops/quant.py` now provides `unpack_gptq_int4` and `unpack_awq_int4`
++(layouts follow vLLM's reference `pack_rows`/`pack_cols`/`awq_pack` helpers and
++AutoGPTQ/AutoAWQ conventions: GPTQ uint4b8 rows, AWQ interleaved columns,
++groupwise scales (in/group, out)). Round-trip self-test:
++`quant.gptq_selftest()` -> err 6e-5 (fp16 rounding). A full checkpoint loader
++(mapping qweight/qzeros/scales tensors into these helpers) is still to be
++written; import support alone does not accelerate anything on RDNA1, it only
++reduces VRAM (7B int4 ~3.5 GB) and enables real quantized models to run.
 diff --git a/docs/LLAMACPP_VULKAN_VS_ZLUDA.md b/docs/LLAMACPP_VULKAN_VS_ZLUDA.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..17263a33f7d3b14662e7ffaf28dcbbc6a02a3e27
@@ -20285,6 +20755,55 @@ index 0000000000000000000000000000000000000000..f8c6bd107fb49e30f3543bb48259dfdd
 +Write-Host "=== summary ==="
 +& $py (Join-Path $repo "bench\summarize_rematrix.py")
 +Write-Host "Done: docs/ENGINE_COMPARISON_REMATRIX.md"
+diff --git a/tools/run_gpu_ci.ps1 b/tools/run_gpu_ci.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..be0dd5bd6d2dea5f9dd7b7767ed3ac1c91e3b88b
+--- /dev/null
++++ b/tools/run_gpu_ci.ps1
+@@ -0,0 +1,43 @@
++# GPU CI runner for the ZLUDA/RDNA1 stack (audit item P1).
++#
++# Runs the regression gate under the safe ZLUDA launcher, stores logs, and exits
++# non-zero on failure so it can be wired into CI / pre-commit hooks.
++#
++# Safe defaults: crashy SDPA fast backends are disabled by zluda_ops.auto, the
++# gate only uses the well-tested suites (phase-2 kernels, shim smoke, training),
++# and never touches llama.cpp MMQ/FA or raw PyTorch SDPA selection.
++#
++# Usage:
++#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_gpu_ci.ps1 [-Update]
++param([switch]$Update)
++$ErrorActionPreference = "Continue"
++$repo = Split-Path -Parent $PSScriptRoot
++$outDir = Join-Path $repo "bench\results\infra"
++New-Item -ItemType Directory -Force $outDir | Out-Null
++$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
++$log = Join-Path $outDir "gpu_ci-$stamp.log"
++$args2 = "bench\regression_gate.py --tag ci-$stamp"
++if ($Update) { $args2 += " --update" }
++$bat = Join-Path $env:TEMP "gpu_ci_$stamp.cmd"
++$lines = @('@echo off',
++           "call `"$repo\run-zluda.cmd`" venv\Scripts\python.exe `"$repo\$args2`" > `"$log`" 2>&1",
++           'exit /b %ERRORLEVEL%')
++Set-Content -Path $bat -Value $lines -Encoding ascii
++Write-Host "GPU CI: running $args2"
++$p = Start-Process -FilePath $bat -PassThru -WindowStyle Hidden
++$p | Wait-Process -Timeout 2400 -ErrorAction SilentlyContinue | Out-Null
++if (-not $p.HasExited) {
++    Get-Process python,zluda -ErrorAction SilentlyContinue |
++        Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-42) } |
++        Stop-Process -Force
++    Write-Host "GPU CI: TIMEOUT (log $log)"
++    exit 1
++}
++Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 12 |
++    ForEach-Object { Write-Host "  $_" }
++if ($p.ExitCode -eq 0) {
++    Write-Host "GPU CI: PASS (log $log)"
++    exit 0
++}
++Write-Host "GPU CI: FAIL (exit $($p.ExitCode), log $log)"
++exit 1
 diff --git a/tools/run_infra_suite.ps1 b/tools/run_infra_suite.ps1
 new file mode 100644
 index 0000000000000000000000000000000000000000..b6133360d5f093fd431df2fd85dbc5f18457fb0e
@@ -24638,10 +25157,10 @@ index 0000000000000000000000000000000000000000..d27b7a9411b9d4b118f98b4f12d7861c
 +__all__ = ["qkv_rope_append"]
 diff --git a/zluda_ops/quant.py b/zluda_ops/quant.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..063af30f8a35107c54829bc8203edde45be32356
+index 0000000000000000000000000000000000000000..64d23d78e1e34569aebcd7c2b84ff90eeda2fe3a
 --- /dev/null
 +++ b/zluda_ops/quant.py
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,543 @@
 +"""Weight-only quantization: int4/int8 groupwise storage with fused dequant.
 +
 +Storage format (GPTQ/AWQ compatible in spirit):
@@ -24922,7 +25441,7 @@ index 0000000000000000000000000000000000000000..063af30f8a35107c54829bc8203edde4
 +
 +__all__ = [
 +    "quantize_int4", "dequantize_int4", "quantize_int8", "dequantize_int8",
-+    "int4_linear", "int8_linear", "int8_matmul", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
++    "int4_linear", "int8_linear", "int8_matmul", "unpack_gptq_int4", "unpack_awq_int4", "gptq_selftest", "int4_matmul", "int4_prefill_linear", "linspace_reference", "CONFIGS",
 +]
 +
 +# ---------------------------------------------------------------------------
@@ -25039,6 +25558,152 @@ index 0000000000000000000000000000000000000000..063af30f8a35107c54829bc8203edde4
 +        x, w, scales, y, m, n, k, GROUP=group_size, BM=block_m, BN=block_n,
 +        BK=block_k, num_warps=num_warps, num_stages=num_stages)
 +    return y
++
++# ---------------------------------------------------------------------------
++# GPTQ / AWQ weight unpacking (Phase-2 functional gap: import real quantized
++# checkpoints -- 7B int4 fits in ~3.5 GB on this 8 GB card).
++#
++# Layouts follow the reference packing helpers in vLLM
++# (quant_utils.py: pack_rows/pack_cols/gptq_pack/awq_pack) and AutoGPTQ/ AutoAWQ:
++#   GPTQ: qweight int32 (in/8, out), 8 consecutive *input* features per int32,
++#         little-endian nibble order; dequant = (q - qzeros) * scales.
++#         Symmetric checkpoints store the uint4b8 bias (zero = 8).
++#   AWQ:  qweight int32 (in, out/8), 8 consecutive *output* features per int32
++#         with the interleave order [0,2,4,6,1,3,5,7]; dequant = (q - qzeros) * scales.
++# Scales are groupwise along the input dimension: (in/group, out).
++# ---------------------------------------------------------------------------
++def _pack_rows_ref(q_uint, bits=4):
++    """Reference GPTQ packing: q_uint (k, n) -> int32 (k/(32/bits), n)."""
++    k, n = q_uint.shape
++    pf = 32 // bits
++    if k % pf:
++        raise ValueError("k must be divisible by the pack factor")
++    res = torch.zeros((k // pf, n), dtype=torch.int32, device=q_uint.device)
++    for i in range(pf):
++        res |= (q_uint[i::pf, :].to(torch.int32) & ((1 << bits) - 1)) << (bits * i)
++    return res
++
++
++def _pack_cols_ref(q_uint, bits=4):
++    """Reference column packing: q_uint (k, n) -> int32 (k, n/(32/bits))."""
++    k, n = q_uint.shape
++    pf = 32 // bits
++    if n % pf:
++        raise ValueError("n must be divisible by the pack factor")
++    res = torch.zeros((k, n // pf), dtype=torch.int32, device=q_uint.device)
++    for i in range(pf):
++        res |= (q_uint[:, i::pf].to(torch.int32) & ((1 << bits) - 1)) << (bits * i)
++    return res
++
++
++def _unpack_rows(packed, bits, k):
++    pf = 32 // bits
++    mask = (1 << bits) - 1
++    out = torch.empty((k, packed.shape[1]), dtype=torch.int32, device=packed.device)
++    for i in range(pf):
++        out[i::pf, :] = (packed >> (bits * i)) & mask
++    return out
++
++
++def _unpack_cols(packed, bits, n):
++    pf = 32 // bits
++    mask = (1 << bits) - 1
++    out = torch.empty((packed.shape[0], n), dtype=torch.int32, device=packed.device)
++    for i in range(pf):
++        out[:, i::pf] = (packed >> (bits * i)) & mask
++    return out
++
++
++_AWQ_INTERLEAVE = [0, 2, 4, 6, 1, 3, 5, 7]
++_AWQ_DEINTERLEAVE = [0, 4, 1, 5, 2, 6, 3, 7]
++
++
++def unpack_gptq_int4(qweight, scales, qzeros=None, in_features=None,
++                     out_features=None, group_size=128, zero_offset=1):
++    """Unpack GPTQ int4 weights to a dequantized fp16 weight (in, out)."""
++    if qweight.dim() != 2 or qweight.dtype != torch.int32:
++        raise ValueError("qweight must be an int32 2-D tensor")
++    k, n = in_features, out_features
++    if k is None:
++        k = qweight.shape[0] * 8
++    if n is None:
++        n = qweight.shape[1]
++    if qweight.shape != (k // 8, n):
++        raise ValueError(f"qweight shape {tuple(qweight.shape)} != ({k // 8}, {n})")
++    q = _unpack_rows(qweight, 4, k).to(torch.float32)  # (k, n), unsigned 0..15
++    if qzeros is None:
++        zeros = torch.full((k // group_size, n), 8.0, device=qweight.device)
++    else:
++        if qzeros.shape != (k // group_size, n // 8):
++            raise ValueError(f"qzeros shape {tuple(qzeros.shape)} != "
++                             f"({k // group_size}, {n // 8})")
++        zeros = _unpack_cols(qzeros, 4, n).to(torch.float32) + zero_offset
++    zeros = zeros.repeat_interleave(group_size, dim=0)
++    w = (q - zeros) * scales.float().repeat_interleave(group_size, dim=0)
++    return w.to(torch.float16)
++
++
++def unpack_awq_int4(qweight, scales, qzeros=None, in_features=None,
++                    out_features=None, group_size=128, zero_offset=1):
++    """Unpack AWQ int4 weights to a dequantized fp16 weight (in, out)."""
++    if qweight.dim() != 2 or qweight.dtype != torch.int32:
++        raise ValueError("qweight must be an int32 2-D tensor")
++    k, n = in_features, out_features
++    if k is None:
++        k = qweight.shape[0]
++    if n is None:
++        n = qweight.shape[1] * 8
++    if qweight.shape != (k, n // 8):
++        raise ValueError(f"qweight shape {tuple(qweight.shape)} != ({k}, {n // 8})")
++    q = _unpack_cols(qweight, 4, n).to(torch.float32)
++    # undo the AWQ interleave of the output dimension inside each 8-column group
++    q = q.reshape(k, n // 8, 8)[:, :, _AWQ_DEINTERLEAVE].reshape(k, n)
++    if qzeros is None:
++        zeros = torch.full((k // group_size, n), 8.0, device=qweight.device)
++    else:
++        if qzeros.shape != (k // group_size, n // 8):
++            raise ValueError(f"qzeros shape {tuple(qzeros.shape)} != "
++                             f"({k // group_size}, {n // 8})")
++        zeros = _unpack_cols(qzeros, 4, n).to(torch.float32)
++        zeros = zeros.reshape(k // group_size, n // 8, 8)[:, :, _AWQ_DEINTERLEAVE]
++        zeros = zeros.reshape(k // group_size, n) + zero_offset
++    zeros = zeros.repeat_interleave(group_size, dim=0)
++    w = (q - zeros) * scales.float().repeat_interleave(group_size, dim=0)
++    return w.to(torch.float16)
++
++
++def gptq_selftest():
++    """Round-trip test for the GPTQ/AWQ unpack helpers (CPU, no GPU needed)."""
++    torch.manual_seed(0)
++    in_f, out_f, group = 256, 128, 128
++    w = torch.randn(out_f, in_f) * 0.05  # (out, in) as used by nn.Linear
++    # --- GPTQ (symmetric uint4b8: stored = q + 8) ---
++    g = w.reshape(out_f, in_f // group, group)
++    amax = g.abs().amax(-1, keepdim=True).clamp(min=1e-8)
++    scale = amax / 7.0
++    q_signed = torch.round(g / scale).clamp(-8, 7).to(torch.int32).reshape(out_f, in_f)
++    stored = (q_signed + 8).to(torch.int32).t().contiguous()  # (in, out) uint4b8
++    qw = _pack_rows_ref(stored)
++    sc_g = scale.reshape(out_f, in_f // group).t().contiguous()
++    w_gptq = unpack_gptq_int4(qw, sc_g, qzeros=None, group_size=group)
++    ref = ((q_signed.reshape(out_f, in_f // group, group).float() * scale)
++           .reshape(out_f, in_f))
++    err = float((w_gptq.float().t() - ref).abs().max())
++    # --- AWQ (asymmetric, interleaved columns, zero stored as zp-1) ---
++    zp = 8
++    q_awq = torch.round(w.reshape(out_f, in_f // group, group) / scale) + zp
++    q_awq = q_awq.clamp(0, 15).to(torch.int32).reshape(out_f, in_f)
++    inter = q_awq.t().reshape(in_f, out_f // 8, 8)[:, :, _AWQ_INTERLEAVE]
++    inter = inter.reshape(in_f, out_f)
++    qw_awq = _pack_cols_ref(inter)
++    zeros = torch.full((in_f // group, out_f // 8, 8), zp - 1, dtype=torch.int32)
++    qz = _pack_cols_ref(zeros.reshape(in_f // group, out_f))
++    w_awq = unpack_awq_int4(qw_awq, sc_g, qz, group_size=group, zero_offset=1)
++    ref_awq = ((q_awq.reshape(out_f, in_f // group, group) - zp).float() * scale)
++    ref_awq = ref_awq.reshape(out_f, in_f)
++    err_awq = float((w_awq.float().t() - ref_awq).abs().max())
++    return {"gptq_err": round(err, 5), "awq_err": round(err_awq, 5),
++            "gptq_shape": tuple(w_gptq.shape), "awq_shape": tuple(w_awq.shape)}
 diff --git a/zluda_ops/sampling.py b/zluda_ops/sampling.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..bb589c696cc00f6f75f8c30ff5756e46f007da17
